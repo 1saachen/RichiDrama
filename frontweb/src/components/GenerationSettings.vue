@@ -1,0 +1,188 @@
+<template>
+  <section class="generation-settings" aria-label="生成参数">
+    <UiChoiceField v-if="showTextModel" label="文本模型" :model-value="value.text_model || 'auto'" :options="textModelOptions" @update:model-value="set('text_model', $event)" />
+    <UiChoiceField label="视频模型" :model-value="value.video_model || ''" :options="videoModelOptions" :invalid="videoModelInvalid" :error="videoModelError" @update:model-value="set('video_model', $event)" />
+    <UiChoiceField class="duration-setting" label="时长（秒）" :model-value="duration" :options="durationOptions.map((second) => ({ label: `${second} 秒`, value: second }))" @update:model-value="set('duration', $event)" />
+    <UiChoiceField label="分辨率" :model-value="value.resolution || '720p'" :options="resolutionOptions" :invalid="resolutionInvalid" :error="resolutionError" @update:model-value="set('resolution', $event)" />
+    <UiChoiceField label="AI 超分（新镜头默认 1080p）" :model-value="value.upscale_resolution || ''" :options="upscaleOptions" @update:model-value="set('upscale_resolution', $event || null)" />
+    <UiChoiceField label="智能插帧（按需）" :model-value="value.target_fps || ''" :options="fpsOptions" @update:model-value="set('target_fps', $event || null)" />
+    <UiChoiceField label="宽高比" :model-value="value.aspect_ratio || '16:9'" :options="aspectRatioOptions" :invalid="aspectRatioInvalid" :error="aspectRatioError" @update:model-value="set('aspect_ratio', $event)" />
+    <div class="postprocess-quote" role="status" aria-live="polite" :aria-busy="quoteLoading">
+      <b>预计积分：</b>
+      <span v-if="quoteLoading">正在核算…</span>
+      <span v-else-if="quote">{{ formatPoints(quote.estimated_total_points) }}</span>
+      <span v-else-if="quoteError">{{ quoteError }}</span>
+      <span v-else-if="includeGenerationQuote && !value.video_model">选择视频模型后显示</span>
+      <small>未选择的阶段不扣费。</small>
+    </div>
+  </section>
+</template>
+
+<script setup>
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { aiAPI } from '@/api/ai'
+import { omniVideoAPI } from '@/api/omniVideo'
+import { videosAPI } from '@/api/videos'
+import UiChoiceField from '@/components/ui/UiChoiceField.vue'
+import { collectDisplayNames, modelLabel } from '@/utils/modelDisplayNames'
+
+const props = defineProps({
+  modelValue: { type: Object, default: () => ({}) },
+  showTextModel: { type: Boolean, default: false },
+  maxDuration: { type: Number, default: 60 },
+  videoModelInvalid: { type: Boolean, default: false },
+  videoModelError: { type: String, default: '' },
+  includeGenerationQuote: { type: Boolean, default: false },
+  hasVideoInput: { type: Boolean, default: false },
+  hasAudioInput: { type: Boolean, default: false },
+})
+const emit = defineEmits(['update:modelValue'])
+const textModels = ref([]), videoModels = ref([]), modelNames = ref({})
+let modelOptionsCache = null
+let modelOptionsPromise = null
+const value = computed(() => props.modelValue || {})
+const textModelOptions = computed(() => [{ label: '自动选择', description: '使用当前默认文本模型', value: 'auto' }, ...textModels.value.map((item) => ({ label: displayModelName(item), value: item }))])
+const videoModelOptions = computed(() => videoModels.value.map((item) => ({ label: displayModelName(item.model), description: item.is_default ? '默认模型' : '', value: item.model })))
+const allResolutionOptions = [{ label: '480p', value: '480p' }, { label: '720p', value: '720p' }, { label: '1080p', value: '1080p' }]
+function modelKey(model) { return String(model || '').trim().toLowerCase() }
+function isSeedance25Model(model) { return /seedance[-_]?2[-_]?5|2[-_]?5[-_]?260628/i.test(modelKey(model)) }
+const selectedVideoCapability = computed(() => videoModels.value.find((item) => modelKey(item.model) === modelKey(value.value.video_model)) || null)
+const modelMaxDuration = computed(() => {
+  const configured = Number(selectedVideoCapability.value?.limits?.duration?.max)
+  return Number.isFinite(configured) && configured > 0 ? configured : isSeedance25Model(value.value.video_model) ? 30 : props.maxDuration
+})
+const duration = computed(() => Math.min(modelMaxDuration.value, Math.max(4, Number(value.value.duration) || 15)))
+const durationOptions = computed(() => Array.from({ length: Math.max(0, modelMaxDuration.value - 3) }, (_, index) => index + 4))
+const allowedResolutions = computed(() => {
+  const configured = selectedVideoCapability.value?.limits?.resolutions
+  return Array.isArray(configured) && configured.length
+    ? configured.map((item) => String(item || '').trim().toLowerCase()).filter(Boolean)
+    : allResolutionOptions.map((item) => item.value)
+})
+const resolutionOptions = computed(() => allResolutionOptions.filter((item) => allowedResolutions.value.includes(item.value)))
+const resolutionInvalid = computed(() => !!selectedVideoCapability.value && !allowedResolutions.value.includes(String(value.value.resolution || '720p').toLowerCase()))
+const resolutionError = computed(() => resolutionInvalid.value
+  ? `当前模型不支持 ${value.value.resolution} 原片。请选择 ${allowedResolutions.value.join(' 或 ')}${allowedResolutions.value.includes('720p') ? '；需要 1080p 成片时可启用 AI 超分' : ''}。`
+  : '')
+const fpsOptions = [{ label: '不插帧', description: '保持原始帧率', value: '' }, { label: '60 fps', value: 60 }, { label: '120 fps', value: 120 }]
+const allAspectRatioOptions = ['16:9', '9:16', '1:1', '3:4', '4:3', '3:2', '2:3', '21:9'].map((item) => ({ label: item, value: item }))
+const allowedAspectRatios = computed(() => {
+  const configured = selectedVideoCapability.value?.limits?.aspect_ratios
+  return Array.isArray(configured) && configured.length ? configured : allAspectRatioOptions.map((item) => item.value)
+})
+const aspectRatioOptions = computed(() => allAspectRatioOptions.filter((item) => allowedAspectRatios.value.includes(item.value)))
+const aspectRatioInvalid = computed(() => !!selectedVideoCapability.value && !allowedAspectRatios.value.includes(value.value.aspect_ratio || '16:9'))
+const aspectRatioError = computed(() => aspectRatioInvalid.value
+  ? `当前模型不支持 ${value.value.aspect_ratio} 画幅。请选择 ${allowedAspectRatios.value.join('、')}。`
+  : '')
+const upscaleOptions = computed(() => {
+  const resolution = String(value.value.resolution || '720p').toLowerCase()
+  const items = [{ label: '不超分（保持原分辨率）', value: '' }]
+  if (resolution === '480p') items.push({ label: '超分至 720p', value: '720p' }, { label: '超分至 1080p', value: '1080p' })
+  else if (resolution === '720p') items.push({ label: '超分至 1080p', value: '1080p' })
+  return items
+})
+const quote = ref(null), quoteLoading = ref(false), quoteError = ref('')
+let quoteTimer = null, quoteRevision = 0
+function formatPoints(value) { return Number(value || 0).toFixed(4).replace(/\.?(?:0+)$/, '') }
+function displayModelName(model) {
+  return modelLabel(modelNames.value, model)
+}
+function set(key, next) {
+  const nextValue = { ...value.value, [key]: key === 'duration' ? Math.min(modelMaxDuration.value, Math.max(4, Number(next) || 15)) : next }
+  if (key === 'video_model') {
+    const capability = videoModels.value.find((item) => modelKey(item.model) === modelKey(next))
+    const nextMaxDuration = Number(capability?.limits?.duration?.max)
+    const durationLimit = Number.isFinite(nextMaxDuration) && nextMaxDuration > 0 ? nextMaxDuration : isSeedance25Model(next) ? 30 : props.maxDuration
+    nextValue.duration = Math.min(durationLimit, Math.max(4, Number(nextValue.duration) || 15))
+    const configured = capability?.limits?.resolutions
+    const allowed = Array.isArray(configured) && configured.length ? configured.map((item) => String(item).toLowerCase()) : allResolutionOptions.map((item) => item.value)
+    const current = String(nextValue.resolution || '720p').toLowerCase()
+    if (!allowed.includes(current)) {
+      nextValue.resolution = allowed.includes('720p') ? '720p' : allowed[0]
+      if (current === '1080p' && nextValue.resolution === '720p') nextValue.upscale_resolution = '1080p'
+    }
+  }
+  if (key === 'resolution') {
+    const allowed = next === '480p' ? ['720p', '1080p'] : next === '720p' ? ['1080p'] : []
+    if (!allowed.includes(nextValue.upscale_resolution)) nextValue.upscale_resolution = null
+  }
+  emit('update:modelValue', nextValue)
+}
+function scheduleQuote() {
+  clearTimeout(quoteTimer)
+  const revision = ++quoteRevision
+  const upscale = value.value.upscale_resolution || null
+  const fps = value.value.target_fps || null
+  const includeGeneration = props.includeGenerationQuote && !!value.value.video_model
+  if (props.includeGenerationQuote && !includeGeneration) {
+    quote.value = null
+    quoteError.value = ''
+    quoteLoading.value = false
+    return
+  }
+  if (!includeGeneration && !upscale && !fps) {
+    quote.value = { estimated_total_points: 0 }
+    quoteError.value = ''
+    quoteLoading.value = false
+    return
+  }
+  quote.value = null
+  quoteError.value = ''
+  quoteLoading.value = true
+  quoteTimer = setTimeout(async () => {
+    try {
+      const requests = []
+      if (includeGeneration) requests.push(omniVideoAPI.quoteBilling({
+        model: value.value.video_model,
+        duration: duration.value,
+        resolution: value.value.resolution || '720p',
+        has_video_input: props.hasVideoInput,
+        has_audio: props.hasAudioInput,
+      }).then((result) => ({ kind: 'generation', points: Number(result?.amount || 0) })))
+      if (upscale || fps) requests.push(videosAPI.postprocessQuote({ duration: duration.value, resolution: value.value.resolution || '720p', aspect_ratio: value.value.aspect_ratio || '16:9', upscale_resolution: upscale, target_fps: fps, source_fps: 30 }).then((result) => ({ kind: 'postprocess', points: Number(result?.estimated_total_points || 0) })))
+      const results = await Promise.all(requests)
+      if (revision === quoteRevision) quote.value = {
+        estimated_total_points: results.reduce((sum, item) => sum + item.points, 0),
+      }
+    } catch (_) {
+      if (revision === quoteRevision) {
+        quote.value = null
+        quoteError.value = '预计积分暂不可用'
+      }
+    } finally { if (revision === quoteRevision) quoteLoading.value = false }
+  }, 250)
+}
+watch(() => [value.value.video_model, value.value.duration, value.value.resolution, value.value.aspect_ratio, value.value.upscale_resolution, value.value.target_fps, props.includeGenerationQuote, props.hasVideoInput, props.hasAudioInput], scheduleQuote, { immediate: true })
+onBeforeUnmount(() => clearTimeout(quoteTimer))
+function configModels(configs) { return [...new Set((configs || []).filter((item) => item.is_active !== false).flatMap((item) => Array.isArray(item.model) ? item.model : item.model ? [item.model] : []).filter(Boolean))] }
+onMounted(async () => {
+  if (!modelOptionsPromise) {
+    modelOptionsPromise = Promise.allSettled([aiAPI.list('text', { selectable: true }), omniVideoAPI.capabilities()]).then(([text, video]) => {
+      const names = text.status === 'fulfilled' ? collectDisplayNames(text.value) : {}
+      const videoList = video.status === 'fulfilled' && Array.isArray(video.value) ? video.value : []
+      for (const item of videoList) if (item?.display_name && item.display_name !== item.model) names[item.model] = item.display_name
+      return {
+        text: text.status === 'fulfilled' ? configModels(text.value) : [],
+        video: videoList,
+        names,
+      }
+    }).then((result) => { modelOptionsCache = result; return result })
+  }
+  const options = modelOptionsCache || await modelOptionsPromise
+  textModels.value = options.text
+  videoModels.value = options.video
+  modelNames.value = options.names || {}
+})
+</script>
+
+<style scoped>
+.generation-settings{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;width:100%;padding:14px;border:1px solid var(--ui-line-1);border-radius:var(--ui-radius-panel);background:var(--ui-surface-1)}.duration-setting{grid-column:span 1}.postprocess-quote{grid-column:1/-1;padding:10px 12px;border:1px solid color-mix(in srgb,var(--ui-accent) 24%,var(--ui-line-1));border-radius:var(--ui-radius-control);background:color-mix(in srgb,var(--ui-accent) 9%,var(--ui-surface-2));color:var(--ui-text-2);font-size:13px;line-height:1.55}.postprocess-quote b{color:var(--ui-text-1)}.postprocess-quote small{display:block;margin-top:5px;color:var(--ui-text-3);line-height:1.5}
+/* 窄容器（AI 工具箱控制栏、创作面板）里一律单列，避免选择器被压成 72px。 */
+:global(.creation-panel .generation-settings),:global(.control-panel .generation-settings){grid-template-columns:1fr;gap:12px;padding:14px}
+:global(.creation-panel .generation-settings .duration-setting){grid-column:1}
+:global(.creation-panel .generation-settings .duration-controls){grid-template-columns:minmax(0,1fr) 88px;align-items:center}
+:global(.creation-panel .generation-settings .duration-controls .el-input-number){max-width:none}
+:global(.creation-panel .generation-settings .duration-controls .el-button){padding-inline:4px;font-size:12px}
+@media(max-width:700px){.generation-settings{grid-template-columns:1fr 1fr}}@media(max-width:420px){.generation-settings{grid-template-columns:1fr}}
+</style>

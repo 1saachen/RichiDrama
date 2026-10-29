@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PREVIEW_ROOT="${MINIDRAMA_PREVIEW_ROOT:-/data/minidrama-previews}"
+RELEASE_ROOT="${MINIDRAMA_RELEASE_ROOT:-/data/minidrama-releases}"
+INCOMING_ROOT="${MINIDRAMA_INCOMING_ROOT:-/data/minidrama-incoming}"
+PROD_DATA_DIR="${MINIDRAMA_DATA_DIR:-/data/minidrama-data}"
+DEPLOY_LOCK="${MINIDRAMA_DEPLOY_LOCK:-/var/lock/minidrama-deploy.lock}"
+PROD_CONTAINER="${MINIDRAMA_PROD_CONTAINER:-local-minidrama}"
+HTTP_NGINX_CONTAINER="${MINIDRAMA_HTTP_NGINX_CONTAINER:-${MINIDRAMA_NGINX_CONTAINER:-lens-rhyme-nginx-1}}"
+PROD_PROXY_NETWORK="${MINIDRAMA_PROXY_NETWORK:-lens-rhyme_default}"
+
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >&2; }
+fail() { log "ERROR: $*" >&2; exit 1; }
+
+require_root() { [[ "$(id -u)" == "0" ]] || fail 'Run this command as root.'; }
+
+# Production boots must never silently degrade to local storage because an
+# environment file went missing alongside a repository refresh.
+require_env_file() {
+  local profile="${1:-${MINIDRAMA_PROFILE:-prod}}" file
+  file="$(resolve_env_file "$profile")"
+  [[ -n "$file" ]] || fail \
+    "Environment file not found for profile $profile. Put .$profile.env in /data/minidrama-config."
+  printf '%s\n' "$file"
+}
+
+acquire_lock() {
+  mkdir -p "$(dirname "$DEPLOY_LOCK")"
+  exec 9>"$DEPLOY_LOCK"
+  flock -n 9 || fail 'Another RichiDrama deployment operation is running.'
+}
+
+validate_sha() { [[ "${1:-}" =~ ^[0-9a-f]{40}$ ]] || fail "Invalid commit SHA: ${1:-<empty>}"; }
+validate_pr() { [[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || fail "Invalid PR number: ${1:-<empty>}"; }
+
+resolve_env_file() {
+  local profile="${1:-${MINIDRAMA_PROFILE:-prod}}"
+  [[ "$profile" =~ ^(dev|preview|prod)$ ]] || fail "Invalid environment profile: $profile"
+  local candidates=(
+    "${MINIDRAMA_ENV_FILE:-}"
+    "/data/minidrama-config/.${profile}.env"
+    "/data/apps/LocalMiniDrama/.${profile}.env"
+    # Compatibility paths. Remove only after every server has migrated.
+    "/data/minidrama-config/minidrama.oss.env"
+    "/data/apps/LocalMiniDrama/minidrama.oss.env"
+  )
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -n "$candidate" && -f "$candidate" ]]; then printf '%s\n' "$candidate"; return; fi
+  done
+  printf '%s\n' ''
+}
+
+require_running_container() {
+  local container="$1"
+  docker ps --format '{{.Names}}' | grep -Fqx "$container" || fail "Required container is not running: $container"
+}
+
+require_container_network() {
+  local container="$1" network="$2" networks
+  require_running_container "$container"
+  docker network inspect "$network" >/dev/null 2>&1 || fail "Docker network does not exist: $network"
+  networks="$(docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$container")"
+  grep -Fqx "$network" <<<"$networks" || fail "Container $container is not connected to network $network"
+}
+
+validate_production_ingress() {
+  require_container_network "$HTTP_NGINX_CONTAINER" "$PROD_PROXY_NETWORK"
+  docker exec "$HTTP_NGINX_CONTAINER" sh -eu -c '
+    active="$(nginx -T 2>&1)"
+    printf "%s\n" "$active" | grep -Eq "server_name[[:space:]]+drama\\.richbest\\.cn;"
+    printf "%s\n" "$active" | grep -Eq "proxy_pass[[:space:]]+http://minidrama-app:5679"
+    count="$(printf "%s\n" "$active" | grep -Ec "server_name[[:space:]]+drama\\.richbest\\.cn;")"
+    [ "$count" -eq 1 ]
+    getent hosts minidrama-app >/dev/null
+    nginx -t
+  ' || fail 'Production Nginx ingress validation failed.'
+}
+
+# Preview deploys apply the same read-only checks to the complete active Nginx
+# configuration. The RichiDrama vhost can live in any included conf.d file.
+validate_production_ingress_readonly() {
+  require_container_network "$HTTP_NGINX_CONTAINER" "$PROD_PROXY_NETWORK"
+  validate_production_ingress
+}
+
+prepare_source() {
+  local sha="$1" archive="${INCOMING_ROOT}/${1}.tar.gz" target="${RELEASE_ROOT}/${1}/source" resolved_root resolved_target
+  validate_sha "$sha"
+  resolved_root="$(realpath -m "$RELEASE_ROOT")"
+  resolved_target="$(realpath -m "$target")"
+  [[ "$resolved_root" != '/' && "$resolved_target" == "$resolved_root/$sha/source" ]] || fail "Unsafe release path: $resolved_target"
+  [[ -f "$archive" ]] || fail "Source archive not found: $archive"
+  if tar -tzf "$archive" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+    fail 'Source archive contains an unsafe path.'
+  fi
+  mkdir -p "$RELEASE_ROOT"
+  if mkdir "${RELEASE_ROOT}/${sha}" 2>/dev/null; then
+    # Only a directory this function created is stamped. Retrying an older SHA
+    # reuses a pre-policy directory, and that history must not become collectible
+    # just because it was unpacked again.
+    touch "${RELEASE_ROOT}/${sha}/.gc-stamp"
+  fi
+  target="${RELEASE_ROOT}/${sha}/source"
+  rm -rf "$target"
+  mkdir -p "$target"
+  tar -xzf "$archive" -C "$target"
+  [[ -f "$target/Dockerfile" && -f "$target/backend-node/package.json" ]] || fail 'Source archive is incomplete.'
+  printf '%s\n' "$target"
+}
+
+build_image() {
+  local sha="$1" source_dir="$2" image="local-minidrama:${1}"
+  local pull_args=()
+  if [[ "${MINIDRAMA_PULL_BASE_IMAGES:-0}" == 1 ]]; then
+    pull_args+=(--pull)
+  fi
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    log "Building immutable image $image"
+    # Normal releases reuse the validated local base. Planned maintenance can
+    # set MINIDRAMA_PULL_BASE_IMAGES=1 to refresh it explicitly.
+    docker build "${pull_args[@]}" --build-arg "APP_REVISION=$sha" -t "$image" "$source_dir" || \
+      fail "Immutable image build failed: $image"
+  else
+    log "Using existing image $image"
+  fi
+  printf '%s\n' "$image"
+}
+
+build_preview_image() {
+  local sha="$1" source_dir="$2" image="local-minidrama:${1}"
+  local base_image base_tag="local-minidrama:preview-runtime-base"
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    require_running_container "$PROD_CONTAINER"
+    base_image="$(docker inspect --format '{{.Image}}' "$PROD_CONTAINER")"
+    [[ "$base_image" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'Cannot resolve the production image ID.'
+    docker image tag "$base_image" "$base_tag"
+    log "Building preview image $image from the active production runtime"
+    docker build --file "$source_dir/Dockerfile.preview" \
+      --build-arg "RUNTIME_BASE_IMAGE=$base_tag" \
+      --build-arg "APP_REVISION=$sha" \
+      --build-arg "PREVIEW_TITLE_BADGE=1" \
+      -t "$image" "$source_dir" || fail "Preview image build failed: $image"
+  else
+    log "Using existing image $image"
+  fi
+  printf '%s\n' "$image"
+}
+
+create_online_snapshot() {
+  local output="$1" name
+  mkdir -p "$(dirname "$output")"
+  rm -f "$output" "${output}-wal" "${output}-shm"
+  if [[ ! -f "${PROD_DATA_DIR}/drama_generator.db" ]]; then
+    log 'Production database does not exist. The verifier will create an empty database.'
+    return
+  fi
+  docker inspect "$PROD_CONTAINER" >/dev/null 2>&1 || fail "Production container is not available: $PROD_CONTAINER"
+  local env_file storage_type
+  env_file="$(resolve_env_file)"
+  storage_type="$(awk -F= '$1=="MINIDRAMA_STORAGE_TYPE"{gsub(/^[ \t]+|[ \t]+$/, "", $2); print tolower($2); exit}' "$env_file" 2>/dev/null || true)"
+  if [[ "$storage_type" == oss ]]; then
+    local unsynced
+    unsynced="$(docker exec "$PROD_CONTAINER" node -e 'const Database=require("better-sqlite3");const db=new Database("/app/backend-node/data/drama_generator.db",{readonly:true});const exists=db.prepare("SELECT 1 FROM sqlite_master WHERE type=? AND name=?").get("table","media_archive_records");const count=exists?db.prepare("SELECT COUNT(*) count FROM media_archive_records WHERE archive_status NOT IN (?,?)").get("oss_synced","local_pruned").count:0;db.close();process.stdout.write(String(count))' 2>/dev/null || true)"
+    [[ "$unsynced" =~ ^[0-9]+$ ]] || fail 'Cannot verify the production OSS archive ledger.'
+    [[ "$unsynced" == 0 ]] || fail "$unsynced media records are not OSS-synced."
+  fi
+  name="snapshot-$(date +%s)-$$.db"
+  mkdir -p "${PROD_DATA_DIR}/.deploy-snapshots"
+  # A crashed release can leave its staged snapshot inside the data mount, where
+  # every later media backup would copy the same database again.
+  find "${PROD_DATA_DIR}/.deploy-snapshots" -maxdepth 1 -type f -name 'snapshot-*.db' -mmin +60 -delete
+  docker exec -e "SNAPSHOT_TARGET=/app/backend-node/data/.deploy-snapshots/${name}" "$PROD_CONTAINER" \
+    node -e 'const Database=require("better-sqlite3");(async()=>{const db=new Database("/app/backend-node/data/drama_generator.db",{readonly:true});await db.backup(process.env.SNAPSHOT_TARGET);db.close()})().catch(e=>{console.error(e);process.exit(1)})'
+  mv "${PROD_DATA_DIR}/.deploy-snapshots/${name}" "$output"
+  [[ -f "$output" ]] || fail 'SQLite online backup did not create the snapshot.'
+}
+
+verify_migrations() {
+  local image="$1" data_dir="$2"
+  mkdir -p "$data_dir"
+  log "Verifying migrations twice against $data_dir"
+  docker run --rm --network none \
+    --security-opt no-new-privileges --cap-drop ALL \
+    -v "${data_dir}:/verify-data" \
+    "$image" node tools/verify-migrations.js /verify-data/drama_generator.db
+}
+
+wait_container_ready() {
+  local container="$1" revision="$2" timeout="${3:-90}" elapsed=0
+  while (( elapsed < timeout )); do
+    local actual
+    actual="$(docker exec "$container" node -e 'require("http").get("http://127.0.0.1:5679/ready",r=>{let b="";r.on("data",c=>b+=c);r.on("end",()=>{try{if(r.statusCode===200)process.stdout.write(JSON.parse(b).revision||"")}catch(_){}})}).on("error",()=>{})' 2>/dev/null || true)"
+    [[ "$actual" == "$revision" ]] && return 0
+    sleep 3
+    elapsed=$((elapsed + 3))
+  done
+  docker logs --tail 100 "$container" >&2 || true
+  return 1
+}
+
+run_preflight_app() {
+  local image="$1" sha="$2" data_dir="$3"
+  local name="minidrama-preflight-${sha:0:12}"
+  local env_file env_args=()
+  env_file="$(resolve_env_file prod)"
+  [[ -n "$env_file" ]] && env_args+=(--env-file "$env_file")
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" --network none \
+    --security-opt no-new-privileges --cap-drop ALL --pids-limit 256 \
+    --memory 2g --cpus 1 --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m \
+    "${env_args[@]}" -e NODE_ENV=production -e PORT=5679 -e "APP_REVISION=$sha" \
+    -v "${data_dir}:/app/backend-node/data" "$image" >/dev/null
+  if ! wait_container_ready "$name" "$sha" 90; then
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    fail 'Candidate application did not become ready during preflight.'
+  fi
+  if ! docker exec "$name" node -e 'require("http").get("http://127.0.0.1:5679/",r=>process.exit(r.statusCode===200?0:1)).on("error",()=>process.exit(1))'; then
+    docker logs --tail 100 "$name" >&2 || true
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    fail 'Candidate frontend smoke check failed.'
+  fi
+  docker rm -f "$name" >/dev/null
+}
+
+safe_remove_preview_dir() {
+  local pr="$1" target="${PREVIEW_ROOT}/pr-${1}" resolved_root resolved_target
+  validate_pr "$pr"
+  resolved_root="$(realpath -m "$PREVIEW_ROOT")"
+  resolved_target="$(realpath -m "$target")"
+  [[ "$resolved_target" == "$resolved_root/pr-$pr" ]] || fail "Unsafe preview path: $resolved_target"
+  [[ "$resolved_target" != "$resolved_root" && "$resolved_target" != '/' ]] || fail "Refusing broad removal: $resolved_target"
+  rm -rf -- "$resolved_target"
+}
+
+remove_preview_resources() {
+  local pr="$1"
+  validate_pr "$pr"
+  # Legacy overlay views from earlier deployments must be detached before the
+  # per-PR directory can be removed ('Device or resource busy' otherwise).
+  local legacy_view="$PREVIEW_ROOT/pr-$pr/media-view"
+  if mountpoint -q "$legacy_view" 2>/dev/null; then
+    umount -l "$legacy_view" >/dev/null 2>&1 || true
+  fi
+  # Same for the current per-PR media view.
+  local media_view="$PREVIEW_ROOT/pr-$pr/storage-view"
+  if mountpoint -q "$media_view" 2>/dev/null; then
+    umount -l "$media_view" >/dev/null 2>&1 || true
+  fi
+  # Remove only this preview's route before removing its container.
+  if docker ps --format '{{.Names}}' | grep -Fqx "$HTTP_NGINX_CONTAINER"; then
+    docker exec "$HTTP_NGINX_CONTAINER" rm -f "/etc/nginx/conf.d/preview-pr-$pr.conf" "/etc/nginx/sites-enabled/preview-pr-$pr.conf"
+    docker exec "$HTTP_NGINX_CONTAINER" nginx -t
+    docker exec "$HTTP_NGINX_CONTAINER" nginx -s reload
+  fi
+  mapfile -t preview_containers < <(docker ps -aq --filter "label=com.richidrama.preview-pr=$pr")
+  ((${#preview_containers[@]} == 0)) || docker rm -f "${preview_containers[@]}" >/dev/null
+  safe_remove_preview_dir "$pr"
+}
+
+# Media tree fidelity: production serves media from its local hot-copy tree,
+# and legacy uploads exist ONLY there (the OSS archive ledger starts later).
+# Mount an OverlayFS union view into the preview container at the exact
+# storage path: reads present the real production bytes, writes and deletions
+# land in the preview-private upper directory — production bytes stay
+# immutable. Re-created fresh on every deploy; failure degrades to an empty
+# storage tree (the application then behaves like a fresh install).
+ensure_preview_media_tree() {
+  local pr_dir="$1"
+  local lower="${MINIDRAMA_MEDIA_SOURCE_DIR:-${PROD_DATA_DIR}/storage}"
+  local upper="$pr_dir/storage-upper" work="$pr_dir/storage-work" view="$pr_dir/storage-view"
+  [[ -d "$lower" ]] || {
+    log "No production media directory at $lower; preview storage starts empty."
+    printf '%s\n' ''
+    return 0
+  }
+  # Always remount: the lower tree changes with production and the view must
+  # reflect the latest state at deploy time.
+  umount -l "$view" >/dev/null 2>&1 || true
+  rm -rf -- "$upper" "$work"
+  mkdir -p "$upper" "$work" "$view"
+  if ! mount -t overlay overlay -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$view"; then
+    log 'OverlayFS media view unavailable; preview storage starts empty.'
+    return 0
+  fi
+  printf '%s\n' "$view"
+}
+
+install_ingress_conf_at() {
+  # $1 = conf file on disk, $2 = absolute path inside the ingress container.
+  # Succeeds only when the dropped file is part of the effective
+  # configuration (nginx -T lists every file it actually includes).
+  local conf_source="$1" conf_target="$2"
+  docker cp "$conf_source" "$HTTP_NGINX_CONTAINER:$conf_target"
+  docker exec "$HTTP_NGINX_CONTAINER" nginx -t
+  docker exec "$HTTP_NGINX_CONTAINER" nginx -s reload
+  docker exec "$HTTP_NGINX_CONTAINER" sh -eu -c '
+    nginx -T 2>/dev/null | grep -Fq "configuration file $1"
+  ' sh "$conf_target"
+}
+
+render_preview_vhost() {
+  local template="$1" pr="$2"
+  validate_pr "$pr"
+  # Exact hostnames keep another PR's older shared template from changing
+  # this preview's protocol support. Keep DNS resolution at request time.
+  awk -v pr="$pr" '
+    /^resolver / { resolver = $0; next }
+    /^# Any other preview-zone/ { exit }
+    /server_name / {
+      print "    server_name pr-" pr ".preview.drama.richbest.cn;"
+      print "    set $preview_pr " pr ";"
+      print "    " resolver
+      next
+    }
+    { print }
+  ' "$template"
+}
+
+install_preview_ingress() {
+  local vhost_conf="$1" auth_dir="$PREVIEW_ROOT/auth"
+  [[ -r "$auth_dir/htpasswd" ]] || fail 'Preview basic-auth file is missing.'
+  require_running_container "$HTTP_NGINX_CONTAINER"
+  # The shared ingress container can be recreated by the Lens deployment.
+  # Restore the auth file with the vhost instead of relying on old container
+  # state.
+  docker cp "$auth_dir/htpasswd" "$HTTP_NGINX_CONTAINER:/etc/nginx/minidrama-preview.htpasswd"
+  docker exec "$HTTP_NGINX_CONTAINER" chmod 0644 /etc/nginx/minidrama-preview.htpasswd
+  # Files dropped by earlier layouts must never survive: the ACME-era suffix
+  # wildcard and the per-PR direct vhosts would outrank or duplicate the
+  # current routing.
+  docker exec "$HTTP_NGINX_CONTAINER" sh -eu -c '
+    rm -f /etc/nginx/conf.d/minidrama-preview-http.conf
+    rm -f /etc/nginx/conf.d/minidrama-previews.conf
+    rm -f /etc/nginx/conf.d/minidrama-previews-ingress.conf
+  '
+  if ! install_ingress_conf_at "$vhost_conf" '/etc/nginx/conf.d/minidrama-preview-vhost.conf'; then
+    log 'conf.d is not part of the ingress include layout; trying sites-enabled.'
+    docker exec "$HTTP_NGINX_CONTAINER" rm -f /etc/nginx/conf.d/minidrama-preview-vhost.conf
+    install_ingress_conf_at "$vhost_conf" '/etc/nginx/sites-enabled/minidrama-preview-vhost.conf' || \
+      fail 'Ingress did not load the preview vhost; neither conf.d nor sites-enabled is included.'
+  fi
+  local pr="${PR_NUMBER:?}" generated="$PREVIEW_ROOT/pr-${PR_NUMBER}/ingress.conf"
+  render_preview_vhost "$vhost_conf" "$pr" > "$generated"
+  if ! install_ingress_conf_at "$generated" "/etc/nginx/conf.d/preview-pr-$pr.conf"; then
+    docker exec "$HTTP_NGINX_CONTAINER" rm -f "/etc/nginx/conf.d/preview-pr-$pr.conf"
+    install_ingress_conf_at "$generated" "/etc/nginx/sites-enabled/preview-pr-$pr.conf" || \
+      fail 'Ingress did not load this preview route.'
+  fi
+}
+
+prune_release_images() {
+  local keep="${MINIDRAMA_KEEP_IMAGES:-5}" current_image rollback_image
+  current_image="$(docker inspect --format '{{.Config.Image}}' "$PROD_CONTAINER" 2>/dev/null || true)"
+  rollback_image="$(awk -F= '$1=="PREVIOUS_IMAGE"{print $2}' "${RELEASE_ROOT}/rollback.env" 2>/dev/null || true)"
+  mapfile -t tags < <(docker images local-minidrama --format '{{.Tag}} {{.CreatedAt}}' | \
+    awk '$1 ~ /^[0-9a-f]{40}$/ {print}' | sort -rk2,3 | awk '{print $1}')
+  local index tag image
+  for ((index=keep; index<${#tags[@]}; index++)); do
+    tag="${tags[$index]}"; image="local-minidrama:$tag"
+    [[ "$image" == "$current_image" || "$image" == "$rollback_image" ]] && continue
+    docker image rm "$image" >/dev/null 2>&1 || true
+  done
+}
+
+release_is_referenced() {
+  local sha="$1" active
+  local state="${RELEASE_ROOT}/rollback.env"
+  active="$(cat "${RELEASE_ROOT}/active-revision" 2>/dev/null || true)"
+  if [[ -n "$active" && "$sha" == "$active" ]]; then return 0; fi
+  if [[ -f "$state" ]]; then
+    awk -F= '$1=="CANDIDATE_REVISION"||$1=="PREVIOUS_REVISION"{print $2}' "$state" | grep -Fqx "$sha" && return 0
+  fi
+  return 1
+}
+
+# prepare_source stamps every directory it creates. Release collection only ever
+# touches stamped directories, so data that predates this policy stays exactly
+# where it is until an operator opts in to the backlog cleanup.
+release_is_collectible() {
+  [[ -f "${1}/.gc-stamp" ]] || [[ "${MINIDRAMA_GC_INCLUDE_LEGACY:-0}" == 1 ]]
+}
+
+# A release leaves an unpacked source tree, a migrated preflight database copy
+# and a full pre-release database behind, and a CI preview leaves an unpacked
+# source tree. The source tree and the preflight copy are reproducible from Git
+# and from the production snapshot, so they are removed as soon as a release is
+# superseded. A pre-release database is a recovery point: it survives for the
+# newest MINIDRAMA_KEEP_RELEASES successful releases and for every release named
+# by active-revision or rollback.env, and only disappears with its directory
+# after that window.
+prune_release_artifacts() {
+  local keep="${MINIDRAMA_KEEP_RELEASES:-5}"
+  local current="${MINIDRAMA_GC_CURRENT_SHA:-}"
+  local root dir sha
+  local -a kept=()
+  [[ "$keep" =~ ^[1-9][0-9]*$ ]] || keep=5
+  root="$(realpath -m "$RELEASE_ROOT")"
+  [[ "$root" = /* && "$root" != / ]] || return 0
+  mapfile -t kept < <(find "$root" -mindepth 2 -maxdepth 2 -type f -name succeeded -printf '%T@ %h\n' 2>/dev/null |
+    sort -nr | cut -d' ' -f2- | while IFS= read -r dir; do
+      release_is_collectible "$dir" && printf '%s\n' "$dir"
+    done | head -n "$keep")
+  while IFS= read -r dir; do
+    sha="${dir##*/}"
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+    [[ -z "$current" || "$sha" != "$current" ]] || continue
+    release_is_collectible "$dir" || continue
+    if release_is_referenced "$sha" || printf '%s\n' "${kept[@]}" | grep -Fqx -- "$dir"; then
+      rm -rf -- "${dir}/preflight-data"
+    elif [[ -f "${dir}/production-before.db" && ! -f "${dir}/succeeded" ]]; then
+      # An aborted release never wrote its success marker, so it takes no slot in
+      # the keep window. Its pre-release database is still the only copy of the
+      # state before that attempt, which is exactly what an operator needs after
+      # a rollback. Drop the reproducible parts and keep the snapshot.
+      rm -rf -- "${dir}/source" "${dir}/preflight-data"
+    else
+      rm -rf -- "$dir"
+    fi
+  done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%p\n' 2>/dev/null)
+}

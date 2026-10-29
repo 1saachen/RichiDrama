@@ -1,0 +1,859 @@
+// AI 配置 CRUD，与 Go application/services/ai_service.go 对齐
+const fs = require('fs');
+const path = require('path');
+const { normalizeMaterialHubToken } = require('./jimengMaterialHubService');
+
+// 对外回显掩码：仅保留前 4 位与后 4 位，中间以 **** 代替。
+// 内部调用（aiClient / testConnection 等）仍使用真实 api_key，仅路由层回显时脱敏。
+function maskApiKey(key) {
+  if (key == null || key === '') return '';
+  const s = String(key);
+  if (s.length <= 8) return '****';
+  return s.slice(0, 4) + '****' + s.slice(-4);
+}
+
+function isMaskedApiKey(key) {
+  return typeof key === 'string' && key.includes('****');
+}
+
+function normalizeApiKeyForService(serviceType, apiKey) {
+  if (apiKey == null) return apiKey;
+  if (serviceType === 'jimeng2_character_auth') {
+    return normalizeMaterialHubToken(apiKey);
+  }
+  // 粘贴凭证时经常连 "Bearer " 一起带上：各调用方还会再拼一次前缀，结果是
+  // "Bearer Bearer xxx" → 401。这里统一剥掉，读写两侧都走同一口径。
+  return String(apiKey).replace(/^Bearer\s+/i, '').trim();
+}
+
+function parseSettings(value) {
+  if (!value) return {};
+  if (typeof value === 'object') return value;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function usesOfficialAccessSecret(body, existing = null) {
+  const serviceType = String(body.service_type ?? existing?.service_type ?? '').trim();
+  const protocol = String(body.api_protocol ?? existing?.api_protocol ?? '').trim();
+  const settings = parseSettings(body.settings ?? existing?.settings);
+  if (serviceType === 'model_ark_asset') {
+    return Boolean(String(settings.access_key_id || '').trim() && String(settings.secret_access_key || '').trim());
+  }
+  return serviceType === 'video'
+    && protocol === 'kling_omni'
+    && Boolean(String(settings.kling_access_key || '').trim() && String(settings.kling_secret_key || '').trim());
+}
+
+// 专用服务按固定算子工作，不绑定可切换模型；价目表按算子名单独发布。
+const MODELLESS_SERVICE_TYPES = new Set(['model_ark_asset', 'video_localization']);
+
+function modelList(value) {
+  if (Array.isArray(value)) return value.map((item) => String(item || '').trim()).filter(Boolean);
+  if (value == null) return [];
+  return [String(value).trim()].filter(Boolean);
+}
+
+/**
+ * Validate user-facing AI configuration requests. Internal template creation
+ * intentionally uses createConfig directly and may keep credentials blank.
+ */
+function validateConfigRequest(body = {}, { mode = 'create', existing = null } = {}) {
+  const required = ['service_type', 'name', 'provider', 'base_url'];
+  if (mode === 'create') {
+    const missing = required.filter((field) => !String(body[field] ?? '').trim());
+    if (missing.length) throw new Error(`缺少必填字段: ${missing.join(', ')}`);
+  } else {
+    for (const field of required) {
+      if (Object.prototype.hasOwnProperty.call(body, field) && !String(body[field] ?? '').trim()) {
+        throw new Error(`${field} 不能为空`);
+      }
+    }
+  }
+
+  const effective = { ...(existing || {}), ...body };
+  const specialCredential = usesOfficialAccessSecret(effective, existing);
+  const hasApiKey = Object.prototype.hasOwnProperty.call(body, 'api_key');
+  const apiKey = body.api_key == null ? '' : String(body.api_key).trim();
+  const masked = isMaskedApiKey(body.api_key);
+  if ((mode === 'create' || hasApiKey) && !masked && !apiKey && !specialCredential) {
+    throw new Error('api_key 不能为空；官方 AK/SK 配置可不填 API Key');
+  }
+
+  const hasModel = Object.prototype.hasOwnProperty.call(body, 'model');
+  const shouldValidateModel = mode === 'create' || hasModel;
+  if (shouldValidateModel && !MODELLESS_SERVICE_TYPES.has(effective.service_type) && !modelList(effective.model).length) {
+    throw new Error('至少配置一个模型');
+  }
+  return true;
+}
+const { applyDeepSeekConnectivityOptions } = require('./deepseekConfig');
+function modelToDb(model) {
+  if (model == null) return null;
+  if (Array.isArray(model)) return JSON.stringify(model);
+  if (typeof model === 'string') return JSON.stringify([model]);
+  return JSON.stringify([]);
+}
+
+function modelFromDb(val) {
+  if (val == null || val === '') return [];
+  try {
+    const arr = JSON.parse(val);
+    return Array.isArray(arr) ? arr : [String(arr)];
+  } catch {
+    return [String(val)];
+  }
+}
+
+/** 每种服务类型只保留一个默认：若有多个 is_default=1，只保留优先级最高（同优先级取 id 最小）的那条 */
+function ensureSingleDefaultPerType(db) {
+  const types = ['text', 'image', 'storyboard_image', 'video', 'video_postprocess', 'tts', 'jimeng2_character_auth', 'model_ark_asset', 'video_localization'];
+  for (const st of types) {
+    const rows = db.prepare(
+      'SELECT id, priority FROM ai_service_configs WHERE deleted_at IS NULL AND COALESCE(owner_tenant_id, 0) = 0 AND service_type = ? AND is_default = 1 ORDER BY priority DESC, id ASC'
+    ).all(st);
+    if (rows.length <= 1) continue;
+    const keepId = rows[0].id;
+    db.prepare(
+      'UPDATE ai_service_configs SET is_default = 0 WHERE deleted_at IS NULL AND COALESCE(owner_tenant_id, 0) = 0 AND service_type = ? AND id != ?'
+    ).run(st, keepId);
+  }
+}
+
+function listConfigs(db, serviceType, options = {}) {
+  ensureSingleDefaultPerType(db);
+  const order = 'ORDER BY is_default DESC, priority DESC, created_at DESC';
+  let sql = 'SELECT * FROM ai_service_configs WHERE deleted_at IS NULL ' + order;
+  const params = [];
+  if (serviceType) {
+    sql = 'SELECT * FROM ai_service_configs WHERE deleted_at IS NULL AND service_type = ? ' + order;
+    params.push(serviceType);
+  }
+  // A tenant can explicitly bind its shared provider configurations. Only the
+  // migrated default tenant retains the legacy global fallback; an empty custom
+  // group must never silently borrow another group's provider credentials.
+  const tenantId = Number(options.tenant_id || options.tenantId);
+  if (tenantId) {
+    const tenantService = require('./tenantService');
+    const ids = serviceType
+      ? tenantService.configIdsForService(db, tenantId, serviceType)
+      : tenantService.configIdsForTenant(db, tenantId);
+    if (!ids.length && !tenantService.usesLegacyGlobalConfigs(db, tenantId)) return [];
+    if (ids.length) {
+      const typeClause = serviceType ? ' AND c.service_type = ?' : '';
+      // Group defaults are deliberately stored on bindings.  The same platform
+      // configuration may therefore be the default in one project group but a
+      // fallback in another, without changing the shared credential library.
+      sql = `SELECT c.*, b.is_default AS tenant_is_default, b.priority AS tenant_priority
+        FROM tenant_ai_config_bindings b JOIN ai_service_configs c ON c.id = b.ai_config_id
+        WHERE b.tenant_id = ? AND b.is_active = 1 AND c.deleted_at IS NULL${typeClause}
+        ORDER BY b.is_default DESC, b.priority DESC, c.priority DESC, c.created_at DESC`;
+      params.length = 0;
+      params.push(tenantId);
+      if (serviceType) params.push(serviceType);
+    }
+  }
+  const rows = params.length ? db.prepare(sql).all(...params) : db.prepare(sql).all();
+  const configs = rows.map(row => rowToConfig(row, db));
+  if (serviceType === 'storyboard_image') {
+    configs.push(...listConfigs(db, 'image', options).filter(config => config.provider_connection_id).map(config => ({ ...config, is_default: false })));
+  }
+  return options.scene_defaults === false ? configs : require('./sceneDefaultService').apply(db, serviceType, configs);
+}
+
+// Creators only need model choices. Provider credentials and transport
+// configuration must stay inside the backend.
+function publicConfig(config, displayNames = null) {
+  const names = Object.fromEntries((config.model || [])
+    .filter((model) => displayNames?.[`${config.service_type}\u0000${model}`])
+    .map((model) => [model, displayNames[`${config.service_type}\u0000${model}`]]));
+  return {
+    id: config.id,
+    service_type: config.service_type,
+    provider: config.provider,
+    name: config.name,
+    model: config.model,
+    default_model: config.default_model,
+    priority: config.priority,
+    is_default: config.is_default,
+    is_active: config.is_active,
+    // 模型目录里的展示名；提交值仍是 model 里的原 id，二者不得混用。
+    ...(Object.keys(names).length ? { display_names: names } : {}),
+  };
+}
+
+function catalogDisplayNames(db) {
+  try {
+    return Object.fromEntries(db.prepare('SELECT service_type, model, display_name FROM ai_model_catalog')
+      .all().map((row) => [`${row.service_type}\u0000${row.model}`, row.display_name]));
+  } catch (_) {
+    return null;
+  }
+}
+
+function listPublicConfigs(db, serviceType, options = {}) {
+  const displayNames = catalogDisplayNames(db);
+  return require('./modelCatalogService').filterConfigs(db, listConfigs(db, serviceType, options), options.user_id)
+    .map((config) => publicConfig(config, displayNames));
+}
+
+function resolveBillingTarget(db, serviceType, model, configId, options = {}) {
+  const providerModel = String(model || '').trim();
+  const configs = listConfigs(db, serviceType, options).filter((config) => config.is_active);
+  const config = configs.find((item) => Number(item.id) === Number(configId)) || configs.find((item) => item.model.includes(providerModel)) || configs[0] || null;
+  return { config_id: config?.id || null, provider: config?.provider || null, provider_model: providerModel, billing_key: String(config?.billing_key || providerModel).trim() };
+}
+
+function clearOtherDefault(db, serviceType, exceptId, ownerTenantId = null) {
+  const stmt = db.prepare(
+    'UPDATE ai_service_configs SET is_default = 0 WHERE deleted_at IS NULL AND service_type = ? AND id != ? AND ((COALESCE(?, 0) = 0 AND COALESCE(owner_tenant_id, 0) = 0) OR owner_tenant_id = ?)'
+  );
+  stmt.run(serviceType, exceptId, ownerTenantId, ownerTenantId);
+}
+
+function getConfig(db, id) {
+  const row = db.prepare('SELECT * FROM ai_service_configs WHERE id = ? AND deleted_at IS NULL').get(id);
+  return row ? rowToConfig(row, db) : null;
+}
+
+function listOwnedTenantConfigs(db, tenantId, serviceType) {
+  const params = [Number(tenantId)];
+  const legacy = require('./tenantService').usesLegacyGlobalConfigs(db, tenantId);
+  // legacy 组视图同时展示全局配置与本组自有配置;只看 IS NULL 会把
+  // 运营工作台向该组添加的配置(owner_tenant_id=组)从列表里排除。
+  let sql = `SELECT c.*, b.is_default AS tenant_is_default, b.priority AS tenant_priority
+    FROM ai_service_configs c LEFT JOIN tenant_ai_config_bindings b ON b.ai_config_id=c.id AND b.tenant_id=? AND b.is_active=1
+    WHERE c.deleted_at IS NULL AND ${legacy ? '(COALESCE(c.owner_tenant_id, 0) = 0 OR c.owner_tenant_id = ?)' : 'c.owner_tenant_id = ?'}`;
+  params.push(Number(tenantId));
+  if (serviceType) { sql += ' AND c.service_type = ?'; params.push(serviceType); }
+  sql += ' ORDER BY b.is_default DESC, b.priority DESC, c.created_at DESC';
+  return db.prepare(sql).all(...params).map(row => rowToConfig(row, db));
+}
+
+function createConfig(db, log, req) {
+  const now = new Date().toISOString();
+  const model = modelToDb(req.model);
+  let endpoint = req.endpoint || '';
+  let queryEndpoint = req.query_endpoint || '';
+  if (!endpoint && req.provider) {
+    const p = req.provider.toLowerCase();
+    const st = (req.service_type || 'text').toLowerCase();
+    if (p === 'openai') {
+      if (st === 'text') endpoint = '/chat/completions';
+      else if (st === 'image') endpoint = '/images/generations';
+      else if (st === 'video') {
+        endpoint = '/videos';
+        queryEndpoint = '/videos/{taskId}';
+      }
+    } else if (p === 'gemini' || p === 'google') {
+      endpoint = '/v1beta/models/{model}:generateContent';
+    } else if (p === 'dashscope' || p === 'qwen_image') {
+      if (st === 'image' || st === 'storyboard_image') endpoint = '/api/v1/services/aigc/multimodal-generation/generation';
+      else if (st === 'video' && p === 'dashscope') {
+        endpoint = '/api/v1/services/aigc/image2video/video-synthesis';
+        queryEndpoint = '/api/v1/tasks/{taskId}';
+      }
+    } else if (p === 'volces' || p === 'volcengine' || p === 'volc') {
+      if (st === 'video') {
+        endpoint = '/contents/generations/tasks';
+        queryEndpoint = '/contents/generations/tasks/{taskId}';
+      } else if (st === 'image' || st === 'storyboard_image') {
+        endpoint = '/images/generations';
+      }
+    } else if (p === 'richbest') {
+      const richbest = require('./richbestProvider');
+      if (st === 'video') {
+        endpoint = richbest.PATHS.videoTasks;
+        queryEndpoint = richbest.PATHS.videoTasks + '/{taskId}';
+      } else if (st === 'image' || st === 'storyboard_image') {
+        endpoint = '/images/generations';
+      } else if (st === 'text') {
+        endpoint = '/chat/completions';
+      }
+    } else if (p === 'nano_banana') {
+      if (st === 'image' || st === 'storyboard_image') {
+        endpoint = '/api/v1/nanobanana/generate-2';
+        queryEndpoint = '/api/v1/nanobanana/record-info';
+      }
+    } else if (p === 'agnes') {
+      if (st === 'text') endpoint = '/chat/completions';
+      else if (st === 'image' || st === 'storyboard_image') endpoint = '/images/generations';
+      else if (st === 'video') {
+        endpoint = '/videos';
+        queryEndpoint = '/videos/{taskId}';
+      }
+    }
+  }
+  const defaultModel = req.default_model != null ? String(req.default_model).trim() || null : null;
+  // 从脱敏导出文件导入的掩码 Key 不是真实凭据，不能原样入库
+  const rawApiKey = isMaskedApiKey(req.api_key) ? '' : (req.api_key || '');
+  const info = db.prepare(
+    `INSERT INTO ai_service_configs (service_type, provider, api_protocol, name, base_url, api_key, model, default_model, billing_key, endpoint, query_endpoint, priority, is_default, is_active, settings, owner_tenant_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`
+  ).run(
+    req.service_type || 'text',
+    req.provider || '',
+    req.api_protocol || '',
+    req.name || '',
+    req.base_url || '',
+    normalizeApiKeyForService(req.service_type, rawApiKey),
+    model,
+    defaultModel,
+    req.billing_key != null ? String(req.billing_key).trim() || null : null,
+    endpoint,
+    queryEndpoint,
+    req.priority ?? 0,
+    req.is_default ? 1 : 0,
+    req.settings || null,
+    (Number(req.owner_tenant_id) > 0) ? Number(req.owner_tenant_id) : null,
+    now,
+    now
+  );
+  log.info('AI config created', { config_id: info.lastInsertRowid, provider: req.provider });
+  const newId = info.lastInsertRowid;
+  if (req.is_default) clearOtherDefault(db, req.service_type || 'text', newId, req.owner_tenant_id || null);
+  return getConfig(db, newId);
+}
+
+function updateConfig(db, log, id, req) {
+  const existing = getConfig(db, id);
+  if (!existing) return null;
+  if (existing.provider_connection_id) {
+    if (req.service_type != null && req.service_type !== existing.service_type) throw new Error('模型绑定不能更换能力，请在供应商连接中重新导入');
+    if (req.model != null) {
+      const capability = require('./modelCapabilityService');
+      for (const model of modelList(req.model).filter(model => !existing.model.includes(model))) {
+        const known = capability.infer(model);
+        if (known && known !== capability.canonical(existing.service_type)) throw new Error('模型能力与绑定不匹配，请在共享连接中导入模型');
+      }
+    }
+    for (const key of ['provider', 'base_url', 'api_key']) {
+      if (req[key] != null && req[key] !== existing[key] && !(key === 'api_key' && isMaskedApiKey(req[key]))) {
+        throw new Error('请在供应商连接中修改共享地址和凭据');
+      }
+    }
+    req = { ...req };
+    delete req.provider; delete req.base_url; delete req.api_key;
+  }
+  const updates = [];
+  const params = [];
+  if (req.name != null) {
+    updates.push('name = ?');
+    params.push(req.name);
+  }
+  if (req.provider != null) {
+    updates.push('provider = ?');
+    params.push(req.provider);
+  }
+  if (req.api_protocol != null) {
+    updates.push('api_protocol = ?');
+    params.push(req.api_protocol);
+  }
+  if (req.base_url != null) {
+    updates.push('base_url = ?');
+    params.push(req.base_url);
+  }
+  // 掩码值（未修改的回显）不覆盖已保存的真实 Key；只有用户输入新 Key 才更新
+  if (req.api_key != null && !isMaskedApiKey(req.api_key)) {
+    updates.push('api_key = ?');
+    const st = req.service_type != null ? req.service_type : existing.service_type;
+    params.push(normalizeApiKeyForService(st, req.api_key));
+  }
+  if (req.model != null) {
+    updates.push('model = ?');
+    params.push(modelToDb(req.model));
+  }
+  if (req.default_model !== undefined) {
+    updates.push('default_model = ?');
+    params.push(req.default_model != null ? String(req.default_model).trim() || null : null);
+  }
+  if (req.billing_key !== undefined) {
+    updates.push('billing_key = ?');
+    params.push(req.billing_key != null ? String(req.billing_key).trim() || null : null);
+  }
+  if (req.priority != null) {
+    updates.push('priority = ?');
+    params.push(req.priority);
+  }
+  if (req.endpoint !== undefined) {
+    updates.push('endpoint = ?');
+    params.push(req.endpoint || '');
+  }
+  if (req.query_endpoint !== undefined) {
+    updates.push('query_endpoint = ?');
+    params.push(req.query_endpoint || '');
+  }
+  if (req.settings != null) {
+    updates.push('settings = ?');
+    params.push(req.settings);
+  }
+  if (typeof req.is_default === 'boolean') {
+    updates.push('is_default = ?');
+    params.push(req.is_default ? 1 : 0);
+  }
+  if (typeof req.is_active === 'boolean') {
+    updates.push('is_active = ?');
+    params.push(req.is_active ? 1 : 0);
+  }
+  if (updates.length === 0) return existing;
+  params.push(new Date().toISOString(), id);
+  db.prepare('UPDATE ai_service_configs SET ' + updates.join(', ') + ', updated_at = ? WHERE id = ?').run(...params);
+  if (req.is_default === true) clearOtherDefault(db, existing.service_type, id, existing.owner_tenant_id || null);
+  log.info('AI config updated', { config_id: id });
+  return getConfig(db, id);
+}
+
+function deleteConfig(db, log, id) {
+  const now = new Date().toISOString();
+  const result = db.prepare('UPDATE ai_service_configs SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL').run(now, id);
+  if (result.changes === 0) return false;
+  log.info('AI config deleted', { config_id: id });
+  return true;
+}
+
+function rowToConfig(r, db) {
+  const connection = r.provider_connection_id ? require('./providerConnectionService').get(db, r.provider_connection_id) : null;
+  const cfg = {
+    id: r.id,
+    provider_connection_id: r.provider_connection_id || null,
+    provider_connection_name: connection?.name || null,
+    service_type: r.service_type,
+    provider: r.provider,
+    api_protocol: r.api_protocol || '',
+    name: r.name,
+    base_url: connection?.base_url ?? r.base_url,
+    // 读侧也归一化：历史行里已经存进 "Bearer xxx" 的凭证不必等管理员重存才生效。
+    api_key: normalizeApiKeyForService(r.service_type, r.provider_connection_id ? connection?.api_key || '' : r.api_key),
+    model: modelFromDb(r.model),
+    default_model: r.default_model ? String(r.default_model).trim() : null,
+    billing_key: r.billing_key ? String(r.billing_key).trim() : null,
+    endpoint: r.endpoint,
+    query_endpoint: r.query_endpoint,
+    priority: r.tenant_priority ?? r.priority ?? 0,
+    is_default: r.tenant_is_default == null ? !!r.is_default : !!r.tenant_is_default,
+    platform_is_default: !!r.is_default,
+    is_active: (r.is_active == null ? true : !!r.is_active) && (!r.provider_connection_id || !!connection?.is_active),
+    settings: r.settings,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    owner_tenant_id: r.owner_tenant_id == null ? null : Number(r.owner_tenant_id),
+  };
+  if (connection) {
+    const capability = require('./modelCapabilityService');
+    cfg.model = cfg.model.filter(model => !capability.infer(model) || capability.infer(model) === capability.canonical(cfg.service_type));
+  }
+  // TTS 配置：从 settings JSON 展开 voice_id / group_id 供 ttsService 直接读取
+  if (r.service_type === 'tts' && r.settings) {
+    try {
+      const s = JSON.parse(r.settings);
+      if (s.voice_id) cfg.voice_id = s.voice_id;
+      if (s.group_id) cfg.group_id = s.group_id;
+    } catch (_) {}
+  }
+  return cfg;
+}
+
+/** 中转站的业务 Key 要填两处：生成用 provider='richbest'，素材库用 provider='richbest_asset_v3'。 */
+const RELAY_KEY_PROVIDERS = ['richbest', 'richbest_asset_v3'];
+const RELAY_KEY_SERVICE_TYPES = ['text', 'image', 'storyboard_image', 'video', 'jimeng2_character_auth'];
+
+function normalizeRelayKey(value) {
+  return String(value || '').trim().replace(/^Bearer\s+/i, '').trim();
+}
+
+/**
+ * 中转站按业务 Key 隔离「项目」，而 /api/auth/me 按设计不返回项目名（CLIENT_API §4.2），
+ * 所以「两处 Key 是否同一个瑞池项目」无法由接口自证。填成不同项目时的表现是生成阶段才报
+ * 「素材不存在 / 模型未开通」，排查成本很高，因此连接测试时把不一致直接提示出来。
+ * 只比对平台级配置（owner_tenant_id 为空）——多租户各有自己的项目 Key 是合法的。
+ */
+function relayKeyWarnings(db, apiKey, currentServiceType) {
+  if (!db || !hasTable(db, 'ai_service_configs')) return [];
+  const own = normalizeRelayKey(apiKey);
+  if (!own) return [];
+  let rows = [];
+  try {
+    rows = db.prepare(`SELECT id, service_type, provider, api_key FROM ai_service_configs
+      WHERE deleted_at IS NULL AND is_active = 1 AND COALESCE(owner_tenant_id, 0) = 0
+        AND provider IN (${RELAY_KEY_PROVIDERS.map(() => '?').join(',')})
+        AND service_type IN (${RELAY_KEY_SERVICE_TYPES.map(() => '?').join(',')})`)
+      .all(...RELAY_KEY_PROVIDERS, ...RELAY_KEY_SERVICE_TYPES);
+  } catch (_) { return []; }
+  const others = rows.filter((row) => {
+    const key = normalizeRelayKey(row.api_key);
+    return key && key !== own && String(row.service_type) !== String(currentServiceType || '');
+  });
+  if (!others.length) return [];
+  const roles = [...new Set(others.map((row) => row.service_type))];
+  return [`中转站业务 Key 与 ${roles.join('、')} 上的配置不一致。中转站按业务 Key 隔离项目，`
+    + '生成与素材库必须使用同一个瑞池项目的 Key，否则会出现「素材不存在」或「模型未开通」。'];
+}
+
+function hasTable(db, table) {
+  try { return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table); }
+  catch (_) { return false; }
+}
+
+/**
+ * 测试连接：与 Go AIService.TestConnection 对齐，根据 provider 发最小请求验证 base_url + api_key
+ * @param opts { base_url, api_key, model (string|string[]), provider?, endpoint?, settings?, db? }
+ * @returns Promise<void> 成功 resolve，失败 reject(error)
+ */
+async function testConnection(opts) {
+  const base = (opts.base_url || '').replace(/\/$/, '');
+  if (!base) throw new Error('base_url 必填');
+  if (!opts.api_key) throw new Error('api_key 必填');
+  const models = Array.isArray(opts.model) ? opts.model : opts.model != null ? [opts.model] : [];
+  const model = models[0] || '';
+  if (!model && (opts.provider === 'gemini' || opts.provider === 'google')) throw new Error('model 必填');
+  const provider = (opts.provider || 'openai').toLowerCase();
+  const serviceType = (opts.service_type || '').toLowerCase();
+  let endpoint = opts.endpoint || '';
+
+  // --- 瑞池中转站：只用 GET 探测健康、Key 与模型目录，不创建任务、不产生费用 ---
+  if (provider === 'richbest') {
+    const richbest = require('./richbestProvider');
+    const result = await richbest.probe({ baseUrl: base, apiKey: opts.api_key });
+    if (!result.ok) throw new Error(result.error || '中转站连接失败');
+    if (model && result.models && !result.models.items.some((item) => item.id === model)) {
+      throw new Error(`中转站未向当前项目开放模型 ${model}，请先在「获取模型」中同步 /v1/models`);
+    }
+    return {
+      message: '连接测试成功',
+      api_key_id: result.apiKeyId || null,
+      models: result.models ? { total: result.models.total, by_modality: result.models.by_modality } : null,
+      warnings: relayKeyWarnings(opts.db, opts.api_key, opts.service_type),
+    };
+  }
+
+  // --- NanoBanana ---
+  if (provider === 'nano_banana') {
+    // 用 record-info 查询一个不存在的 taskId：401/403=key 无效，404=key 有效已联通
+    const url = base + '/api/v1/nanobanana/record-info?taskId=test-connectivity';
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer ' + (opts.api_key || '') },
+    });
+    if (res.status === 401 || res.status === 403) {
+      const text = await res.text();
+      let errMsg = `API Key 无效 (${res.status})`;
+      try { const j = JSON.parse(text); errMsg = j.msg || j.message || errMsg; } catch {}
+      throw new Error(errMsg);
+    }
+    return;
+  }
+
+  // --- Gemini ---
+  if (provider === 'gemini' || provider === 'google') {
+    endpoint = endpoint || '/v1beta/models/{model}:generateContent';
+    const path = endpoint.replace(/{model}/g, model || 'gemini-pro');
+    const url = base + (path.startsWith('/') ? path : '/' + path) + '?key=' + encodeURIComponent(opts.api_key || '');
+    const body = { contents: [{ parts: [{ text: 'Hello' }] }] };
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`请求失败: ${res.status} ${text.slice(0, 200)}`);
+    }
+    const data = await res.json().catch(() => ({}));
+    if (data.candidates == null && data.error != null) {
+      throw new Error(data.error.message || data.error || 'Gemini 返回错误');
+    }
+    return;
+  }
+
+  // --- TTS 语音合成 ---
+  if (serviceType === 'tts') {
+    // MiniMax T2A：用 /v1/models 或直接对 chat 端点做轻量探针
+    const ttsBase = base.includes('minimaxi.com') || base.includes('minimax') ? base : base;
+    // 尝试调用一个极简的 MiniMax T2A 请求（1 字，验证 key 合法性）
+    // 为避免真实扣费，使用非计费的 list-voices 或 models 接口
+    const probeUrl = ttsBase + '/text_to_speech';
+    const probeBody = JSON.stringify({ model: model || 'speech-02-hd', text: 'hi', stream: false });
+    const res = await fetch(probeUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (opts.api_key || '') },
+      body: probeBody,
+    });
+    if (res.status === 401 || res.status === 403) {
+      const text = await res.text();
+      let errMsg = `API Key 无效 (${res.status})`;
+      try { const j = JSON.parse(text); errMsg = j.base_resp?.status_msg || j.error?.message || j.message || errMsg; } catch {}
+      throw new Error(errMsg);
+    }
+    // 其他状态（400 缺参数、404 端点不对等）说明网络通、key 疑似有效
+    return;
+  }
+
+  // service_type 作为主要判断信号
+  const isImageService = serviceType === 'image' || serviceType === 'storyboard_image';
+  const isVideoService = serviceType === 'video';
+  const hasImageEndpoint = !!(endpoint && endpoint.includes('/images/'));
+
+  const isDashscope = provider === 'dashscope' || provider === 'qwen_image';
+  const isVolcengine = provider === 'volces' || provider === 'volcengine' || provider === 'volc';
+  const modelLower = model.toLowerCase();
+
+  // 兜底识别图片/视频模型（service_type 未传时使用）
+  const looksLikeImageModel = /seedream|image2video|text2image|img2img|wanx|wan\d|flux|stable.?diff|dall.?e|imagen|agnes-image|-image$/i.test(modelLower)
+    || (isVolcengine && /seedream|vision|image/i.test(modelLower));
+  const looksLikeVideoModel = /seedance|video.?gen|video2video|kf2v|cogvideo|sora|kling|agnes-video/i.test(modelLower);
+  // DashScope 图片/视频专用端点特征
+  const isDashscopeNonChatEndpoint = isDashscope && !!(endpoint && (endpoint.includes('aigc') || endpoint.includes('multimodal') || endpoint.includes('video')));
+
+  // 综合判断是否为图片服务
+  const treatAsImage = isImageService || hasImageEndpoint || isDashscopeNonChatEndpoint
+    || looksLikeImageModel
+    || (isVolcengine && !serviceType && !endpoint);
+
+  // --- DashScope 图片 / 视频 / 分镜 ---
+  // 通义万象 / WAN 系列：API key 通过 compatible-mode chat 接口验证即可（同一 key 通用）
+  if (isDashscope && (isImageService || isVideoService || looksLikeImageModel || looksLikeVideoModel || isDashscopeNonChatEndpoint)) {
+    const chatUrl = base.replace(/\/(api\/v1|compatible-mode)\/.*$/, '') + '/compatible-mode/v1/chat/completions';
+    const body = { model: 'qwen-turbo', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 };
+    console.log('[testConnection] DashScope 非文本服务，用 compatible chat 验证 key', { chatUrl, serviceType, model });
+    const res = await fetch(chatUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + opts.api_key },
+      body: JSON.stringify(body),
+    });
+    // 401/403 = key 无效，其他均视为联通
+    if (res.status === 401 || res.status === 403) {
+      const text = await res.text();
+      let errMsg = `API Key 无效 (${res.status})`;
+      try { const j = JSON.parse(text); errMsg = j.error?.message || j.message || errMsg; } catch {}
+      throw new Error(errMsg);
+    }
+    return;
+  }
+
+  // --- 视频生成服务（非 DashScope）：通过 chat/completions 验证 key 合法性 ---
+  // 视频生成 API 调用代价高昂，无法直接测试；但同账号 chat 接口验证 key 有效性即可
+  if (isVideoService || looksLikeVideoModel) {
+    const chatPath = '/chat/completions';
+    const url = base + chatPath;
+    const body = { model: model || '', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 };
+    console.log('[testConnection] 视频服务，用 chat/completions 验证 key', { url, serviceType, model });
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (opts.api_key || '') },
+      body: JSON.stringify(body),
+    });
+    // 401/403 = key 无效；其他（400 模型不存在等）视为联通
+    if (res.status === 401 || res.status === 403) {
+      const text = await res.text();
+      let errMsg = `API Key 无效 (${res.status})`;
+      try { const j = JSON.parse(text); errMsg = j.error?.message || j.message || errMsg; } catch {}
+      throw new Error(errMsg);
+    }
+    return;
+  }
+
+  // --- OpenAI 兼容图片生成（volcengine、OpenAI DALL·E、其他）---
+  if (treatAsImage) {
+    endpoint = endpoint || '/images/generations';
+    const path = endpoint.startsWith('/') ? endpoint : '/' + endpoint;
+    const url = base + path;
+    const body = { model: model || '', prompt: 'test connectivity', n: 1 };
+    console.log('[testConnection] 图片服务', { url, serviceType, model, body });
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer ' + (opts.api_key || ''),
+      },
+      body: JSON.stringify(body),
+    });
+    // 401/403 = key 无效；其他状态（含 400 参数错误、429 限流等）表示已联通
+    if (res.status === 401 || res.status === 403) {
+      const text = await res.text();
+      let errMsg = `API Key 无效 (${res.status})`;
+      try {
+        const j = JSON.parse(text);
+        errMsg = j.error?.message || j.message || errMsg;
+      } catch {}
+      throw new Error(errMsg);
+    }
+    if (!res.ok) {
+      // 其他 4xx/5xx：如果能解析出明确的 auth 错误才拒绝，否则视为联通
+      const text = await res.text();
+      let parsed = null;
+      try { parsed = JSON.parse(text); } catch {}
+      const msg = parsed?.error?.message || parsed?.message || '';
+      const lmsg = msg.toLowerCase();
+      const isAuthErr = lmsg.includes('unauthorized') || lmsg.includes('invalid api key')
+        || lmsg.includes('authentication') || lmsg.includes('forbidden');
+      if (isAuthErr) throw new Error(`API Key 无效: ${msg || res.status}`);
+      // 其他错误（如模型不支持某个 API 参数）说明网络通、key 有效
+      return;
+    }
+    return;
+  }
+
+  // --- OpenAI / 默认：chat completions ---
+  endpoint = endpoint || '/chat/completions';
+  const path = endpoint.startsWith('/') ? endpoint : '/' + endpoint;
+  const url = base + path;
+  let body = {
+    model: model || 'gpt-3.5-turbo',
+    messages: [{ role: 'user', content: 'Hello' }],
+    max_tokens: 5,
+  };
+  body = applyDeepSeekConnectivityOptions(
+    { provider, base_url: base, settings: opts.settings },
+    body
+  );
+  console.log('[testConnection] 文本/chat 服务', { url, serviceType, model });
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + (opts.api_key || ''),
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    let errMsg = `请求失败: ${res.status}`;
+    try {
+      const j = JSON.parse(text);
+      errMsg += ' - ' + (j.error?.message || j.message || j.error || text.slice(0, 150));
+    } catch {
+      if (text) errMsg += ' - ' + text.slice(0, 150);
+    }
+    throw new Error(errMsg);
+  }
+  const data = await res.json().catch(() => ({}));
+  if (data.choices == null && data.error != null) {
+    throw new Error(data.error.message || data.error || '接口返回错误');
+  }
+}
+
+/**
+ * 返回 vendor_lock 状态
+ */
+function getVendorLockStatus(cfg) {
+  const lock = cfg?.vendor_lock;
+  return {
+    enabled: !!(lock?.enabled),
+    config_file: lock?.config_file || '',
+  };
+}
+
+/**
+ * 启动时同步 vendor_lock 指定的配置文件到数据库。
+ * - 软删除所有现有配置，按文件重新导入
+ * - 若同 service_type + provider 在 DB 中已有记录，则保留用户修改过的 api_key
+ */
+function applyVendorLock(db, log, cfg) {
+  const status = getVendorLockStatus(cfg);
+  if (!status.enabled) return;
+
+  const configFile = status.config_file;
+  if (!configFile) {
+    log.warn && log.warn('vendor_lock enabled but config_file is empty');
+    return;
+  }
+
+  const candidates = [
+    path.join(process.cwd(), 'configs', configFile),
+    path.join(__dirname, '..', '..', 'configs', configFile),
+  ];
+  let raw = null;
+  for (const p of candidates) {
+    if (fs.existsSync(p)) { raw = fs.readFileSync(p, 'utf8'); break; }
+  }
+  if (!raw) {
+    console.warn('[vendor_lock] config file not found:', configFile);
+    return;
+  }
+
+  let configs;
+  try {
+    configs = JSON.parse(raw);
+    if (!Array.isArray(configs)) throw new Error('config file must be a JSON array');
+  } catch (e) {
+    console.error('[vendor_lock] failed to parse config file:', e.message);
+    return;
+  }
+
+  // 保存现有 api_key（key: "service_type:provider"）
+  const existing = db.prepare('SELECT service_type, provider, api_key FROM ai_service_configs WHERE deleted_at IS NULL').all();
+  const savedKeys = new Map();
+  for (const row of existing) {
+    savedKeys.set(`${row.service_type}:${row.provider}`, row.api_key);
+  }
+
+  const now = new Date().toISOString();
+  db.prepare('UPDATE ai_service_configs SET deleted_at = ? WHERE deleted_at IS NULL').run(now);
+
+  for (const item of configs) {
+    const mapKey = `${item.service_type}:${item.provider}`;
+    const apiKey = savedKeys.get(mapKey) ?? item.api_key ?? '';
+    const model = Array.isArray(item.model)
+      ? JSON.stringify(item.model)
+      : item.model ? JSON.stringify([item.model]) : '[]';
+    db.prepare(
+      `INSERT INTO ai_service_configs
+        (service_type, provider, api_protocol, name, base_url, api_key, model, default_model, endpoint, query_endpoint, priority, is_default, is_active, settings, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`
+    ).run(
+      item.service_type || 'text',
+      item.provider || '',
+      item.api_protocol || '',
+      item.name || '',
+      item.base_url || '',
+      apiKey,
+      model,
+      item.default_model || null,
+      item.endpoint || '',
+      item.query_endpoint || '',
+      item.priority ?? 0,
+      item.is_default ? 1 : 0,
+      item.settings || null,
+      now,
+      now
+    );
+  }
+  for (const item of configs) {
+    console.log(`[vendor_lock] loaded: service_type=${item.service_type} provider=${item.provider} api_protocol=${item.api_protocol || '(auto)'} endpoint=${item.endpoint || '(auto)'}`);
+  }
+  console.log(`[vendor_lock] synced ${configs.length} configs from ${configFile}`);
+}
+
+/**
+ * 批量替换所有配置的 api_key（仅限锁定模式下使用）
+ */
+function bulkUpdateApiKey(db, log, newKey) {
+  const now = new Date().toISOString();
+  const info = db.prepare(
+    'UPDATE ai_service_configs SET api_key = ?, updated_at = ? WHERE deleted_at IS NULL'
+  ).run(newKey, now);
+  log.info('Bulk update api_key', { updated: info.changes });
+  return info.changes;
+}
+
+module.exports = {
+  listConfigs,
+  listOwnedTenantConfigs,
+  listPublicConfigs,
+  resolveBillingTarget,
+  getConfig,
+  createConfig,
+  updateConfig,
+  deleteConfig,
+  testConnection,
+  maskApiKey,
+  isMaskedApiKey,
+  validateConfigRequest,
+  getVendorLockStatus,
+  applyVendorLock,
+  bulkUpdateApiKey,
+};

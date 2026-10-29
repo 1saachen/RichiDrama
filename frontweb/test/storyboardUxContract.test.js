@@ -1,0 +1,261 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+
+const freeCreate = readFileSync(new URL('../src/views/FreeCreate.vue', import.meta.url), 'utf8')
+const promptEditor = readFileSync(new URL('../src/components/OmniAssetPromptEditor.vue', import.meta.url), 'utf8')
+const filmCreate = readFileSync(new URL('../src/views/FilmCreate.vue', import.meta.url), 'utf8')
+const adminConsole = readFileSync(new URL('../src/views/AdminConsole.vue', import.meta.url), 'utf8')
+const mediaLibrary = readFileSync(new URL('../src/views/MediaLibrary.vue', import.meta.url), 'utf8')
+const historyDetail = readFileSync(new URL('../src/views/GenerationHistoryDetail.vue', import.meta.url), 'utf8')
+const failureDetails = readFileSync(new URL('../src/components/GenerationFailureDetails.vue', import.meta.url), 'utf8')
+const router = readFileSync(new URL('../src/router/index.js', import.meta.url), 'utf8')
+const dragPreview = readFileSync(new URL('../src/utils/dragPreview.js', import.meta.url), 'utf8')
+const pointerDrag = readFileSync(new URL('../src/utils/assetPointerDrag.js', import.meta.url), 'utf8')
+const canvasEpisodeGenerate = readFileSync(new URL('../src/composables/useCanvasEpisodeGenerate.js', import.meta.url), 'utf8')
+const canvasWorkflowRunner = readFileSync(new URL('../src/composables/useCanvasWorkflowRunner.js', import.meta.url), 'utf8')
+
+test('storyboard navigation uses real video, including retained source after post-processing failure', () => {
+  assert.match(freeCreate, /<video v-if="shotPreviewUrl\(shot\)"/)
+  assert.match(freeCreate, /function shotGenerationInProgress\(shot\) \{ return activeGenerationStatuses\.has\(shot\?\.status\) \}/)
+  assert.match(freeCreate, /v-else class="shot-video-placeholder"/)
+  assert.match(freeCreate, /class="shot-play"/)
+  assert.match(freeCreate, /shotGenerationInProgress\(shot\) \? '[^']+' : '▶'/)
+  assert.match(freeCreate, /mergeSavedShot\(shots\.value, savingShotId, projectShot\(updated\), \{ preserveMedia: true \}\)/)
+  assert.match(freeCreate, /source_local_path/)
+  assert.match(freeCreate, /function bestPlayableVideo/)
+  assert.match(freeCreate, /currentShot\.value\.video_url = localVideoUrl\(playableVideo\)/)
+  assert.match(freeCreate, /videosAPI\.list\(\{\s*storyboard_id: storyboard\.id,\s*page_size: 20/)
+  assert.doesNotMatch(freeCreate, /storyboard_id: storyboard\.id,\s*episode_id:/)
+  assert.doesNotMatch(freeCreate, /storyboard-placeholder\.svg|shotCover\(/)
+})
+
+test('storyboard preview controls stay hidden until a playable video exists', () => {
+  assert.match(freeCreate, /<template v-if="activeVideoUrl && !previewVideoError && !previewVideoProgress">\s*<div class="player-tools"/)
+  assert.match(freeCreate, /<div class="video-stage has-video"/)
+  assert.match(freeCreate, /<section v-else class="generation-stage-status"/)
+  assert.match(freeCreate, /generation-error-copy/)
+  assert.match(freeCreate, /完成生成后，播放器和成片操作将在这里显示/)
+})
+
+test('development mode can preview the video error state without creating a task', () => {
+  assert.match(freeCreate, /const videoStatusPreviewEnabled = import\.meta\.env\.DEV/)
+  assert.match(freeCreate, /@click="previewVideoError = true; previewVideoProgress = false">预览错误状态/)
+  assert.match(freeCreate, /开发预览不会创建任务，也不会调用模型服务/)
+  assert.match(freeCreate, /GenerationFailureDetails :job="previewVideoErrorJob"/)
+  assert.match(freeCreate, /@click="previewVideoError = false">退出错误预览/)
+  assert.match(freeCreate, /activeVideoUrl && !previewVideoError && !previewVideoProgress/)
+  assert.match(freeCreate, /预览真人授权提示/)
+  assert.match(freeCreate, /预览版权限制提示/)
+  assert.match(freeCreate, /watch\(activeShotId, \(\) => \{ previewVideoError\.value = false; previewVideoProgress\.value = false \}\)/)
+})
+
+test('copyright failures keep one compact bulk library import action', () => {
+  assert.match(failureDetails, /本次包含.*张参考图/)
+  assert.match(failureDetails, /火山没有指出具体图片/)
+  assert.match(failureDetails, /importCopyrightAssets/)
+  assert.match(failureDetails, /批量加入素材库/)
+  assert.doesNotMatch(failureDetails, /v-for="item in copyrightTargets"|copyright-target-card/)
+  assert.doesNotMatch(failureDetails, /版权[^\n]{0,80}声明含真人并认证/)
+})
+
+test('a possible real-person false positive defaults to library import and keeps certification optional', () => {
+  assert.match(failureDetails, />仅加入素材库<\/el-button>/)
+  assert.match(failureDetails, />声明含真人并认证<\/el-button>/)
+  assert.match(failureDetails, /identity_required: false/)
+  assert.match(failureDetails, /identity_required: true/)
+  assert.match(failureDetails, /图片已加入素材库，未声明为真人素材/)
+  assert.doesNotMatch(failureDetails, /加入素材库并授权|标记含真人并授权/)
+})
+
+test('development mode can preview indeterminate provider progress without creating a task', () => {
+  assert.match(freeCreate, /预览生成进度/)
+  assert.match(freeCreate, /generation-progress is-indeterminate/)
+  assert.match(freeCreate, /模型服务正在生成视频/)
+  assert.match(freeCreate, /@click="previewVideoProgress = false">退出进度预览/)
+})
+
+test('generation actions use a synchronous single-flight guard before requests', () => {
+  assert.match(freeCreate, /if \(creating\.value \|\| hasActiveShotGeneration\.value\) return; creating\.value = true/)
+  assert.match(freeCreate, /const hasActiveShotGeneration = computed/)
+  assert.match(filmCreate, /if \(genStore\.isRunning\(meta\)\) return\s+genStore\.markRunning\(meta\)/)
+})
+
+test('an empty episode shows one explicit empty state instead of a phantom first shot', () => {
+  assert.match(freeCreate, /<template v-if="currentShot">/)
+  assert.match(freeCreate, /<section v-else class="empty-shot-workspace"/)
+  assert.match(freeCreate, /当前剧集还没有分镜/)
+  assert.match(freeCreate, /@click="addShot\(false\)">添加第一个镜头/)
+  assert.match(freeCreate, /:disabled="[^"]*!currentShot \|\| reproductionMode[^"]*" @click="addShot\(true\)">当前镜头后添加/)
+  assert.match(freeCreate, /const workspaceReady = ref\(false\)/)
+  assert.match(freeCreate, /finally \{ workspaceReady\.value = true\b/)
+})
+
+test('batch media actions distinguish empty, completed and missing-reference states', () => {
+  assert.match(canvasEpisodeGenerate, /if \(!boards\.length\) \{\s*ElMessage\.warning\(\{ message: '当前集还没有分镜，请先生成或新建分镜', grouping: true \}\)/)
+  assert.match(canvasEpisodeGenerate, /if \(!imageBoards\.length\) \{\s*ElMessage\.info\(\{ message: '当前集只有全能模式分镜，无需生图，请直接生视频', grouping: true \}\)/)
+  assert.match(canvasEpisodeGenerate, /当前集经典模式分镜均已有图片，无需重复生成/)
+  assert.match(canvasEpisodeGenerate, /当前集分镜均已有视频，无需重复生成/)
+  assert.match(canvasEpisodeGenerate, /missingPromptCount = missingImages\.length - todo\.length/)
+  assert.match(canvasEpisodeGenerate, /缺少图片提示词，将跳过/)
+  assert.match(canvasEpisodeGenerate, /missingInputCount = incomplete\.length - todo\.length/)
+  assert.match(canvasEpisodeGenerate, /缺少生成输入，将跳过/)
+  assert.match(canvasWorkflowRunner, /export function canRunVideoStep/)
+  assert.match(filmCreate, /if \(boards\.length === 0\) \{\s*ElMessage\.warning\(\{ message: '当前集还没有分镜，请先生成或新建分镜', grouping: true \}\)/)
+  assert.match(filmCreate, /completedVideoCount === boards\.length/)
+  assert.match(filmCreate, /当前集分镜缺少可用参考图，请先生成或选择分镜图/)
+  assert.match(filmCreate, /没有可生成视频的分镜：\$\{completedVideoCount\} 镜已有视频，\$\{missingReferenceCount\} 镜缺少参考图/)
+})
+
+test('clicking a completed history record previews it without changing the adopted version', () => {
+  assert.match(freeCreate, /function selectHistoryJob\(job\) \{ playOnSelection\.value = true; selectedHistoryJobId\.value = job\.id \}/)
+})
+
+test('project storyboard history opens a complete detail page with the original prompt', () => {
+  assert.match(freeCreate, /aria-label="复制镜头" @click\.stop="copyShot\(shot\)"/)
+  assert.doesNotMatch(freeCreate, />复制当前镜头<\/el-button>/)
+  assert.doesNotMatch(freeCreate, /aria-label="上移镜头"|aria-label="下移镜头"/)
+  assert.match(freeCreate, /const copied = await storyboardsAPI\.copy\(currentShot\.value\.id\)/)
+  assert.match(freeCreate, /@click\.stop="openHistoryDetail\(job\)">查看生成详情/)
+  assert.match(freeCreate, /@click="openHistoryDetail\(activeJob\)">查看本版本详情/)
+  assert.match(freeCreate, /path: `\/generation-history\/\$\{generationId\}`/)
+  assert.doesNotMatch(freeCreate, /historyPromptOpen|historyPromptText|viewHistoryPrompt/)
+  assert.match(router, /path: '\/generation-history\/:id'/)
+  assert.match(historyDetail, /<b>原始提示词<\/b>/)
+  assert.match(historyDetail, /模型实际接收的提示词/)
+  assert.match(historyDetail, /实际扣费/)
+  assert.match(historyDetail, /请求分辨率/)
+  assert.match(historyDetail, /输出分辨率/)
+  assert.match(historyDetail, /omniVideoAPI\.historyDetail\(route\.params\.id\)/)
+  // 旧工作台的「复制当前分镜」按钮已随死模板删除；复制能力由 FreeCreate 镜头卡承载。
+  assert.doesNotMatch(filmCreate, />复制当前分镜<\/el-button>/)
+})
+
+test('storyboard media management keeps project scope and returns to its source page', () => {
+  assert.match(freeCreate, /function openMediaLibrary\(\)/)
+  assert.match(freeCreate, /drama_id: targetDramaId/)
+  assert.match(freeCreate, /return_to: route\.fullPath/)
+  assert.match(freeCreate, /<ProjectAssetLibraryDialog[\s\S]*@open-full="openMediaLibrary"/)
+  assert.match(filmCreate, /function openProjectMediaLibrary\(\)/)
+  assert.match(filmCreate, /return_to: route\.fullPath/)
+  assert.match(mediaLibrary, /@click="returnToSource"/)
+  assert.match(mediaLibrary, /safeRedirectPath\(rawReturnTo, ''\)/)
+  assert.match(mediaLibrary, /path: `\/film\/\$\{projectDramaId\.value\}`/)
+  assert.doesNotMatch(mediaLibrary, /@click="\$router\.push\('\/'\)">[\s\S]{0,100}返回/)
+})
+
+test('provider internal material timeout can retry from the immutable snapshot', () => {
+  assert.match(freeCreate, /activeJob\.status === 'retryable' \|\| activeJob\.can_retry_generation/)
+  assert.match(freeCreate, /job\.status === 'retryable' \|\| job\.can_retry_generation/)
+  assert.match(freeCreate, /使用原配置重试/)
+  assert.match(freeCreate, /omniVideoAPI\.retry\(job\.id\)/)
+})
+
+test('admin production detail opens an immutable workbench reproduction snapshot', () => {
+  assert.match(adminConsole, /<h3>完整提示词<\/h3>/)
+  assert.match(adminConsole, /请求素材/)
+  assert.match(adminConsole, /在制作台复现/)
+  assert.match(adminConsole, /replay_generation_id: replay\.video_generation_id/)
+  assert.match(adminConsole, /path: '\/free-create'/)
+  assert.match(freeCreate, /adminAPI\.productionDetail\(generationId\)/)
+  assert.match(freeCreate, /loadStandaloneProductionReproduction/)
+  assert.match(freeCreate, /当前提示词、参数和素材来自失败时快照/)
+  assert.match(freeCreate, /const canCreate = computed\(\(\) => !reproductionMode\.value/)
+  assert.match(freeCreate, /function scheduleSave\(\) \{ if \(loadingShot\.value \|\| applyingRemoteInputs \|\| reproductionMode\.value/)
+  assert.match(freeCreate, /function flushPromptBeforePageHide\(\) \{ if \(reproductionMode\.value\) return/)
+  assert.match(freeCreate, /document\.execCommand\('copy'\)/)
+  assert.match(freeCreate, /delete query\.replay_generation_id/)
+})
+
+test('project shot reorder keeps generated media and completed presentation', () => {
+  assert.match(freeCreate, /video_url: local\.video_url \|\| remote\.video_url/)
+  assert.match(freeCreate, /poster_local_path: local\.poster_local_path \|\| remote\.poster_local_path/)
+  assert.match(freeCreate, /videoUrl && \['pending', 'draft'/)
+})
+
+test('embedded storyboard keeps its prompt reachable and confines wheel scrolling to workbench panels', () => {
+  assert.match(freeCreate, /\.project-storyboard-page \.shot-list\{flex:1 1 auto;min-height:0\}/)
+  assert.match(freeCreate, /@media\(min-width:761px\)\{\.center-stage\{min-height:0;overflow-x:hidden;overflow-y:auto\}\.shot-script\{flex:1 0 220px;min-height:220px;overflow-y:auto;overscroll-behavior-y:contain\}/)
+assert.match(freeCreate, /function containWorkbenchScroll\(event\)/)
+assert.match(freeCreate, /while \(panel && panel\.scrollHeight <= panel\.clientHeight\)/)
+assert.match(freeCreate, /Desktop free-create uses a fixed-height workbench too/)
+assert.match(freeCreate, /\.shot-panel\{overflow:hidden\}\.shot-list\{flex:1 1 auto;min-height:0\}/)
+  assert.match(freeCreate, /\.omni-page\.embedded\.project-storyboard-page\{position:sticky!important;top:58px;z-index:20;height:calc\(100dvh - 58px\)!important/)
+  assert.match(filmCreate, /\.storyboard-stage-active \.omni-page\.embedded\.project-storyboard-page\{position:static!important;top:auto;height:auto!important;min-height:0!important;overflow:hidden!important;flex:1/)
+})
+
+test('long prompt text keeps an independently scrollable textarea', () => {
+  const promptEditor = readFileSync(new URL('../src/components/OmniAssetPromptEditor.vue', import.meta.url), 'utf8')
+  assert.match(freeCreate, /textarea\.el-textarea__inner, \.prompt-rich-editor, \.shot-list, \.creation-panel, \.shot-script, \.center-stage/)
+  assert.match(freeCreate, /panel\.scrollHeight <= panel\.clientHeight/)
+  assert.match(promptEditor, /overflow-y: auto; overscroll-behavior-y: contain; scrollbar-gutter: stable/)
+})
+
+test('project settings communicate first-shot master, inherited and override states', () => {
+  // 继承首镜是默认行为，不再常驻三态标签与说明；覆盖态仅保留「同首镜同步」入口。
+  assert.doesNotMatch(freeCreate, /首镜母版|跟随首镜|当前镜头覆盖/)
+  assert.match(freeCreate, /同首镜同步/)
+  assert.match(freeCreate, /restoreCurrentShotMaster/)
+  assert.match(freeCreate, /updateGenerationSettings/)
+})
+
+test('asset mention menus are teleported translucent overlays with bounded internal scrolling', () => {
+  assert.match(promptEditor, /teleport to="body"/i)
+  assert.match(promptEditor, /backdrop-filter:\s*blur/i)
+  assert.match(promptEditor, /260/)
+  assert.match(promptEditor, /pickerMatches\.value\.slice\(0, 30\)/)
+  assert.match(promptEditor, /pickerMatchCount > pickerAssets\.length/)
+  assert.match(promptEditor, /loading="lazy" decoding="async"/)
+  assert.match(promptEditor, /const caretRect = visualRectForCollapsedRange\(range\)/)
+  assert.match(promptEditor, /window\.addEventListener\('scroll', schedulePickerPosition, true\)/)
+  assert.match(promptEditor, /transform: placeBelow \? 'none' : 'translateY\(-100%\)'/)
+  assert.match(promptEditor, /if \(anchor\.bottom < visibleTop \|\| anchor\.top > visibleBottom\)/)
+  assert.doesNotMatch(promptEditor, /const top = rect\.top >= height \+ 12/)
+})
+
+test('asset drag shows an exact text-boundary caret and rejects whitespace-only lines', () => {
+  assert.match(dragPreview, /setDragImage\(transparentPreview, 0, 0\)/)
+  assert.match(freeCreate, /@pointerdown="!reproductionMode && \(!projectSession.enabled \|\| projectSession.canEdit\) && beginAssetPointerDrag\(\$event, promptAssetFor\(asset\)\)"/)
+  assert.match(pointerDrag, /Math\.hypot\([\s\S]*< 6/)
+  assert.match(pointerDrag, /ASSET_POINTER_MOVE/)
+  assert.match(pointerDrag, /ASSET_POINTER_DROP/)
+  assert.match(pointerDrag, /event\.preventDefault\(\)/)
+  assert.match(pointerDrag, /setPointerCapture/)
+  assert.match(promptEditor, /window\.addEventListener\(ASSET_POINTER_MOVE/)
+  assert.match(promptEditor, /insertAsset\(detail\.asset, \{ offset: point\.offset \}\)/)
+  assert.match(promptEditor, /caretRect = visualRectForCollapsedRange\(range\)/)
+  assert.match(promptEditor, /function visualRectForCollapsedRange\(range\)/)
+  assert.match(promptEditor, /function offsetForRange\(range\)/)
+  assert.match(promptEditor, /document\.caretPositionFromPoint/)
+  assert.match(promptEditor, /不要改写原生 Selection/)
+  assert.match(promptEditor, /const rect = editorRef\.value\?\.getBoundingClientRect\(\)/)
+  assert.match(promptEditor, /释放位置才是最终意图/)
+  assert.match(promptEditor, /node\.nodeType === Node\.TEXT_NODE/)
+  assert.match(promptEditor, /prevRect\.right/)
+  assert.match(promptEditor, /source\.slice\(lineStart, lineEnd\)\.trim\(\)/)
+  assert.match(promptEditor, /rejected: true/)
+  assert.match(promptEditor, /point && !point\.rejected/)
+  assert.match(promptEditor, /source\[i\] === '\\n'/)
+  assert.doesNotMatch(promptEditor, /class="mention-anchor"/)
+  assert.doesNotMatch(promptEditor, /el-tag v-for="asset in referenced"/)
+})
+
+test('在长提示词中插入素材只重绘一次并保持编辑器滚动位置', () => {
+  assert.match(promptEditor, /const scrollPosition = \{ top: editorRef\.value\?\.scrollTop \|\| 0/)
+  assert.match(promptEditor, /nextTick\(\(\) => \{ syncReferences\(text\.value, true\); restoreEditorAfterInsert\(caret, scrollPosition\) \}\)/)
+  assert.match(promptEditor, /function focusEditorAtOffset\(offset, scrollPosition\)/)
+  assert.match(promptEditor, /el\.focus\(\{ preventScroll: true \}\)/)
+  assert.match(promptEditor, /el\.scrollTop = scrollPosition\?\.top \|\| 0/)
+})
+
+test('@ 素材筛选随光标位置立即更新', () => {
+  assert.match(promptEditor, /const lastCaretOffset = ref\(0\)/)
+  assert.match(promptEditor, /const cursor = lastCaretOffset\.value/)
+  assert.match(promptEditor, /lastCaretOffset\.value = caretOffset\(\)/)
+})
+
+test('billing adjustment explanation is explicitly optional', () => {
+  const admin = readFileSync(new URL('../src/views/AdminConsole.vue', import.meta.url), 'utf8')
+  assert.match(admin, /情况说明（选填）/)
+  assert.doesNotMatch(admin, /请填写调整说明/)
+})

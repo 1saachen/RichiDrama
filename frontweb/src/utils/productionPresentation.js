@@ -1,0 +1,51 @@
+const STATUS_LABELS = {
+  processing: '处理中',
+  persisting: '保存成片',
+  completed: '已完成',
+  failed: '失败',
+  retryable: '可重试',
+  invalid: '状态异常',
+  cancelled: '已取消',
+  reconciliation_required: '等待结算',
+  awaiting_source: '等待源视频',
+  pending: '等待处理',
+  skipped: '已跳过',
+  not_selected: '未选择',
+  local: '本地就绪',
+  local_ready: '本地就绪',
+  oss_synced: '已归档',
+  upscale_pending: '等待画质增强',
+  upscaling: '画质增强中',
+  interpolation_pending: '等待补帧',
+  interpolating: '画面补帧中',
+}
+
+const FAILURE_STATUSES = new Set(['failed', 'retryable', 'invalid', 'cancelled', 'reconciliation_required'])
+const SUCCESS_STATUSES = new Set(['completed', 'oss_synced', 'local', 'local_ready'])
+
+export function latestExecutedStage(row) {
+  const stages = row?.stages || []
+  if (['failed', 'retryable', 'invalid', 'cancelled'].includes(row?.status)) {
+    return [...stages].reverse().find(stage => stage.key !== 'archive' && stage.status === 'failed') || { key: 'generation', status: row.status }
+  }
+  const key = ({ upscaling: 'upscale', upscale_pending: 'upscale', interpolating: 'interpolation', interpolation_pending: 'interpolation' })[row?.status]
+  if (key) return stages.find(stage => stage.key === key) || { key, status: row.status }
+  return [...stages].reverse().find(stage => stage.selected !== false && !['not_selected', 'skipped', 'awaiting_source', 'cancelled'].includes(stage.status)) || { key: 'generation', status: row?.status || 'unknown' }
+}
+
+export function productionStatusLabel(status) {
+  const value = String(status || '').trim()
+  return STATUS_LABELS[value] || value || '未知'
+}
+
+export function productionStatusTone(status) {
+  if (FAILURE_STATUSES.has(status)) return 'bad'
+  if (SUCCESS_STATUSES.has(status)) return 'good'
+  return 'neutral'
+}
+
+export function productionTimelineType(status) {
+  if (FAILURE_STATUSES.has(status)) return 'danger'
+  if (SUCCESS_STATUSES.has(status)) return 'success'
+  return 'primary'
+}

@@ -1,0 +1,97 @@
+<template>
+  <main class="tool-workbench">
+    <header class="workbench-header"><div><el-button text @click="$router.push('/ai-tools')">← AI 工具箱</el-button><p class="breadcrumb">结果自动保存 · 可导入项目</p></div><div class="workbench-title"><span class="title-mark">{{ config.symbol }}</span><div><h1>{{ config.title }}</h1><p>{{ config.description }}</p></div></div><AccountBalanceBadge /></header>
+    <section class="tool-layout">
+      <form class="tool-form" @submit.prevent="run"><div class="panel-kicker"><span>01</span><div><b>创作输入</b></div></div>
+        <label>运行标题<el-input v-model="title" :placeholder="`${config.title} · ${formatChinaDate(new Date())}`" /></label>
+        <label>计费归属项目<el-select v-model="dramaId" filterable placeholder="请选择项目"><el-option v-for="project in projects" :key="project.id" :label="project.title" :value="project.id" /></el-select><small>本次运行、续写与实际积分只归属此项目。</small></label>
+        <label>语言<el-select v-model="language"><el-option label="中文" value="zh"/><el-option label="English" value="en"/><el-option v-if="kind === 'reverse_prompt'" label="双语" value="bilingual"/></el-select></label>
+        <label>模型<el-select v-model="model" clearable placeholder="默认（自动选择）"><el-option v-for="item in modelOptions" :key="item" :label="item" :value="item" /></el-select></label>
+        <label v-if="kind === 'script_analysis' || kind === 'script_analysis_stream'">项目资料<el-input v-model="projectInfo" type="textarea" :rows="3" placeholder="题材、受众、已有设定（可选）" /></label>
+        <label v-if="kind === 'script_analysis' || kind === 'script_analysis_stream'">剧本资料<el-input v-model="content" type="textarea" :rows="12" placeholder="粘贴剧本文本" /></label>
+        <label v-if="kind === 'script_analysis_stream'">导入 TXT（≤2MB）<input type="file" accept="text/plain,.txt" @change="readTxt" /></label>
+        <template v-else-if="kind === 'script_writing'"><label>创意／故事梗概<el-input v-model="content" type="textarea" :rows="8" placeholder="主角、冲突、世界观……" /></label><label>题材<el-input v-model="genre" placeholder="例如：都市悬疑" /></label><label>集数<el-input-number v-model="episodeCount" :min="1" :max="100" /></label></template>
+        <template v-else-if="kind === 'reverse_prompt'"><ToolAssetSelector v-model="assetId" label="反推素材" /><small>可从素材库选择或本地上传；视频只分析首、中、尾帧，不上传完整视频。</small></template>
+        <el-button native-type="submit" type="primary" :loading="running">{{ config.action }}</el-button>
+      </form>
+      <aside class="run-history"><div class="panel-kicker"><span>02</span><div><b>运行历史</b><small>{{ runs.length }} 条记录</small></div><el-button text @click="load">刷新</el-button></div><button v-for="runItem in runs" :key="runItem.id" class="run-item" :class="{active:active?.id===runItem.id}" @click="open(runItem)"><span :class="`dot ${runItem.status}`"></span><div><b>{{ runItem.title || `运行 #${runItem.id}` }}</b><small>{{ statusText(runItem.status) }} · {{ formatChinaDateTime(runItem.updated_at) }}</small></div></button><p v-if="!runs.length" class="history-empty">没有运行记录。首次运行后会出现在这里。</p></aside>
+      <section class="result"><div class="result-heading"><div class="panel-kicker"><span>03</span><div><b>成果舞台</b><small>{{ active ? '' : '等待一次运行' }}</small></div></div><div v-if="active"><el-button text @click="copy">复制</el-button><el-button text @click="download">下载结果</el-button><el-button v-if="['script_analysis','script_analysis_stream','script_writing'].includes(active.tool_type) && active.status==='completed'" type="primary" plain size="small" @click="importProject">导入短剧项目</el-button><el-button text type="danger" @click="remove">删除</el-button></div></div><div v-if="active" class="status"><span :class="`dot ${active.status}`"></span>{{ statusText(active.status) }}<span v-if="active.status==='processing'" class="saving">输出将持续保存到本地历史</span><el-button v-if="active.status==='failed'" text @click="retry">重新执行</el-button></div><ToolResultRenderer v-if="active" :run="active" /><div v-else class="empty"><span>◌</span><b>从左侧开始一次运行</b><p>每次运行单独保存，可随时复制、删除或导入项目。</p></div></section>
+    </section>
+  </main>
+</template>
+<script setup>
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
+import { toolsAPI } from '@/api/tools'
+import { dramaAPI } from '@/api/drama'
+import ToolAssetSelector from '@/components/ToolAssetSelector.vue'
+import ToolResultRenderer from '@/components/ToolResultRenderer.vue'
+import AccountBalanceBadge from '@/components/AccountBalanceBadge.vue'
+import { formatChinaDate, formatChinaDateTime } from '@/utils/time'
+import { useModelOptions } from '@/composables/useModelOptions'
+const props=defineProps({ kind:{type:String,required:true} })
+const modelOptions=useModelOptions('text')
+const configs={script_analysis:{symbol:'◎',title:'剧本分析',description:'将剧本拆解为项目、角色、场景、道具与镜头建议。',action:'开始分析'},script_analysis_stream:{symbol:'≋',title:'剧本分析（流式）',description:'持续保存增量输出；断线后可从历史继续查看。',action:'开始流式分析'},script_writing:{symbol:'✦',title:'剧本创作',description:'从创意生成分集短剧正文，可再导入项目。',action:'生成剧本'},reverse_prompt:{symbol:'◌',title:'反推提示词',description:'分析图片的主体、构图、镜头、光影与完整提示词。',action:'开始反推'}}
+const config=computed(()=>configs[props.kind]||configs.script_analysis),runs=ref([]),active=ref(null),running=ref(false),title=ref(''),language=ref('zh'),model=ref(''),projectInfo=ref(''),content=ref(''),genre=ref(''),episodeCount=ref(1),assetId=ref(null),timer=ref(null),projects=ref([]),dramaId=ref(null)
+const isStreamRun=computed(()=>active.value?.tool_type==='script_analysis_stream')
+const display=computed(()=>{if(!active.value)return '';if(isStreamRun.value)return active.value.streamed_text || active.value.output?.raw_json || active.value.error_msg || '正在等待模型输出…';return JSON.stringify(active.value.output || { incremental_text:active.value.streamed_text, error:active.value.error_msg },null,2)})
+// 复制面向正文：优先模型原始输出，而不是 pretty JSON。
+const copyText=computed(()=>{if(!active.value)return '';const out=active.value.output||{};return out.raw_json || active.value.streamed_text || display.value})
+const statusText=(status)=>({pending:'排队中',processing:'处理中',completed:'已完成',failed:'失败'}[status]||status)
+async function load(){runs.value=await toolsAPI.list({tool_type:props.kind});if(active.value){active.value=await toolsAPI.get(active.value.id)}}
+async function open(item){active.value=await toolsAPI.get(item.id)}
+async function run(){if(!Number(dramaId.value))return ElMessage.warning('请选择计费归属项目');if((props.kind.includes('script_analysis')||props.kind==='script_writing')&&!content.value.trim())return ElMessage.warning('请先填写剧本或创意');if(props.kind==='reverse_prompt'&&!assetId.value)return ElMessage.warning('请先选择素材');running.value=true;try{const input=props.kind.includes('script_analysis')?{script:content.value,project_info:projectInfo.value,language:language.value}:props.kind==='script_writing'?{premise:content.value,genre:genre.value,episode_count:episodeCount.value,language:language.value}:{language:language.value};const assets=assetId.value?[{asset_id:Number(assetId.value),usage:'source'}]:[];active.value=await toolsAPI.run(props.kind,{title:title.value,model:model.value,language:language.value,drama_id:Number(dramaId.value),input,assets});await load()}catch(e){ElMessage.error(e.message)}finally{running.value=false}}
+async function retry(){active.value=await toolsAPI.retry(active.value.id);load()};async function remove(){await toolsAPI.remove(active.value.id);active.value=null;load()};async function importProject(){const drama=await toolsAPI.importDrama(active.value.id,{});ElMessage.success(`已导入项目：${drama.title}`)}
+async function copy(){await navigator.clipboard.writeText(copyText.value);ElMessage.success('已复制')};function download(){const blob=new Blob([display.value],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`${props.kind}-${active.value.id}.json`;a.click();URL.revokeObjectURL(url)}
+async function readTxt(event){const file=event.target.files?.[0];event.target.value='';if(!file)return;if(file.size>2*1024*1024)return ElMessage.warning('TXT 单文件不能超过 2MB');try{content.value=await file.text();ElMessage.success(`已载入 ${file.name}`)}catch(_){ElMessage.error('无法读取 TXT 文件')}}
+watch(()=>props.kind,()=>{active.value=null;load()});onMounted(async()=>{const data=await dramaAPI.list({page_size:100});projects.value=data?.items||data||[];load();timer.value=setInterval(load,2500)});onUnmounted(()=>clearInterval(timer.value))
+</script>
+<style scoped>
+.tool-workbench{min-height:100vh;padding:22px 28px;background:#10151d;color:#f2f0ea}.workbench-header,.tool-layout{max-width:1320px;margin:auto}.workbench-header{display:flex;align-items:end;justify-content:space-between;padding:4px 0 20px;border-bottom:1px solid #2d3947}.breadcrumb{margin:3px 0 0;color:#8f9dab;font-size:12px}.workbench-title{display:flex;align-items:center;gap:12px}.title-mark{display:grid;place-items:center;width:36px;height:36px;border-radius:8px;background:#243f54;color:#bfe0f5;font-size:19px}.tool-workbench h1{margin:0;font-size:22px}.workbench-title p,.tool-workbench small{margin:4px 0 0;color:#aab4c0;font-size:12px}.tool-layout{margin-top:16px;display:grid;grid-template-columns:300px 260px minmax(0,1fr);gap:12px}.tool-form,.run-history,.result{background:#181f29;border:1px solid #334050;border-radius:10px;padding:16px}.panel-kicker{display:flex;align-items:center;gap:8px;margin-bottom:15px}.panel-kicker>span{display:grid;place-items:center;width:23px;height:23px;border-radius:6px;background:#253e51;color:#b9d9ef;font-size:10px;font-weight:700}.panel-kicker>div{display:grid;gap:1px}.panel-kicker b{font-size:14px}.panel-kicker small{font-size:10px}.panel-kicker .el-button{margin-left:auto}.tool-form{display:grid;align-content:start;gap:13px}.tool-form label{display:grid;gap:6px;font-size:12px;color:#cbd3da}.tool-form :deep(.el-button--primary){margin-top:7px}.run-history{display:grid;align-content:start;gap:7px;max-height:calc(100vh - 128px);overflow:auto}.run-item{display:grid;grid-template-columns:auto 1fr;align-items:start;gap:8px;border:1px solid #303d4b;background:#151b24;color:#dce1e7;border-radius:7px;text-align:left;padding:10px;cursor:pointer}.run-item.active{border-color:#4b91c8;background:#1c2935}.run-item b{display:block;font-size:12px;line-height:1.4}.run-item small{display:block;line-height:1.45}.history-empty{font-size:12px;line-height:1.6;color:#93a0af}.result{min-width:0;display:flex;flex-direction:column}.result-heading{display:flex;justify-content:space-between;align-items:center;gap:12px}.status{display:flex;align-items:center;gap:6px;margin:14px 0;padding:9px 10px;border:1px solid #304051;border-radius:7px;background:#141a22;color:#c5d0da;font-size:12px}.saving{margin-left:auto;color:#a9cfe8}.dot{width:8px;height:8px;flex:none;border-radius:50%;display:inline-block;background:#a6adb6}.dot.processing{background:#c59455}.dot.completed{background:#5ba97f}.dot.failed{background:#d66b6b}.result pre{flex:1;white-space:pre-wrap;word-break:break-word;min-height:360px;max-height:calc(100vh - 220px);overflow:auto;background:#111720;padding:16px;border:1px solid #293746;border-radius:7px;color:#dce2e9;font-size:12px;line-height:1.65}.empty{flex:1;min-height:380px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;color:#9da6b1}.empty>span{font-size:38px;color:#5d95bf}.empty b{margin-top:13px;color:#d9e0e5}.empty p{max-width:350px;margin:8px 0 0;font-size:13px;line-height:1.65}@media(max-width:900px){.tool-workbench{padding:16px}.workbench-header{align-items:flex-start;flex-direction:column}.tool-layout{grid-template-columns:1fr}.run-history{max-height:260px}.result pre{max-height:none;min-height:280px}} 
+.tool-workbench :deep(.el-button--primary){--el-button-bg-color:#f5f5f5!important;--el-button-border-color:#f5f5f5!important;--el-button-text-color:#111!important;--el-button-hover-bg-color:#d4d4d4!important;--el-button-hover-border-color:#d4d4d4!important}.title-mark,.panel-kicker>span,.empty>span{background:#222!important;color:#f5f5f5!important}.run-item.active{border-color:#f5f5f5!important;background:#222!important}.saving{color:#a3a3a3!important}
+.tool-workbench{--tool-asset-bg:#202020;--tool-asset-border:#46443f;--tool-asset-active:#f0eee8;--tool-asset-media:#292929;--tool-asset-muted:#c4c1ba;--tool-asset-text:#f3f1ec}
+/* Desktop tool lab: one strong visual hierarchy around the existing input/history/result flow. */
+@media(min-width:901px){
+  .tool-workbench{min-height:100vh;padding:30px 38px 42px;background:var(--bg-page);background-image:radial-gradient(46% 42% at 8% -8%,color-mix(in srgb,var(--accent) 20%,transparent),transparent 72%),radial-gradient(36% 34% at 96% 14%,color-mix(in srgb,var(--accent-teal) 10%,transparent),transparent 70%),linear-gradient(180deg,color-mix(in srgb,var(--bg-page) 86%,#05070c),var(--bg-page) 38%);color:var(--text-primary)}
+  .workbench-header,.tool-layout{max-width:1450px}.workbench-header{position:relative;min-height:74px;padding:4px 0 24px;border-bottom-color:var(--border-subtle)}.workbench-header::after{content:'创作工具';position:absolute;right:0;bottom:7px;color:var(--text-faint);font-size:10px;font-weight:800;letter-spacing:.17em}.breadcrumb,.workbench-title p,.tool-workbench small{color:var(--text-muted)}.workbench-title{gap:14px}.title-mark{width:44px;height:44px;border-radius:13px;background:linear-gradient(145deg,var(--accent),#6f61df)!important;color:#fff!important;box-shadow:0 13px 28px color-mix(in srgb,var(--accent) 27%,transparent)}.tool-workbench h1{font-size:28px;letter-spacing:-.04em;color:var(--text-primary)}
+  .tool-layout{grid-template-columns:320px 276px minmax(0,1fr);gap:16px;margin-top:22px}.tool-form,.run-history,.result{position:relative;border-color:var(--border-subtle);border-radius:18px;background:color-mix(in srgb,var(--bg-surface) 94%,transparent);box-shadow:var(--shadow-sm)}.tool-form{background:linear-gradient(155deg,color-mix(in srgb,var(--accent) 10%,var(--bg-surface)),var(--bg-surface) 42%)}.tool-form::before,.run-history::before,.result::before{display:block;margin-bottom:18px;color:var(--text-faint);font-size:10px;font-weight:800;letter-spacing:.16em}.tool-form::before{content:'创作输入'}.run-history::before{content:'运行历史'}.result::before{content:'生成结果'}.tool-form,.run-history,.result{padding:20px}.panel-kicker{margin-bottom:17px}.panel-kicker>span{border-radius:8px;background:color-mix(in srgb,var(--accent) 18%,var(--bg-elevated))!important;color:var(--text-primary)!important}.panel-kicker b{color:var(--text-primary);font-size:14px}.tool-form label{color:var(--text-regular)}.tool-form :deep(.el-input__wrapper),.tool-form :deep(.el-select__wrapper),.tool-form :deep(.el-textarea__inner){background:color-mix(in srgb,var(--bg-page) 34%,transparent);box-shadow:0 0 0 1px var(--border-subtle) inset!important}.tool-form :deep(.el-input__wrapper:hover),.tool-form :deep(.el-select__wrapper:hover),.tool-form :deep(.el-textarea__inner:hover){box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 60%,var(--border-color)) inset!important}.tool-form :deep(.el-button--primary){margin-top:14px!important;min-height:42px;background:linear-gradient(135deg,var(--accent),#6f61df)!important;border:0!important;color:#fff!important;box-shadow:0 12px 24px color-mix(in srgb,var(--accent) 25%,transparent)}
+  .run-history{background:color-mix(in srgb,var(--bg-raised) 75%,var(--bg-surface));max-height:calc(100vh - 172px)}.run-item{border-color:var(--border-subtle);border-radius:11px;background:var(--bg-surface);transition:transform .16s ease,border-color .16s ease,background .16s ease}.run-item:hover{transform:translateX(2px);border-color:var(--border-strong)}.run-item.active{border-color:color-mix(in srgb,var(--accent) 60%,var(--border-color))!important;background:color-mix(in srgb,var(--accent) 11%,var(--bg-raised))!important;box-shadow:inset 3px 0 0 var(--accent)}.history-empty{color:var(--text-muted)}
+  .result{overflow:hidden;background:radial-gradient(circle at 86% 8%,color-mix(in srgb,var(--accent-teal) 11%,transparent),transparent 21%),color-mix(in srgb,var(--bg-surface) 96%,transparent)}.result::after{content:'';position:absolute;right:-86px;top:68px;width:290px;height:290px;border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);border-radius:50%;box-shadow:0 0 0 32px color-mix(in srgb,var(--accent) 4%,transparent);pointer-events:none}.result>*{position:relative;z-index:1}.status{border-color:color-mix(in srgb,var(--accent) 34%,var(--border-color));border-radius:11px;background:color-mix(in srgb,var(--accent) 7%,var(--bg-raised));color:var(--text-regular)}.result pre{border-color:var(--border-subtle);border-radius:13px;background:color-mix(in srgb,var(--bg-page) 62%,transparent);color:var(--text-primary)}.empty{position:relative;min-height:420px}.empty>span{display:grid;place-items:center;width:76px;height:76px;border-radius:24px;background:linear-gradient(145deg,var(--accent),#6f61df)!important;color:#fff!important;box-shadow:0 16px 38px color-mix(in srgb,var(--accent) 26%,transparent)}.empty b{font-size:18px;color:var(--text-primary)}.empty p{color:var(--text-muted)}
+}
+.tool-workbench { display:grid; grid-template-rows:auto minmax(0,1fr); row-gap:1rem; width:100%; height:100vh; height:100dvh; min-height:0; padding:1.4rem 1.8rem; overflow:hidden; }
+.tool-layout { width:100%; max-width:1500px; height:100%; min-height:0; margin:0 auto; grid-template-columns:19rem 17rem minmax(0,1fr); overflow:hidden; }.tool-form,.run-history,.result { min-height:0; }.tool-form,.run-history { overflow-y:auto; overscroll-behavior:contain; }.result pre { min-height:0; max-height:none; }
+@media (max-width: 900px) {
+  .tool-workbench {
+    display: block;
+    height: auto;
+    min-height: 100dvh;
+    overflow: visible;
+  }
+  .tool-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+  }
+  .tool-form,
+  .run-history,
+  .result {
+    height: auto;
+    min-height: 0;
+    max-height: none;
+    overflow: visible;
+  }
+  .result pre {
+    min-height: 18rem;
+    max-height: none;
+    overflow: auto;
+  }
+  .result::after {
+    display: none;
+  }
+  .empty {
+    min-height: 18rem;
+  }
+}
+</style>

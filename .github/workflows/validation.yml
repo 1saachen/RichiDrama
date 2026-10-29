@@ -1,0 +1,120 @@
+name: Validation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests and migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: backend-node/package-lock.json
+      - name: Install bounded test tools
+        run: |
+          sudo timeout 180s apt-get \
+            -o Acquire::Retries=2 \
+            -o Acquire::http::Timeout=15 \
+            -o Acquire::https::Timeout=15 \
+            update
+          sudo timeout 180s apt-get \
+            -o Acquire::Retries=2 \
+            -o Acquire::http::Timeout=15 \
+            -o Acquire::https::Timeout=15 \
+            install -y --no-install-recommends ffmpeg shellcheck
+      - name: Check deployment shell scripts
+        run: |
+          shellcheck -e SC1091 \
+            deploy/lib.sh deploy/preview-deploy deploy/preview-payment-smoke deploy/test-preview-ingress deploy/preview-remove deploy/preview-show deploy/preview-cleanup \
+            deploy/release-deploy deploy/release-rollback deploy/install-operations deploy/prune-release-backlog \
+            deploy/backup-data.sh deploy/restore-data.sh
+      - name: Install backend dependencies
+        working-directory: backend-node
+        run: npm ci --no-audit --no-fund
+      - name: Install frontend dependencies for HTTP integration tests
+        working-directory: frontweb
+        run: npm ci --no-audit --no-fund
+      - name: Run backend tests
+        working-directory: backend-node
+        run: node --test test/*.test.js
+      - name: Verify empty database migrations twice
+        working-directory: backend-node
+        run: node tools/verify-migrations.js "${RUNNER_TEMP}/empty/drama_generator.db"
+
+  frontend:
+    name: Frontend tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontweb/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: frontweb
+        run: npm ci --no-audit --no-fund
+      - name: Run frontend tests
+        working-directory: frontweb
+        run: node --test test/*.test.js
+      - name: Build frontend
+        working-directory: frontweb
+        run: npm run build
+
+  container:
+    name: Container build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build immutable candidate image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: local-minidrama:${{ github.sha }}
+          build-args: |
+            APP_REVISION=${{ github.sha }}
+            DEBIAN_MIRROR=deb.debian.org
+          cache-from: type=gha,scope=validation-container
+          cache-to: type=gha,mode=max,scope=validation-container
+      - name: Verify image revision
+        run: test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "local-minidrama:${GITHUB_SHA}")" = "${GITHUB_SHA}"
+      - name: Verify Node 24 and native modules
+        run: |
+          docker run --rm --network none --entrypoint node "local-minidrama:${GITHUB_SHA}" -e '
+            const assert = require("node:assert/strict");
+            assert.equal(process.versions.node.split(".")[0], "24");
+            const db = require("better-sqlite3")(":memory:");
+            assert.equal(db.prepare("SELECT 1 AS ok").get().ok, 1);
+            db.close();
+            require("sharp")({ create: { width: 1, height: 1, channels: 3, background: "white" } })
+              .png().toBuffer().catch(error => { console.error(error); process.exitCode = 1; });
+          '
+      - name: Verify preview Nginx configuration
+        run: |
+          test_root="${RUNNER_TEMP}/preview-nginx"
+          mkdir -p "$test_root"
+          touch "$test_root/minidrama-preview.htpasswd"
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/deploy/nginx-preview-vhost.conf:/etc/nginx/conf.d/default.conf:ro" \
+            -v "${test_root}/minidrama-preview.htpasswd:/etc/nginx/minidrama-preview.htpasswd:ro" \
+            nginx:1.27-alpine nginx -t
+      - name: Verify concurrent preview WebSocket routing
+        run: bash deploy/test-preview-ingress

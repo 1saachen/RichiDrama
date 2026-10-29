@@ -1,0 +1,538 @@
+// 分镜：create, update, delete；帧提示词 get/save
+const { validateWritableMediaReferences } = require('./mediaAuthorizationService');
+const { normalizeStorageKey } = require('../utils/storagePath');
+
+function validateStoryboardLocalPaths(input) {
+  for (const field of ['local_path', 'last_frame_local_path', 'audio_local_path', 'narration_audio_local_path']) {
+    if (input?.[field] != null && input[field] !== '') normalizeStorageKey(input[field]);
+  }
+}
+
+/**
+ * 将分镜勾选的角色（dramas.characters 表 id）同步到 storyboard_characters（角色库 id），
+ * 便于帧提示词与图生参考图与 UI 一致；按角色名匹配本剧或全局角色库。
+ */
+function parseDramaCharacterIds(charactersValue) {
+  if (charactersValue === undefined || charactersValue === null) return null;
+  if (Array.isArray(charactersValue)) {
+    return charactersValue
+      .map((x) => Number(typeof x === 'object' && x != null ? x.id : x))
+      .filter((n) => Number.isFinite(n));
+  }
+  if (typeof charactersValue === 'string') {
+    try {
+      const arr = JSON.parse(charactersValue);
+      if (!Array.isArray(arr)) return [];
+      return arr
+        .map((x) => Number(typeof x === 'object' && x != null ? x.id : x))
+        .filter((n) => Number.isFinite(n));
+    } catch (_) {
+      return [];
+    }
+  }
+  return [];
+}
+
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value
+  try { const parsed = value ? JSON.parse(value) : []; return Array.isArray(parsed) ? parsed : [] } catch (_) { return [] }
+}
+
+function parseJsonObject(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value
+  try { const parsed = value ? JSON.parse(value) : {}; return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {} } catch (_) { return {} }
+}
+
+function parseStoryboardCharacters(value) {
+  let parsed = value;
+  if (typeof value === 'string') {
+    try { parsed = JSON.parse(value); } catch (_) { return []; }
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .map((character) => (typeof character === 'object' && character != null ? Number(character.id) : Number(character)))
+    .filter((id) => Number.isFinite(id));
+}
+
+function syncStoryboardCharacterLinks(db, storyboardId, dramaCharacterIds) {
+  const sid = Number(storyboardId);
+  db.prepare('DELETE FROM storyboard_characters WHERE storyboard_id = ?').run(sid);
+  const ids = Array.isArray(dramaCharacterIds) ? dramaCharacterIds.map((n) => Number(n)).filter((n) => Number.isFinite(n)) : [];
+  if (ids.length === 0) return;
+  const sb = db.prepare(
+    `SELECT e.drama_id FROM storyboards s JOIN episodes e ON e.id = s.episode_id WHERE s.id = ? AND s.deleted_at IS NULL`
+  ).get(sid);
+  const dramaId = sb?.drama_id != null ? Number(sb.drama_id) : null;
+  const now = new Date().toISOString();
+  const ins = db.prepare('INSERT OR IGNORE INTO storyboard_characters (storyboard_id, character_id, created_at) VALUES (?, ?, ?)');
+  for (const cid of ids.slice(0, 20)) {
+    const crow = db.prepare('SELECT name FROM characters WHERE id = ? AND deleted_at IS NULL').get(cid);
+    const name = (crow?.name || '').trim();
+    if (!name) continue;
+    let lib = null;
+    if (dramaId) {
+      lib = db.prepare(
+        'SELECT id FROM character_libraries WHERE deleted_at IS NULL AND drama_id = ? AND TRIM(name) = ? LIMIT 1'
+      ).get(dramaId, name);
+    }
+    if (!lib) {
+      lib = db.prepare(
+        'SELECT id FROM character_libraries WHERE deleted_at IS NULL AND drama_id IS NULL AND TRIM(name) = ? LIMIT 1'
+      ).get(name);
+    }
+    if (lib) ins.run(sid, lib.id, now);
+  }
+}
+
+function createStoryboard(db, log, req) {
+  const now = new Date().toISOString();
+  const episodeId = Number(req.episode_id);
+  if (!Number.isInteger(episodeId) || episodeId <= 0) throw new Error('缺少有效的 episode_id');
+  let inheritedGenerationSettings = null;
+  try { inheritedGenerationSettings = require('./generationSettingsService').getEpisodeSettings(db, episodeId)?.defaults || null; } catch (_) {}
+  const requestedNumber = Number(req.storyboard_number ?? 0);
+  const requestedNum = Number.isInteger(requestedNumber) && requestedNumber > 0 ? requestedNumber : null;
+  const create = db.prepare(
+    `INSERT INTO storyboards (episode_id, scene_id, storyboard_number, title, description, location, time, duration, dialogue, action, result, atmosphere, image_prompt, video_prompt, status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+  );
+  // The client may be working from a de-duplicated/stale storyboard list.  Never
+  // let that turn into duplicate storyboard_number rows: the visible list is
+  // keyed by this number and duplicates make a successfully created shot appear
+  // to be missing.  Allocation and insert are one synchronous SQLite transaction.
+  const info = db.transaction(() => {
+    const existing = db.prepare(
+      'SELECT 1 FROM storyboards WHERE episode_id = ? AND storyboard_number = ? AND deleted_at IS NULL LIMIT 1'
+    );
+    const max = db.prepare(
+      'SELECT COALESCE(MAX(storyboard_number), 0) AS value FROM storyboards WHERE episode_id = ? AND deleted_at IS NULL'
+    );
+    const duplicate = requestedNum != null && existing.get(episodeId, requestedNum);
+    const num = !requestedNum || duplicate ? Number(max.get(episodeId).value) + 1 : requestedNum;
+    const defaultTitle = requestedNum != null ? `镜头 ${requestedNum}` : null;
+    return create.run(
+      episodeId,
+      req.scene_id ?? null,
+      num,
+      req.title === defaultTitle ? `镜头 ${num}` : (req.title ?? null),
+      req.description ?? null,
+      req.location ?? null,
+      req.time ?? null,
+      req.duration ?? 0,
+      req.dialogue ?? null,
+      req.action ?? null,
+      req.result ?? null,
+      req.atmosphere ?? null,
+      req.image_prompt ?? null,
+      req.video_prompt ?? null,
+      now,
+      now
+    );
+  })();
+  log.info('Storyboard created', { id: info.lastInsertRowid, episode_id: episodeId });
+  try {
+    const identity = require('./storyboardIdentityService');
+    const createdNumber = db.prepare('SELECT storyboard_number FROM storyboards WHERE id = ?').get(info.lastInsertRowid)?.storyboard_number;
+    identity.ensureIdentity(db, info.lastInsertRowid, Math.max(0, Number(createdNumber || 1) - 1));
+  } catch (_) {}
+  try { require('./generationSettingsService').initializeStoryboardFromMaster(db, info.lastInsertRowid, inheritedGenerationSettings); } catch (_) {}
+  return getStoryboardById(db, info.lastInsertRowid);
+}
+
+function activeOmniAssetIds(db, storyboardId, rawIds, ownerUserId, log) {
+  const requested = [...new Set(parseJsonArray(rawIds).map(Number).filter(Number.isFinite))];
+  if (!requested.length) return [];
+  // Tests and old databases may not contain the material table yet. In that
+  // case preserve legacy behavior; production databases always validate.
+  try {
+    const marks = requested.map(() => '?').join(', ');
+    const rows = db.prepare(`SELECT a.id FROM assets a
+      JOIN storyboards s ON s.id = ?
+      JOIN episodes e ON e.id = s.episode_id
+      WHERE a.id IN (${marks}) AND a.deleted_at IS NULL
+        AND (a.drama_id = e.drama_id OR (a.drama_id IS NULL AND a.owner_user_id = ?))`)
+      .all(Number(storyboardId), ...requested, Number(ownerUserId));
+    const active = new Set(rows.map((row) => Number(row.id)));
+    const kept = requested.filter((assetId) => active.has(assetId));
+    if (kept.length !== requested.length) {
+      log.warn('Removed unavailable storyboard asset references', {
+        storyboard_id: Number(storyboardId),
+        removed_asset_ids: requested.filter((assetId) => !active.has(assetId)),
+      });
+    }
+    return kept;
+  } catch (_) {
+    return requested;
+  }
+}
+
+function updateStoryboard(db, log, id, req, ownerUserId = null) {
+  const row = db.prepare('SELECT id, updated_at, universal_segment_text FROM storyboards WHERE id = ? AND deleted_at IS NULL').get(Number(id));
+  if (!row) return null;
+  validateStoryboardLocalPaths(req);
+  validateWritableMediaReferences(db, req, ownerUserId, [
+    'image_url', 'local_path', 'composed_image', 'video_url',
+    'last_frame_image_url', 'last_frame_local_path',
+    'audio_local_path', 'narration_audio_local_path',
+  ]);
+  const allowed = ['title', 'description', 'location', 'time', 'duration', 'dialogue', 'narration', 'action', 'result', 'atmosphere', 'image_prompt', 'polished_prompt', 'video_prompt', 'text_model', 'video_model', 'video_resolution', 'video_aspect_ratio', 'video_upscale_resolution', 'video_target_fps', 'scene_id', 'characters', 'composed_image', 'image_url', 'local_path', 'main_panel_idx', 'video_url', 'active_video_generation_id', 'audio_local_path', 'narration_audio_local_path', 'status', 'shot_type', 'angle', 'angle_h', 'angle_v', 'angle_s', 'movement', 'segment_index', 'segment_title', 'creation_mode', 'universal_segment_text', 'layout_description', 'first_frame_image_id', 'last_frame_image_id', 'last_frame_image_url', 'last_frame_local_path', 'omni_asset_ids', 'audio_strategy', 'keep_original_audio', 'audio_volume', 'audio_fade_seconds', 'omni_creation_mode', 'omni_first_frame_asset_id', 'omni_last_frame_asset_id', 'omni_asset_usage_json', 'omni_asset_send_policy', 'omni_prompt_document'];
+  const updates = [];
+  const params = [];
+  // 前端可能传 character_ids，与 characters 统一：存为 JSON 字符串
+  const charactersValue = req.character_ids !== undefined ? req.character_ids : req.characters;
+  let parsedDramaCharIdsForSync = null;
+  let validatedPropIds = null;
+  if (charactersValue !== undefined) {
+    updates.push('characters = ?');
+    const jsonStr = Array.isArray(charactersValue) ? JSON.stringify(charactersValue) : (typeof charactersValue === 'string' ? charactersValue : '[]');
+    params.push(jsonStr);
+    parsedDramaCharIdsForSync = parseDramaCharacterIds(charactersValue) ?? [];
+    if (parsedDramaCharIdsForSync.length > 0) {
+      const marks = parsedDramaCharIdsForSync.map(() => '?').join(', ');
+      const dramaRow = db.prepare(`SELECT e.drama_id
+        FROM storyboards s JOIN episodes e ON e.id = s.episode_id
+        WHERE s.id = ? AND s.deleted_at IS NULL`).get(Number(id));
+      const rows = db.prepare(`SELECT c.id FROM characters c
+        WHERE c.id IN (${marks}) AND c.drama_id = ? AND c.deleted_at IS NULL`)
+        .all(...parsedDramaCharIdsForSync, Number(dramaRow?.drama_id));
+      if (rows.length !== new Set(parsedDramaCharIdsForSync).size) {
+        const error = new Error('只能关联当前项目的角色');
+        error.code = 'BAD_REQUEST';
+        throw error;
+      }
+    }
+  }
+  for (const key of allowed) {
+    if (key === 'characters') continue;
+    if (req[key] !== undefined) {
+      updates.push(key === 'omni_prompt_document' ? 'omni_prompt_document_json = ?' : key + ' = ?');
+      const val = req[key];
+      if (key === 'omni_asset_ids') params.push(JSON.stringify(activeOmniAssetIds(db, id, val, ownerUserId, log)));
+      else if (key === 'omni_asset_usage_json') params.push(JSON.stringify(parseJsonObject(val)));
+      else if (key === 'omni_prompt_document') {
+        const document = val && typeof val === 'object' ? val : { text: '', refs: [] };
+        params.push(JSON.stringify({ ...document, text: document.text ?? req.universal_segment_text ?? row.universal_segment_text ?? '' }));
+      }
+      else if (key === 'keep_original_audio') params.push(val ? 1 : 0);
+      else params.push(val);
+    }
+  }
+  if (req.prop_ids !== undefined) {
+    const propService = require('./propService');
+    validatedPropIds = propService.validateStoryboardPropIds(db, id, req.prop_ids);
+  }
+  if (updates.length === 0 && req.prop_ids === undefined) return getStoryboardById(db, id);
+  if (updates.length > 0) {
+    params.push(new Date().toISOString(), id);
+    db.prepare('UPDATE storyboards SET ' + updates.join(', ') + ', updated_at = ? WHERE id = ?').run(...params);
+  }
+  // 角色勾选变更：只同步 storyboard_characters，不删除 frame_prompts。
+  // 用户手动保存的首/尾帧提示词应保留；图生时 framePromptSanitize 会按当前勾选剔除未出场角色名。
+  if (parsedDramaCharIdsForSync !== null) {
+    try {
+      syncStoryboardCharacterLinks(db, id, parsedDramaCharIdsForSync);
+    } catch (e) {
+      log.warn('syncStoryboardCharacterLinks failed', { id, message: e.message });
+    }
+  }
+  // 道具关联：写入 storyboard_props 表
+  if (req.prop_ids !== undefined) {
+    db.prepare('DELETE FROM storyboard_props WHERE storyboard_id = ?').run(Number(id));
+    const ins = db.prepare('INSERT OR IGNORE INTO storyboard_props (storyboard_id, prop_id) VALUES (?, ?)');
+    for (const pid of validatedPropIds) ins.run(Number(id), Number(pid));
+  }
+  log.info('Storyboard updated', { id });
+  return getStoryboardById(db, id);
+}
+
+function deleteStoryboard(db, log, id) {
+  // Do not orphan an in-flight generation: a soft-deleted storyboard used to
+  // disappear from the editor while its provider job continued billing and
+  // could only be rediscovered through history.  The user must first cancel
+  // an unsubmitted omni task (or wait for a submitted provider task).
+  try {
+    const active = db.prepare(`SELECT COUNT(*) AS count FROM video_generations
+      WHERE storyboard_id = ? AND deleted_at IS NULL
+        AND status IN ('sd2_waiting','processing','persisting','upscale_pending','upscaling','interpolation_pending','interpolating')`).get(Number(id));
+    if (Number(active?.count || 0) > 0) throw new Error(`该分镜仍有 ${active.count} 个生成任务，请先取消或等待完成后再删除`);
+  } catch (error) {
+    if (/该分镜仍有/.test(String(error.message || ''))) throw error;
+  }
+  const now = new Date().toISOString();
+  const result = db.prepare('UPDATE storyboards SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL').run(now, Number(id));
+  if (result.changes === 0) return false;
+  log.info('Storyboard deleted', { id });
+  return true;
+}
+
+function getStoryboardById(db, id, storageRoot = null) {
+  const r = db.prepare('SELECT * FROM storyboards WHERE id = ? AND deleted_at IS NULL').get(Number(id));
+  if (!r) return null;
+  const playback = r.playback_video_generation_id
+    ? require('./videoService').playbackGeneration(db, r.playback_video_generation_id, storageRoot) : null;
+  const characters = parseStoryboardCharacters(r.characters);
+  let propIds = [];
+  try {
+    const propLinks = db.prepare('SELECT prop_id FROM storyboard_props WHERE storyboard_id = ?').all(Number(id));
+    propIds = propLinks.map((p) => p.prop_id);
+  } catch (_) {}
+  return {
+    id: r.id,
+    ...require('./storyboardInputState').storyboardInputState(r),
+    storyboard_uid: r.storyboard_uid ?? null,
+    episode_id: r.episode_id,
+    scene_id: r.scene_id,
+    storyboard_number: r.storyboard_number,
+    position: r.position ?? r.sort_order ?? Math.max(0, Number(r.storyboard_number || 1) - 1),
+    title: r.title,
+    description: r.description,
+    location: r.location,
+    time: r.time,
+    duration: r.duration ?? 0,
+    dialogue: r.dialogue,
+    narration: r.narration ?? null,
+    action: r.action,
+    result: r.result ?? null,
+    atmosphere: r.atmosphere,
+    image_prompt: r.image_prompt,
+    polished_prompt: r.polished_prompt ?? null,
+    continuity_snapshot: r.continuity_snapshot ?? null,
+    video_prompt: r.video_prompt,
+    shot_type: r.shot_type,
+    angle: r.angle,
+    angle_h: r.angle_h ?? null,
+    angle_v: r.angle_v ?? null,
+    angle_s: r.angle_s ?? null,
+    movement: r.movement,
+    lighting_style: r.lighting_style ?? null,
+    depth_of_field: r.depth_of_field ?? null,
+    emotion: r.emotion ?? null,
+    emotion_intensity: r.emotion_intensity ?? null,
+    segment_index: r.segment_index ?? 0,
+    segment_title: r.segment_title ?? null,
+    creation_mode: r.creation_mode === 'universal' ? 'universal' : 'classic',
+    universal_segment_text: r.universal_segment_text ?? null,
+    layout_description: r.layout_description ?? null,
+    first_frame_image_id: r.first_frame_image_id ?? null,
+    last_frame_image_id: r.last_frame_image_id ?? null,
+    last_frame_image_url: r.last_frame_image_url ?? null,
+    last_frame_local_path: r.last_frame_local_path ?? null,
+    characters,
+    prop_ids: propIds,
+    composed_image: r.composed_image,
+    image_url: r.image_url ?? null,
+    local_path: r.local_path ?? null,
+    main_panel_idx: r.main_panel_idx != null ? Number(r.main_panel_idx) : null,
+    video_url: (r.local_path && /\.(?:mp4|webm|mov|m4v|avi|mkv)(?:[?#].*)?$/i.test(String(r.local_path).trim()))
+      ? `/static/${String(r.local_path).trim().replace(/^\/+/, '')}`
+      : (r.video_url || playback?.video_url || null),
+    active_video_generation_id: r.active_video_generation_id ?? null,
+    playback_video_generation_id: r.playback_video_generation_id ?? null,
+    poster_local_path: r.video_url ? null : (playback?.poster_local_path || null),
+    audio_local_path: r.audio_local_path ?? null,
+    narration_audio_local_path: r.narration_audio_local_path ?? null,
+    status: r.status || 'pending',
+    error_msg: r.error_msg ?? null,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+  };
+}
+
+function getFramePrompts(db, storyboardId) {
+  const rows = db.prepare(
+    'SELECT * FROM frame_prompts WHERE storyboard_id = ? ORDER BY created_at ASC'
+  ).all(Number(storyboardId));
+  return rows.map((r) => ({
+    id: r.id,
+    storyboard_id: r.storyboard_id,
+    frame_type: r.frame_type,
+    prompt: r.prompt,
+    description: r.description,
+    layout: r.layout,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+  }));
+}
+
+function saveFramePrompt(db, log, storyboardId, frameType, prompt, description, layout) {
+  const now = new Date().toISOString();
+  const existing = db.prepare('SELECT id FROM frame_prompts WHERE storyboard_id = ? AND frame_type = ?').get(Number(storyboardId), frameType);
+  if (existing) {
+    db.prepare('UPDATE frame_prompts SET prompt = ?, description = ?, layout = ?, updated_at = ? WHERE id = ?').run(
+      prompt,
+      description ?? null,
+      layout ?? null,
+      now,
+      existing.id
+    );
+    return getFramePrompts(db, storyboardId);
+  }
+  db.prepare(
+    `INSERT INTO frame_prompts (storyboard_id, frame_type, prompt, description, layout, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(Number(storyboardId), frameType, prompt, description ?? null, layout ?? null, now, now);
+  log.info('Frame prompt saved', { storyboard_id: storyboardId, frame_type: frameType });
+  return getFramePrompts(db, storyboardId);
+}
+
+/** 在指定分镜前插入一个空白分镜：先把同 episode 中 number >= target 的全部 +1，再创建新分镜 */
+function insertBeforeStoryboard(db, log, targetId) {
+  const target = db.prepare(
+    'SELECT id, episode_id, storyboard_number, segment_index, segment_title FROM storyboards WHERE id = ? AND deleted_at IS NULL'
+  ).get(Number(targetId));
+  if (!target) return null;
+  let inheritedGenerationSettings = null;
+  try { inheritedGenerationSettings = require('./generationSettingsService').getEpisodeSettings(db, target.episode_id)?.defaults || null; } catch (_) {}
+
+  const now = new Date().toISOString();
+  const identity = require('./storyboardIdentityService');
+  const info = db.transaction(() => {
+    const order = identity.orderedActiveRows(db, target.episode_id);
+    const created = db.prepare(
+      `INSERT INTO storyboards (episode_id, storyboard_number, segment_index, segment_title, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'pending', ?, ?)`
+    ).run(target.episode_id, target.storyboard_number, target.segment_index ?? null, target.segment_title ?? null, now, now);
+    const newId = Number(created.lastInsertRowid);
+    identity.ensureIdentity(db, newId);
+    const targetIndex = order.indexOf(Number(target.id));
+    order.splice(targetIndex >= 0 ? targetIndex : order.length, 0, newId);
+    identity.reindexEpisode(db, target.episode_id, order, now);
+    return created;
+  })();
+
+  try { require('./generationSettingsService').initializeStoryboardFromMaster(db, info.lastInsertRowid, inheritedGenerationSettings); } catch (_) {}
+
+  log.info('Storyboard inserted before', { new_id: info.lastInsertRowid, before_id: targetId });
+  return getStoryboardById(db, info.lastInsertRowid);
+}
+
+/**
+ * Copy one storyboard after itself.
+ *
+ * Copy editable content, generation settings, and asset references. Do not copy
+ * generated media, adopted video state, audio files, or task status.
+ */
+function copyStoryboard(db, log, sourceId, storageRoot = null) {
+  const availableColumns = new Set(db.prepare('PRAGMA table_info(storyboards)').all().map((column) => column.name));
+  const copyColumns = [
+    'episode_id', 'scene_id', 'title', 'description', 'layout_description',
+    'location', 'time', 'duration', 'dialogue', 'narration', 'action', 'result',
+    'atmosphere', 'image_prompt', 'polished_prompt', 'video_prompt', 'text_model',
+    'video_model', 'video_resolution', 'video_aspect_ratio', 'video_upscale_resolution',
+    'video_target_fps', 'generation_overrides_json', 'characters', 'shot_type', 'angle',
+    'angle_h', 'angle_v', 'angle_s', 'movement', 'lighting_style', 'depth_of_field',
+    'emotion', 'emotion_intensity', 'segment_index', 'segment_title', 'creation_mode',
+    'universal_segment_text', 'omni_asset_ids', 'audio_strategy', 'keep_original_audio',
+    'audio_volume', 'audio_fade_seconds', 'omni_creation_mode', 'omni_first_frame_asset_id',
+    'omni_last_frame_asset_id', 'omni_asset_usage_json', 'omni_asset_send_policy',
+    'omni_prompt_document_json', 'continuity_snapshot',
+  ].filter((column) => availableColumns.has(column));
+
+  const now = new Date().toISOString();
+  const copied = db.transaction(() => {
+    const source = db.prepare('SELECT * FROM storyboards WHERE id = ? AND deleted_at IS NULL').get(Number(sourceId));
+    if (!source) return null;
+    const videoService = require('./videoService');
+    const { ACTIVE_VIDEO_STATUSES } = require('./generationSubmissionGuard');
+    let activeGeneration = null;
+    if (source.active_video_generation_id) {
+      try {
+        activeGeneration = db.prepare(`SELECT id, status FROM video_generations
+          WHERE id=? AND deleted_at IS NULL`).get(Number(source.active_video_generation_id));
+      } catch (error) { if (!/no such (?:table|column)/i.test(error.message)) throw error; }
+    }
+    const sourceHasActiveTask = ACTIVE_VIDEO_STATUSES.includes(String(activeGeneration?.status || ''));
+    // An active source generation makes both current-generation adoption and
+    // playback fallback ineligible for the copy. The copied storyboard never
+    // receives active_video_generation_id because that column is excluded from
+    // copyColumns; playback is explicitly forced to NULL below.
+    let adopted = sourceHasActiveTask ? null : videoService.playbackGeneration(db, source.active_video_generation_id, storageRoot);
+    // Legacy current adoption may be recorded only by its exact local file.
+    // Do not infer it from the newest history entry or an ambiguous path.
+    if (!adopted && !source.active_video_generation_id && source.local_path) {
+      try {
+        const matches = db.prepare(`SELECT id FROM video_generations
+          WHERE local_path=? AND deleted_at IS NULL AND status='completed' LIMIT 2`).all(source.local_path);
+        if (matches.length === 1) adopted = videoService.playbackGeneration(db, matches[0].id, storageRoot);
+      } catch (error) { if (!/no such (?:table|column)/i.test(error.message)) throw error; }
+    }
+    if (!sourceHasActiveTask) adopted ||= videoService.playbackGeneration(db, source.playback_video_generation_id, storageRoot);
+    db.prepare(
+      'UPDATE storyboards SET storyboard_number = storyboard_number + 1, updated_at = ? WHERE episode_id = ? AND storyboard_number > ? AND deleted_at IS NULL'
+    ).run(now, source.episode_id, source.storyboard_number);
+
+    const insertColumns = ['storyboard_number', ...copyColumns, 'status', 'created_at', 'updated_at'];
+    const values = [
+      Number(source.storyboard_number) + 1,
+      ...copyColumns.map((column) => column === 'title'
+        ? `${String(source.title || '未命名分镜').trim()}（副本）`
+        : source[column]),
+      'pending',
+      now,
+      now,
+    ];
+    if (availableColumns.has('playback_video_generation_id')) {
+      insertColumns.push('playback_video_generation_id');
+      values.push(adopted?.id || null);
+    }
+    const placeholders = insertColumns.map(() => '?').join(', ');
+    const info = db.prepare(
+      `INSERT INTO storyboards (${insertColumns.join(', ')}) VALUES (${placeholders})`
+    ).run(...values);
+    const newId = Number(info.lastInsertRowid);
+    const identity = require('./storyboardIdentityService');
+    identity.ensureIdentity(db, newId);
+
+    const orderBy = availableColumns.has('sort_order')
+      ? 'sort_order ASC, storyboard_number ASC, id ASC'
+      : 'storyboard_number ASC, id ASC';
+    const currentOrder = db.prepare(
+      `SELECT id FROM storyboards WHERE episode_id = ? AND deleted_at IS NULL AND id <> ? ORDER BY ${orderBy}`
+    ).all(source.episode_id, newId).map((row) => Number(row.id));
+    const sourceIndex = currentOrder.indexOf(Number(source.id));
+    currentOrder.splice(sourceIndex >= 0 ? sourceIndex + 1 : currentOrder.length, 0, newId);
+    identity.reindexEpisode(db, source.episode_id, currentOrder, now);
+
+    try {
+      const characterLinks = db.prepare('SELECT character_id FROM storyboard_characters WHERE storyboard_id = ?').all(source.id);
+      const insertCharacter = db.prepare(
+        'INSERT OR IGNORE INTO storyboard_characters (storyboard_id, character_id, created_at) VALUES (?, ?, ?)'
+      );
+      characterLinks.forEach((link) => insertCharacter.run(newId, link.character_id, now));
+    } catch (_) {}
+    try {
+      const propLinks = db.prepare('SELECT prop_id FROM storyboard_props WHERE storyboard_id = ?').all(source.id);
+      const insertProp = db.prepare('INSERT OR IGNORE INTO storyboard_props (storyboard_id, prop_id) VALUES (?, ?)');
+      propLinks.forEach((link) => insertProp.run(newId, link.prop_id));
+    } catch (_) {}
+    try {
+      const prompts = db.prepare(
+        'SELECT frame_type, prompt, description, layout FROM frame_prompts WHERE storyboard_id = ? ORDER BY created_at ASC'
+      ).all(source.id);
+      const insertPrompt = db.prepare(
+        'INSERT INTO frame_prompts (storyboard_id, frame_type, prompt, description, layout, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      );
+      prompts.forEach((prompt) => insertPrompt.run(
+        newId, prompt.frame_type, prompt.prompt, prompt.description, prompt.layout, now, now
+      ));
+    } catch (_) {}
+
+    return getStoryboardById(db, newId, storageRoot);
+  }).immediate();
+
+  if (!copied) return null;
+
+  log.info('Storyboard copied', { source_id: Number(sourceId), copied_id: copied.id });
+  return copied;
+}
+
+module.exports = {
+  createStoryboard,
+  insertBeforeStoryboard,
+  copyStoryboard,
+  updateStoryboard,
+  deleteStoryboard,
+  getStoryboardById,
+  getFramePrompts,
+  saveFramePrompt,
+};

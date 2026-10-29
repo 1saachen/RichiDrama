@@ -1,0 +1,15 @@
+[Unit]
+Description=RichiDrama full local media disaster-recovery backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+Environment=PROJECT_DIR=/data/apps/LocalMiniDrama
+Environment=MINIDRAMA_DATA_DIR=/data/minidrama-data
+Environment=MINIDRAMA_BACKUP_DIR=/data/minidrama-backups
+Environment=FULL_BACKUP_RETAIN_COUNT=2
+# Run the copy installed by `install-operations` (a successful release refreshes
+# it) instead of the checkout working tree, where an unrelated `git checkout`
+# silently changes what the nightly backup executes.
+ExecStart=/usr/bin/env bash /usr/local/lib/richidrama-deploy/backup-data.sh --full --quiet

@@ -1,0 +1,1593 @@
+/** 轮询/同步返回的 video_url 须为 http(s)，避免中转 FAILURE 时 result_url 为错误文案 */
+function resolveRemoteVideoUrl(videoUrl, fallbackError) {
+  if (videoUrl && videoClient.isPlausibleHttpVideoUrl(videoUrl)) {
+    return { ok: true, video_url: String(videoUrl).trim() };
+  }
+  if (videoUrl) {
+    return { ok: false, error: (fallbackError || String(videoUrl)).slice(0, 500) };
+  }
+  return { ok: false, error: (fallbackError || '超时或失败').slice(0, 500) };
+}
+
+// 本地视频是持久化结果，优先于厂商返回的带过期时间签名 URL。
+function publicVideoUrl(videoUrl, localPath) {
+  const local = localPath && String(localPath).trim();
+  if (local && /\.(?:mp4|webm|mov|m4v|avi|mkv)(?:[?#].*)?$/i.test(local)) {
+    return `/static/${local.replace(/^\/+/, '')}`;
+  }
+  // Provider delivery URLs (notably Volcengine/TOS) are signed and expire.
+  // A generated video is public only after its bytes have been archived here.
+  return null;
+}
+
+/**
+ * 将 video_generations 标为失败；若无 error_msg 列则只更新 status/updated_at。
+ *
+ * options.unverifiedProviderResult：写请求已发出但终态未知（供应商 5xx / 传输中断）。
+ * 此时不能 void 预授权——那会把"可能已在上游执行并计费的任务"当成没发生，用户重试即新幂等键，
+ * 上游可能重复计费。改为保持冻结并建对账（管理员按供应商用量核实后处置）。
+ * 下游未执行的插帧/超分预授权与本次调用无关，仍然照常释放。
+ */
+function setVideoGenFailed(db, videoGenId, errorMsg, now, options = {}) {
+  try {
+    db.prepare('UPDATE video_generations SET status = ?, error_msg = ?, updated_at = ? WHERE id = ?').run(
+      'failed', (errorMsg || '').slice(0, 500), now, videoGenId
+    );
+  } catch (e) {
+    if ((e.message || '').includes('error_msg')) {
+      db.prepare('UPDATE video_generations SET status = ?, updated_at = ? WHERE id = ?').run('failed', now, videoGenId);
+    } else throw e;
+  }
+  try {
+    const row = db.prepare('SELECT owner_user_id, billing_authorization_id, storyboard_id FROM video_generations WHERE id = ?').get(videoGenId);
+    if (row?.owner_user_id && row?.billing_authorization_id) {
+      const billing = require('./billingService');
+      const owner = { id: row.owner_user_id, role: 'admin' };
+      if (options.unverifiedProviderResult) {
+        billing.markPendingReconciliation(db, owner, row.billing_authorization_id, {
+          reason: `供应商提交未取得确定结果，不能判定是否已计费：${String(errorMsg || '').slice(0, 180)}`,
+          provider_request_id: options.providerRequestId || null,
+        });
+      } else {
+        billing.voidAuthorization(db, owner, row.billing_authorization_id, errorMsg || '视频生成失败');
+      }
+    }
+    // Only the version explicitly selected by the storyboard can change its
+    // visible state. A late failure of an old history record must not replace
+    // a newer adopted completed video.
+    if (row?.storyboard_id) {
+      try {
+        db.prepare(`UPDATE storyboards SET active_video_generation_id=COALESCE(active_video_generation_id, ?),
+          status='failed', error_msg=?, updated_at=?
+          WHERE id=? AND deleted_at IS NULL AND (active_video_generation_id IS NULL OR active_video_generation_id=?)`)
+          .run(videoGenId, (errorMsg || '视频生成失败').slice(0, 500), now, row.storyboard_id, videoGenId);
+      } catch (_) {}
+    }
+    const interpolation = db.prepare('SELECT owner_user_id, billing_authorization_id FROM video_interpolation_jobs WHERE video_generation_id=?').get(videoGenId);
+    if (interpolation?.billing_authorization_id) {
+      require('./billingService').voidAuthorization(db, { id: interpolation.owner_user_id, role: 'admin' }, interpolation.billing_authorization_id, '视频生成失败，插帧未调用');
+      db.prepare("UPDATE video_interpolation_jobs SET status='cancelled', error_msg=?, updated_at=? WHERE video_generation_id=?")
+        .run(String(errorMsg || '视频生成失败').slice(0, 500), now, videoGenId);
+      db.prepare("UPDATE video_generations SET interpolation_status='cancelled' WHERE id=? AND interpolation_status IN ('awaiting_source','pending')").run(videoGenId);
+    }
+    const upscale = db.prepare('SELECT owner_user_id, billing_authorization_id FROM video_upscale_jobs WHERE video_generation_id=?').get(videoGenId);
+    if (upscale?.billing_authorization_id) {
+      require('./billingService').voidAuthorization(db, { id: upscale.owner_user_id, role: 'admin' }, upscale.billing_authorization_id, '视频生成失败，超分未调用');
+      db.prepare("UPDATE video_upscale_jobs SET status='cancelled', error_msg=?, updated_at=? WHERE video_generation_id=?")
+        .run(String(errorMsg || '视频生成失败').slice(0, 500), now, videoGenId);
+      db.prepare("UPDATE video_generations SET upscale_status='cancelled' WHERE id=? AND upscale_status IN ('awaiting_source','pending')").run(videoGenId);
+    }
+  } catch (_) {}
+}
+
+/**
+ * Synchronize a stage-owned generation failure to the visible storyboard.
+ *
+ * Post-processing services already own their stage status and billing
+ * cleanup. Calling setVideoGenFailed() from those services would cancel the
+ * stage that just reported the failure, so they use this narrow helper to
+ * update only the storyboard projection.
+ */
+function syncVideoGenerationFailure(db, videoGenId, errorMsg, at = new Date().toISOString()) {
+  const row = db.prepare('SELECT storyboard_id, task_id FROM video_generations WHERE id=? AND deleted_at IS NULL').get(Number(videoGenId));
+  if (!row?.storyboard_id) return { storyboard_updated: false };
+  const result = db.prepare(`UPDATE storyboards SET active_video_generation_id=COALESCE(active_video_generation_id, ?),
+      status='failed', error_msg=?, updated_at=?
+    WHERE id=? AND deleted_at IS NULL
+      AND (active_video_generation_id IS NULL OR active_video_generation_id=?)`)
+    .run(Number(videoGenId), String(errorMsg || '视频生成失败').slice(0, 500), at, row.storyboard_id, Number(videoGenId));
+  return { storyboard_updated: result.changes > 0 };
+}
+
+function list(db, query) {
+  let sql = 'FROM video_generations WHERE deleted_at IS NULL';
+  const params = [];
+  if (query.owner_user_id) {
+    sql += ` AND ${require('./projectAccessService').generationPredicate(db, query.owner_user_id, 'video_generations')}`;
+  }
+  if (query.drama_id) {
+    sql += ' AND drama_id = ?';
+    params.push(query.drama_id);
+  }
+  if (String(query.tool_only || '') === '1' || String(query.tool_only || '').toLowerCase() === 'true') {
+    sql += ` AND COALESCE(drama_id, 0) = 0 AND storyboard_id IS NULL AND id NOT IN (
+      SELECT video_generation_id FROM omni_video_jobs
+      WHERE sequence_id IS NOT NULL OR shot_id IS NOT NULL OR storyboard_id IS NOT NULL
+    )`;
+  }
+  // An explicit storyboard ID identifies one current shot. Always prefer it.
+  // A copied or inserted shot can reuse a historical storyboard number. The
+  // number fallback must not attach that historical shot's media to the new ID.
+  if (query.storyboard_id) {
+    const ids = require('./storyboardIdentityService').historyStoryboardIds(db, query.storyboard_id);
+    sql += ` AND storyboard_id IN (${ids.map(() => '?').join(', ')})`;
+    params.push(...ids);
+  // Legacy callers can still recover replaced storyboard history by episode +
+  // storyboard number when they do not have a current storyboard ID.
+  } else if (query.episode_id && query.storyboard_number != null) {
+    sql += ` AND storyboard_id IN (
+      SELECT id FROM storyboards WHERE episode_id = ? AND storyboard_number = ?
+    )`;
+    params.push(query.episode_id, query.storyboard_number);
+  }
+  // 与 Go 前端行为对齐：请求 status=processing 时，同时包含“刚结束”的记录（5 分钟内变为 completed/failed），
+  // 这样轮询刷新后任务不会从列表消失，无需改 Vue
+  if (query.status === 'processing') {
+    sql += " AND (status IN ('processing','upscale_pending','upscaling','interpolation_pending','interpolating','persisting') OR (status IN ('completed','failed') AND updated_at >= datetime('now', '-5 minutes')))";
+  } else if (query.status) {
+    sql += ' AND status = ?';
+    params.push(query.status);
+  }
+  const countRow = db.prepare('SELECT COUNT(*) as total ' + sql).get(...params);
+  const total = countRow.total || 0;
+  const page = Math.max(1, parseInt(query.page, 10) || 1);
+  const pageSize = Math.min(100, Math.max(1, parseInt(query.page_size, 10) || 20));
+  const offset = (page - 1) * pageSize;
+  const rows = db.prepare('SELECT * ' + sql + ' ORDER BY created_at DESC LIMIT ? OFFSET ?').all(...params, pageSize, offset);
+  return { items: rows.map((row) => rowToItem(withTaskProgress(db, row))), total, page, pageSize };
+}
+
+/**
+ * 产品展示位使用固定的全局媒体清单，不从任何用户（包括管理员）的作品列表
+ * 动态挑选。这样账号创建、管理员清理作品或作品排序变化都不会改变新用户看到的
+ * 默认轮播。清单仅接受相对的本地视频路径，避免重新暴露供应商临时 URL。
+ */
+function listHomepageDefaultVideos(db, limit = 3) {
+  const configured = require('./settingsService').getHomepageVideoPaths(db);
+  const pageSize = Math.min(3, Math.max(1, Number(limit) || 3));
+  // OSS 镜像：默认资源已归档到对象存储时返回 CDN 地址，供线上渲染使用。
+  // 前端优先用 oss_url，本地无法访问 CDN 时回退到本地 /static 路径。
+  const CDN_BASE = 'https://cdn.ai.tensorbytes.com/';
+  const ossByPath = new Map();
+  try {
+    db.prepare("SELECT local_path, oss_key FROM media_archive_records WHERE archive_status = 'oss_synced' AND oss_key IS NOT NULL").all()
+      .forEach((r) => { if (r.local_path) ossByPath.set(String(r.local_path).replace(/^\/+/, ''), CDN_BASE + r.oss_key); });
+  } catch (_) {}
+  return configured
+    .slice(0, pageSize)
+    .map((localPath, index) => ({
+      // 固定 key 使前端在同一份资源清单内稳定切换；不关联用户或作品记录。
+      id: `global-default-${index + 1}`,
+      drama_id: null,
+      status: 'completed',
+      local_path: localPath,
+      video_url: `/static/${localPath}`,
+      oss_url: ossByPath.get(localPath) || null,
+      created_at: null,
+      updated_at: null,
+    }));
+}
+
+function withTaskProgress(db, row) {
+  if (!row?.task_id) return row;
+  const task = db.prepare('SELECT progress, message, updated_at FROM async_tasks WHERE id=? AND deleted_at IS NULL').get(row.task_id);
+  return task ? { ...row, task_progress: task.progress, task_message: task.message, task_updated_at: task.updated_at } : row;
+}
+
+function rowToItem(r) {
+  return {
+    id: r.id,
+    storyboard_id: r.storyboard_id,
+    drama_id: r.drama_id,
+    provider: r.provider,
+    prompt: r.prompt,
+    model: r.model,
+    duration: r.duration,
+    aspect_ratio: r.aspect_ratio,
+    resolution: r.resolution || null,
+    requested_resolution: r.resolution || null,
+    image_gen_id: r.image_gen_id,
+    image_url: r.image_url,
+    video_url: publicVideoUrl(r.video_url, r.local_path),
+    local_path: r.local_path,
+    source_local_path: r.source_local_path || null,
+    upscale_resolution: r.upscale_resolution || null,
+    upscale_status: r.upscale_status || null,
+    upscale_job_id: r.upscale_job_id || null,
+    upscale_local_path: r.upscale_local_path || null,
+    interpolation_status: r.interpolation_status || null,
+    interpolation_job_id: r.interpolation_job_id || null,
+    target_fps: r.target_fps || null,
+    output_width: r.output_width || null,
+    output_height: r.output_height || null,
+    output_resolution: r.output_resolution || null,
+    output_fps: r.output_fps || null,
+    output_duration_ms: r.output_duration_ms || null,
+    postprocess_chain: `${require('./videoPostprocessPolicy').describe({
+      resolution: r.resolution || null,
+      upscale_resolution: r.upscale_resolution || null,
+      target_fps: r.target_fps || null,
+    })} → 本地规范 ${r.aspect_ratio || '原画幅'}`,
+    poster_local_path: r.poster_local_path || null,
+    status: r.status,
+    task_id: r.task_id,
+    task_progress: r.task_progress == null ? null : Number(r.task_progress),
+    task_message: r.task_message || null,
+    task_updated_at: r.task_updated_at || null,
+    error_msg: r.error_msg,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    completed_at: r.completed_at,
+  };
+}
+
+function getById(db, id) {
+  const r = db.prepare('SELECT * FROM video_generations WHERE id = ? AND deleted_at IS NULL').get(Number(id));
+  return r ? rowToItem(withTaskProgress(db, r)) : null;
+}
+
+// A copy may reuse only a completed, locally readable final artifact. Never
+// expose a signed provider URL or a generation that has been soft-deleted.
+function playbackGeneration(db, id, storageRoot = null) {
+  if (!Number.isSafeInteger(Number(id)) || Number(id) <= 0) return null;
+  let row;
+  try { row = db.prepare(`SELECT id, status, local_path, poster_local_path FROM video_generations
+    WHERE id=? AND deleted_at IS NULL AND status='completed' AND local_path IS NOT NULL`).get(Number(id)); }
+  catch (error) { if (/no such (?:table|column)/i.test(error.message)) return null; throw error; }
+  if (!row?.local_path || !publicVideoUrl(null, row.local_path)) return null;
+  try {
+    const { normalizeStorageKey, resolveStorageFile } = require('../utils/storagePath');
+    if (normalizeStorageKey(row.local_path) !== row.local_path) return null;
+    resolveStorageFile(storageRoot || resolveStoragePath(require('../config').loadConfig()), row.local_path);
+  }
+  catch (_) { return null; }
+  return { id: row.id, local_path: row.local_path, video_url: publicVideoUrl(null, row.local_path), poster_local_path: row.poster_local_path || null };
+}
+
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const { randomUUID } = require('crypto');
+const videoClient = require('./videoClient');
+const taskService = require('./taskService');
+const storageLayout = require('./storageLayout');
+const { getFfmpegPath, hasLocalFfmpeg } = require('../utils/ffmpegPath');
+
+/** @returns {{ dir: string, relPrefix: string }} 与图片 uploads 一致的工程子目录规则 */
+function resolveVideosDir(storagePath, projectSubdir) {
+  const sub = projectSubdir && String(projectSubdir).trim();
+  if (sub) {
+    const relPrefix = `${sub.replace(/\\/g, '/')}/videos`;
+    return { dir: path.join(storagePath, sub, 'videos'), relPrefix };
+  }
+  return { dir: path.join(storagePath, 'videos'), relPrefix: 'videos' };
+}
+
+/**
+ * 将远程 video_url 下载到本地
+ * @returns {string|null} 相对 storage 根的路径，如 projects/.../videos/vg_1_xxx.mp4；无工程时为 videos/...
+ */
+async function downloadVideoToLocal(storagePath, videoUrl, videoGenId, log, projectSubdir = null) {
+  if (!videoUrl || typeof videoUrl !== 'string') return null;
+  const { dir, relPrefix } = resolveVideosDir(storagePath, projectSubdir);
+  try {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const ext = (videoUrl.split('?')[0].match(/\.(mp4|webm|mov)$/i) || [])[1] || 'mp4';
+    const name = `vg_${videoGenId}_${randomUUID().slice(0, 8)}.${ext}`;
+    const filePath = path.join(dir, name);
+    const res = await fetch(videoUrl, { method: 'GET' });
+    if (!res.ok) {
+      log.warn('Download video failed', { status: res.status, videoGenId });
+      return null;
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (!buf.length) {
+      log.warn('Download video returned an empty body', { videoGenId });
+      return null;
+    }
+    fs.writeFileSync(filePath, buf);
+    const relativePath = `${relPrefix}/${name}`.replace(/\\/g, '/');
+    log.info('Video saved to local', { videoGenId, local_path: relativePath, projectSubdir: projectSubdir || '(root)' });
+    return relativePath;
+  } catch (e) {
+    log.warn('Download video error', { videoGenId, error: e.message });
+    return null;
+  }
+}
+
+function markVideoArchivePending(db, log, videoGenId, error) {
+  const at = new Date().toISOString();
+  const message = String(error?.message || 'OSS 归档待重试').slice(0, 500);
+  try {
+    db.prepare('UPDATE video_generations SET archive_status = ?, archive_error = ?, archive_attempts = COALESCE(archive_attempts, 0) + 1, updated_at = ? WHERE id = ?')
+      .run('pending', message, at, videoGenId);
+  } catch (_) {}
+  log.warn('Video OSS archive pending retry; local delivery remains available', { id: videoGenId, error: message });
+}
+
+async function archiveCompletedVideo(db, log, videoGenId, cfg = null) {
+  const row = db.prepare('SELECT id, local_path, status FROM video_generations WHERE id = ? AND deleted_at IS NULL').get(Number(videoGenId));
+  if (!row?.local_path || row.status !== 'completed') return { skipped: 'not_completed_local_video' };
+  cfg = cfg || require('../config').loadConfig();
+  const storage = require('./mediaStorageService');
+  if (!storage.isOss(cfg)) {
+    try { db.prepare('UPDATE video_generations SET archive_status = ?, archive_error = NULL, archived_at = ? WHERE id = ?').run('local', new Date().toISOString(), row.id); } catch (_) {}
+    return { provider: 'local' };
+  }
+  try {
+    const saved = await storage.mirrorAndTrack(db, cfg, resolveStoragePath(cfg), row.local_path, 'video_generation', row.id, log);
+    const at = new Date().toISOString();
+    try { db.prepare('UPDATE video_generations SET archive_status = ?, archive_error = NULL, archive_attempts = COALESCE(archive_attempts, 0) + 1, archived_at = ?, updated_at = ? WHERE id = ?').run('oss_synced', at, at, row.id); } catch (_) {}
+    return saved;
+  } catch (error) {
+    markVideoArchivePending(db, log, row.id, error);
+    return { provider: 'oss', pending: true, error: error.message };
+  }
+}
+
+/** Resolve an exact aspect canvas from the requested short-edge tier. This
+ * preserves 16:9/9:16/etc. without the former unconditional 2K enlargement. */
+function targetVideoPixelsForAspect(aspectRatio, resolution, sourceProbe = null) {
+  const normalized = videoClient.normalizeAspectRatioForApi(aspectRatio) || '16:9';
+  const match = normalized.match(/^(\d+)\s*:\s*(\d+)$/);
+  const a = Number(match?.[1] || 16);
+  const b = Number(match?.[2] || 9);
+  const requested = String(resolution || '').toLowerCase();
+  const shortEdge = requested.includes('1080') ? 1080
+    : requested.includes('720') ? 720
+      : requested.includes('480') ? 480
+        : Math.max(2, Math.round(Math.min(Number(sourceProbe?.width || 720), Number(sourceProbe?.height || 720)) / 2) * 2);
+  const even = (value) => Math.max(2, Math.round(Number(value) / 2) * 2);
+  if (a >= b) return { w: even(shortEdge * a / b), h: even(shortEdge), aspect_ratio: normalized, short_edge: shortEdge };
+  return { w: even(shortEdge), h: even(shortEdge * b / a), aspect_ratio: normalized, short_edge: shortEdge };
+}
+
+/**
+ * 用 ffmpeg 将视频缩放并加黑边到固定分辨率，避免 Grok 等返回实际像素不一致导致连播时画面跳动。
+ */
+function normalizeVideoFileToTargetPixels(absPath, tw, th, log, videoGenId) {
+  if (!absPath || !tw || !th || !fs.existsSync(absPath)) return false;
+  if (!hasLocalFfmpeg()) {
+    log.info('[视频] 未找到 ffmpeg，跳过画幅归一化', { videoGenId });
+    return false;
+  }
+  const ffmpeg = getFfmpegPath();
+  const vf = `scale=${tw}:${th}:force_original_aspect_ratio=decrease,pad=${tw}:${th}:(ow-iw)/2:(oh-ih)/2:black`;
+  const tmpOut = absPath + '.norm-' + randomUUID().slice(0, 8) + (path.extname(absPath) || '.mp4');
+  const baseArgs = ['-y', '-i', absPath, '-vf', vf, '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p', '-movflags', '+faststart'];
+  let r = spawnSync(ffmpeg, [...baseArgs, '-c:a', 'copy', tmpOut], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  if (r.status !== 0) {
+    r = spawnSync(ffmpeg, [...baseArgs, '-an', tmpOut], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  }
+  if (r.status !== 0) {
+    log.warn('[视频] 画幅归一化失败（保留原文件）', {
+      videoGenId,
+      stderr: (r.stderr || '').slice(-500),
+    });
+    try {
+      fs.unlinkSync(tmpOut);
+    } catch (_) {}
+    return false;
+  }
+  try {
+    fs.unlinkSync(absPath);
+    fs.renameSync(tmpOut, absPath);
+    log.info('[视频] 已统一画幅尺寸', { videoGenId, w: tw, h: th });
+    return true;
+  } catch (e) {
+    log.warn('[视频] 替换归一化文件失败', { videoGenId, error: e.message });
+    try {
+      fs.unlinkSync(tmpOut);
+    } catch (_) {}
+    return false;
+  }
+}
+
+function maybeNormalizeVideoAfterDownload(storagePath, localPath, row, videoGenId, log) {
+  // Preserve the supplier's original pixels. Aspect ratio is a composition
+  // contract, not permission to upscale a 480p/720p result to a fixed 2K
+  // canvas. Explicit, separately billed enhancement must create a new file.
+  return false;
+}
+
+function normalizeFinalVideoToContract(storagePath, localPath, row, videoGenId, log) {
+  const probe = require('./videoMediaProbeService').probeVideoMedia(path.join(storagePath, localPath));
+  const target = targetVideoPixelsForAspect(row.aspect_ratio, row.upscale_resolution || row.resolution, probe);
+  if (probe.width === target.w && probe.height === target.h) return { local_path: localPath, probe, target, normalized: false };
+  const sourceRatio = probe.width / probe.height;
+  const targetRatio = target.w / target.h;
+  if (Math.abs(sourceRatio / targetRatio - 1) > 0.08) {
+    throw new Error(`供应商成片画幅 ${probe.width}x${probe.height} 与请求 ${target.aspect_ratio} 偏差超过 8%，拒绝大幅裁切`);
+  }
+  if (!hasLocalFfmpeg()) throw new Error(`最终成片 ${probe.width}x${probe.height} 未满足 ${target.aspect_ratio} / ${target.w}x${target.h}，且本机缺少 ffmpeg`);
+  const source = path.join(storagePath, localPath);
+  // With no paid post-process stage, normalize in place so the original
+  // output remains the single retained artifact. Paid stages retain their
+  // output until the new final canvas has passed validation.
+  const replaceInput = !row.upscale_resolution && !row.target_fps;
+  const relative = replaceInput
+    ? localPath
+    : path.join(path.dirname(localPath), `vg_${videoGenId}_final_${target.w}x${target.h}.mp4`).replace(/\\/g, '/');
+  const output = path.join(storagePath, relative);
+  const tempOutput = replaceInput
+    ? output + `.norm-${randomUUID().slice(0, 8)}${path.extname(output) || '.mp4'}`
+    : output;
+  fs.mkdirSync(path.dirname(output), { recursive: true });
+  const filter = `scale=${target.w}:${target.h}:force_original_aspect_ratio=increase,crop=${target.w}:${target.h}`;
+  const base = ['-y', '-i', source, '-vf', filter, '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p', '-movflags', '+faststart'];
+  let result = spawnSync(getFfmpegPath(), [...base, '-c:a', 'copy', tempOutput], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  if (result.status !== 0) result = spawnSync(getFfmpegPath(), [...base, '-c:a', 'aac', '-b:a', '192k', tempOutput], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  if (result.status !== 0 || !fs.existsSync(tempOutput) || fs.statSync(tempOutput).size === 0) {
+    try { fs.unlinkSync(tempOutput); } catch (_) {}
+    throw new Error(`最终成片画幅规范化失败：${String(result.stderr || '').slice(-300)}`);
+  }
+  const finalProbe = require('./videoMediaProbeService').probeVideoMedia(tempOutput);
+  const durationTolerance = Math.max(250, probe.duration_ms * 0.02);
+  if (finalProbe.width !== target.w || finalProbe.height !== target.h
+    || Math.abs(finalProbe.fps - probe.fps) > 1
+    || Math.abs(finalProbe.duration_ms - probe.duration_ms) > durationTolerance) {
+    try { fs.unlinkSync(tempOutput); } catch (_) {}
+    throw new Error(`最终成片规范验收失败：期望 ${target.w}x${target.h}/${probe.fps}fps，实际 ${finalProbe.width}x${finalProbe.height}/${finalProbe.fps}fps`);
+  }
+  if (replaceInput) {
+    try { fs.renameSync(tempOutput, output); } catch (error) {
+      try { fs.unlinkSync(tempOutput); } catch (_) {}
+      throw new Error(`最终成片规范化替换失败：${error.message}`);
+    }
+  }
+  log.info('Final video normalized to requested aspect contract', { video_generation_id: videoGenId, from: `${probe.width}x${probe.height}`, to: `${target.w}x${target.h}`, aspect_ratio: target.aspect_ratio });
+  return { local_path: relative, probe: finalProbe, target, normalized: true };
+}
+
+/**
+ * New generations opt in to keeping exactly one video artifact. This function
+ * only runs after final validation and the completed row are durable; legacy
+ * rows keep their historical source paths and bytes unchanged.
+ */
+function pruneSupersededVideoArtifacts(db, storagePath, videoGenId, finalLocalPath, log) {
+  const row = db.prepare('SELECT source_local_path, upscale_local_path, intermediate_cleanup_enabled FROM video_generations WHERE id=?').get(Number(videoGenId));
+  if (!row || Number(row.intermediate_cleanup_enabled) !== 1) return { skipped: 'legacy_or_disabled' };
+  const root = path.resolve(storagePath);
+  const finalKey = String(finalLocalPath || '').replace(/\\/g, '/');
+  const candidates = [...new Set([row.source_local_path, row.upscale_local_path].filter(Boolean).map((item) => String(item).replace(/\\/g, '/')))]
+    .filter((item) => item !== finalKey);
+  const removed = [];
+  for (const relative of candidates) {
+    const absolute = path.resolve(root, relative);
+    if (!absolute.startsWith(root + path.sep)) {
+      log.warn('Refused to remove video artifact outside storage root', { video_generation_id: videoGenId, local_path: relative });
+      continue;
+    }
+    try {
+      if (fs.existsSync(absolute)) fs.unlinkSync(absolute);
+      removed.push(relative);
+    } catch (error) {
+      log.warn('Could not remove superseded local video artifact', { video_generation_id: videoGenId, local_path: relative, error: error.message });
+    }
+  }
+  if (removed.length) {
+    const sourceRemoved = row.source_local_path && removed.includes(String(row.source_local_path).replace(/\\/g, '/'));
+    const upscaleRemoved = row.upscale_local_path && removed.includes(String(row.upscale_local_path).replace(/\\/g, '/'));
+    db.prepare('UPDATE video_generations SET source_local_path=?, upscale_local_path=?, updated_at=? WHERE id=?').run(
+      sourceRemoved ? null : row.source_local_path,
+      upscaleRemoved ? null : row.upscale_local_path,
+      new Date().toISOString(), Number(videoGenId));
+  }
+  return { removed };
+}
+
+function createVideoPoster(storagePath, localPath, videoGenId, log) {
+  if (!localPath || !hasLocalFfmpeg()) return null;
+  try {
+    const source = path.join(storagePath, localPath);
+    const relativeDir = path.join(path.dirname(localPath), 'posters');
+    const outputDir = path.join(storagePath, relativeDir);
+    fs.mkdirSync(outputDir, { recursive: true });
+    const fileName = `vg_${videoGenId}.jpg`;
+    const output = path.join(outputDir, fileName);
+    const result = spawnSync(getFfmpegPath(), ['-y', '-ss', '0.12', '-i', source, '-frames:v', '1', '-vf', 'thumbnail,scale=640:-2', '-q:v', '3', output], { encoding: 'utf8', maxBuffer: 1024 * 1024 });
+    if (result.status === 0 && fs.existsSync(output)) return path.join(relativeDir, fileName).replace(/\\/g, '/');
+    log.warn('视频海报提取失败', { video_gen_id: videoGenId, status: result.status });
+  } catch (error) { log.warn('视频海报提取失败', { video_gen_id: videoGenId, error: error.message }); }
+  return null;
+}
+
+/** 防止同一 videoGenId 重复发起 poll（含重启恢复） */
+const activeVideoPolls = new Set();
+/** 防止对账/重启恢复同时进入同一后处理链。 */
+const activePostprocessResumes = new Set();
+const activeReconciliationResumes = new Set();
+
+const FINALIZABLE_VIDEO_STATUSES = new Set([
+  'processing',
+  'upscale_pending',
+  'upscaling',
+  'interpolation_pending',
+  'interpolating',
+  'persisting',
+]);
+
+function canFinalizeVideoGeneration(db, videoGenId) {
+  const row = db.prepare('SELECT status FROM video_generations WHERE id=? AND deleted_at IS NULL').get(Number(videoGenId));
+  return !!row && FINALIZABLE_VIDEO_STATUSES.has(String(row.status || ''));
+}
+
+function resolveStoragePath(cfg) {
+  return path.isAbsolute(cfg.storage?.local_path)
+    ? cfg.storage.local_path
+    : path.join(process.cwd(), cfg.storage?.local_path || './data/storage');
+}
+
+function settleGenerationBeforePostProcess(db, log, row, videoGenId, providerUsage, providerRequestId) {
+  if (!row?.owner_user_id || !row?.billing_authorization_id) return;
+  try {
+    const billing = require('./billingService');
+    const auth = billing.getAuthorization(db, row.billing_authorization_id);
+    const usage = require('./billingUsageService').textUsage(providerUsage);
+    if (require('./billingUsageService').hasTokenMeter(auth?.snapshot) && !usage) {
+      billing.markPendingReconciliation(db, { id: row.owner_user_id, role: 'admin' }, row.billing_authorization_id, {
+        provider_request_id: providerRequestId || `video-generation:${videoGenId}`,
+        reason: '视频供应商成功响应但未返回实际 token 用量',
+      });
+    } else {
+      billing.settleAuthorization(db, { id: row.owner_user_id, role: 'admin' }, row.billing_authorization_id, {
+        usage: usage || auth?.snapshot?.usage, provider_request_id: providerRequestId || `video-generation:${videoGenId}`,
+      });
+    }
+  } catch (error) {
+    log.error('[billing] generation settlement before interpolation failed', { video_gen_id: videoGenId, error: error.message });
+  }
+}
+
+async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, videoUrl, logLabel, providerUsage = null, providerRequestId = null, providerResponseSnapshot = null) {
+  const now = new Date().toISOString();
+  if (!canFinalizeVideoGeneration(db, videoGenId)) {
+    log.info('Skip video finalization after local terminal state', { video_gen_id: videoGenId, log_label: logLabel });
+    return;
+  }
+  if (row?.task_id) taskService.updateTaskStatus(db, row.task_id, 'processing', 70, '视频已生成，正在下载并保存原片');
+  let localPath = null;
+  let storagePath = null;
+  try {
+    const cfg = require('../config').loadConfig();
+    storagePath = resolveStoragePath(cfg);
+    const projectSubdir = storageLayout.getProjectStorageSubdir(db, row.drama_id);
+    const localStaticPath = String(videoUrl || '').startsWith('/static/')
+      ? decodeURIComponent(String(videoUrl).slice('/static/'.length).split(/[?#]/)[0]).replace(/^\/+/, '')
+      : null;
+    if (localStaticPath && fs.existsSync(path.join(storagePath, localStaticPath))) localPath = localStaticPath;
+    else localPath = await downloadVideoToLocal(storagePath, videoUrl, videoGenId, log, projectSubdir);
+    maybeNormalizeVideoAfterDownload(storagePath, localPath, rowForAspect, videoGenId, log);
+    try {
+      const sourceProbe = require('./videoMediaProbeService').probeVideoMedia(path.join(storagePath, localPath));
+      require('./costLedgerService').forAuthorization(db, row.billing_authorization_id, {
+        status: 'completed', usage: { millisecond: sourceProbe.duration_ms, ...(require('./costLedgerService').normalizeUsage(providerUsage) || {}) },
+        provider_request_id: providerRequestId, evidence_kind: 'provider_usage_and_local_source_media',
+      });
+    } catch (error) { log.warn('Cost source duration unavailable', { video_gen_id: videoGenId, error: error.message }); }
+
+    // 全能工作台选择“成片后混音”时，生成完成后创建新成片，不覆盖原供应商结果。
+    const postMix = db.prepare(`SELECT a.snapshot_json, j.request_snapshot_json FROM omni_video_jobs j
+      JOIN omni_video_job_assets a ON a.omni_job_id = j.id
+      WHERE j.video_generation_id = ? AND j.audio_strategy = 'post_mix' AND a.media_type = 'audio'
+      ORDER BY a.ordinal LIMIT 1`).get(Number(videoGenId));
+    if (postMix?.snapshot_json && localPath) {
+      const audio = JSON.parse(postMix.snapshot_json);
+      if (audio.local_path) {
+        const processor = require('./omniMediaProcessService');
+        const requestSnapshot = JSON.parse(postMix.request_snapshot_json || '{}');
+        localPath = processor.mixAudio(localPath, audio.local_path, log, requestSnapshot.post_process || {});
+        const baseUrl = cfg.storage?.base_url ? String(cfg.storage.base_url).replace(/\/$/, '') : '';
+        videoUrl = baseUrl ? `${baseUrl}/${localPath}` : `/static/${localPath}`;
+      }
+    }
+  } catch (error) {
+    log.warn('全能视频本地归档/后期处理失败', { video_gen_id: videoGenId, error: error.message });
+    // No local bytes exist, so this is a genuine generation-delivery failure.
+    setVideoGenFailed(db, videoGenId, '视频下载或本地处理失败：' + error.message, new Date().toISOString());
+    if (row?.task_id) taskService.updateTaskError(db, row.task_id, '视频下载或本地处理失败');
+    return;
+  }
+  if (!localPath) {
+    setVideoGenFailed(db, videoGenId, '视频下载失败，供应商临时地址未能归档到本地', new Date().toISOString());
+    if (row?.task_id) taskService.updateTaskError(db, row.task_id, '视频下载失败');
+    return;
+  }
+  // Generation and interpolation are independent billable supplier calls.
+  // Settle the first call once its bytes exist even if post-processing fails.
+  settleGenerationBeforePostProcess(db, log, row, videoGenId, providerUsage, providerRequestId);
+  // Persist the supplier output before any optional post-processing. Each
+  // selected stage owns its own authorization and creates a new local file.
+  try {
+    const sourceSavedAt = new Date().toISOString();
+    const sourceSaved = db.prepare(`UPDATE video_generations SET source_local_path=?, upscale_status=?, interpolation_status=?,
+      updated_at=?
+      WHERE id=? AND status IN (${Array.from(FINALIZABLE_VIDEO_STATUSES).map(() => '?').join(',')})`)
+      .run(localPath,
+        row.upscale_resolution ? (row.upscale_status === 'completed' ? 'completed' : 'awaiting_source') : 'skipped',
+        row.target_fps ? (['completed', 'skipped'].includes(row.interpolation_status) ? row.interpolation_status : 'awaiting_source') : 'skipped',
+        sourceSavedAt, videoGenId, ...Array.from(FINALIZABLE_VIDEO_STATUSES));
+    if (!sourceSaved.changes) {
+      log.info('Skip source persistence after local terminal state', { video_gen_id: videoGenId, log_label: logLabel });
+      return;
+    }
+
+    if (row.upscale_resolution) {
+      const pending = db.prepare(`UPDATE video_generations SET status='upscale_pending', upscale_status='pending', updated_at=?
+        WHERE id=? AND status IN (${Array.from(FINALIZABLE_VIDEO_STATUSES).map(() => '?').join(',')})`)
+        .run(new Date().toISOString(), videoGenId, ...Array.from(FINALIZABLE_VIDEO_STATUSES));
+      if (!pending.changes) return;
+      if (row.task_id) taskService.updateTaskStatus(db, row.task_id, 'processing', 78, `视频已生成，正在 AI 超分至 ${row.upscale_resolution}`);
+      const upscaled = await require('./videoUpscaleService').process(db, log, videoGenId, storagePath);
+      if (!upscaled?.local_path) {
+        const current = db.prepare('SELECT status, error_msg FROM video_generations WHERE id=?').get(videoGenId);
+        if (current?.status === 'billing_reconciliation') {
+          if (row.task_id) taskService.updateTaskStatus(db, row.task_id, 'processing', 99, '超分已完成，等待计费对账');
+          return;
+        }
+        // videoUpscaleService has already written the authoritative stage
+        // failure (for example, MediaKit upload HTTP 500).  Do not overwrite
+        // it with a generic message here, otherwise users cannot tell whether
+        // the original generation or the enhancement stage failed.
+        const message = current?.error_msg || 'AI 超分失败，原始视频已保留，可仅重试超分';
+        if (current?.status !== 'failed') setVideoGenFailed(db, videoGenId, message, new Date().toISOString());
+        if (row.task_id) taskService.updateTaskError(db, row.task_id, message);
+        return;
+      }
+      localPath = upscaled.local_path;
+      providerResponseSnapshot = {
+        ...(providerResponseSnapshot || {}),
+        upscale: { request_id: upscaled.provider_request_id, duration_ms: upscaled.duration_ms, resolution: upscaled.resolution, fps: upscaled.fps },
+      };
+    }
+
+    if (row.target_fps) {
+      const pending = db.prepare(`UPDATE video_generations SET status='interpolation_pending', interpolation_status='pending', updated_at=?
+        WHERE id=? AND status IN (${Array.from(FINALIZABLE_VIDEO_STATUSES).map(() => '?').join(',')})`)
+        .run(new Date().toISOString(), videoGenId, ...Array.from(FINALIZABLE_VIDEO_STATUSES));
+      if (!pending.changes) return;
+      if (row.task_id) taskService.updateTaskStatus(db, row.task_id, 'processing', 88, `${row.upscale_resolution ? '超分完成，' : ''}正在进行 ${Number(row.target_fps)}fps 智能插帧`);
+      const interpolated = await require('./videoInterpolationService').process(db, log, videoGenId, storagePath);
+      if (!interpolated?.local_path) {
+        const current = db.prepare('SELECT status, error_msg FROM video_generations WHERE id=?').get(videoGenId);
+        if (current?.status === 'billing_reconciliation') {
+          if (row.task_id) taskService.updateTaskStatus(db, row.task_id, 'processing', 99, '插帧已完成，等待计费对账');
+          return;
+        }
+        const message = current?.error_msg || '智能插帧失败，已保留上一阶段视频，可仅重试插帧';
+        if (current?.status !== 'failed') setVideoGenFailed(db, videoGenId, message, new Date().toISOString());
+        if (row.task_id) taskService.updateTaskError(db, row.task_id, message);
+        return;
+      }
+      localPath = interpolated.local_path;
+      providerResponseSnapshot = {
+        ...(providerResponseSnapshot || {}),
+        interpolation: interpolated.skipped
+          ? { skipped: true, duration_ms: interpolated.duration_ms, resolution: interpolated.resolution, fps: interpolated.fps }
+          : { request_id: interpolated.provider_request_id, duration_ms: interpolated.duration_ms, resolution: interpolated.resolution, fps: interpolated.fps },
+      };
+    }
+  } catch (error) {
+    setVideoGenFailed(db, videoGenId, '视频后处理失败：' + error.message, new Date().toISOString());
+    if (row.task_id) taskService.updateTaskError(db, row.task_id, '视频后处理失败');
+    return;
+  }
+  // Never persist a provider's signed delivery URL as the application's
+  // completed-media URL. TOS links normally expire after 24 hours.
+  const persisting = db.prepare(`UPDATE video_generations SET status='persisting', updated_at=?
+    WHERE id=? AND status IN (${Array.from(FINALIZABLE_VIDEO_STATUSES).map(() => '?').join(',')})`)
+    .run(new Date().toISOString(), videoGenId, ...Array.from(FINALIZABLE_VIDEO_STATUSES));
+  if (!persisting.changes) {
+    log.info('Skip video persistence after local terminal state', { video_gen_id: videoGenId, log_label: logLabel });
+    return;
+  }
+  if (row.task_id) taskService.updateTaskStatus(db, row.task_id, 'processing', 95, '正在规范画幅并持久化最终成片');
+  let finalProbe;
+  try {
+    const normalized = normalizeFinalVideoToContract(storagePath, localPath, rowForAspect || row, videoGenId, log);
+    localPath = normalized.local_path;
+    finalProbe = normalized.probe;
+  } catch (error) {
+    setVideoGenFailed(db, videoGenId, '最终成片画幅规范化失败：' + error.message, new Date().toISOString());
+    if (row.task_id) taskService.updateTaskError(db, row.task_id, '最终成片画幅规范化失败');
+    return;
+  }
+  videoUrl = `/static/${String(localPath).replace(/^\/+/, '')}`;
+  const posterLocalPath = createVideoPoster(resolveStoragePath(require('../config').loadConfig()), localPath, videoGenId, log);
+  const completedAt = new Date().toISOString();
+  const archiveStatus = require('./mediaStorageService').isOss(require('../config').loadConfig()) ? 'pending' : 'local';
+  try {
+    const completed = db.prepare(
+      `UPDATE video_generations SET status = ?, video_url = ?, local_path = ?, output_width=?, output_height=?, output_resolution=?, output_fps=?, output_duration_ms=?, archive_status = ?, archive_error = NULL, completed_at = ?, updated_at = ?
+       WHERE id = ? AND status IN (${Array.from(FINALIZABLE_VIDEO_STATUSES).map(() => '?').join(',')})`
+    ).run('completed', videoUrl, localPath, finalProbe.width, finalProbe.height, finalProbe.resolution, finalProbe.fps, finalProbe.duration_ms, archiveStatus, completedAt, completedAt, videoGenId, ...Array.from(FINALIZABLE_VIDEO_STATUSES));
+    if (!completed.changes) {
+      log.info('Skip completed video write after local terminal state', { video_gen_id: videoGenId, log_label: logLabel });
+      return;
+    }
+  } catch (e) {
+    if ((e.message || '').includes('archive_')) {
+      try {
+        const completed = db.prepare(
+          `UPDATE video_generations SET status = ?, video_url = ?, local_path = ?, completed_at = ?, updated_at = ?
+           WHERE id = ? AND status IN (${Array.from(FINALIZABLE_VIDEO_STATUSES).map(() => '?').join(',')})`
+        ).run('completed', videoUrl, localPath, completedAt, completedAt, videoGenId, ...Array.from(FINALIZABLE_VIDEO_STATUSES));
+        if (!completed.changes) return;
+      } catch (_) {
+        const completed = db.prepare(
+          `UPDATE video_generations SET status = ?, video_url = ?, local_path = ?, updated_at = ?
+           WHERE id = ? AND status IN (${Array.from(FINALIZABLE_VIDEO_STATUSES).map(() => '?').join(',')})`
+        ).run('completed', videoUrl, localPath, completedAt, videoGenId, ...Array.from(FINALIZABLE_VIDEO_STATUSES));
+        if (!completed.changes) return;
+      }
+    } else if ((e.message || '').includes('completed_at')) {
+      const completed = db.prepare(
+        `UPDATE video_generations SET status = ?, video_url = ?, local_path = ?, updated_at = ?
+         WHERE id = ? AND status IN (${Array.from(FINALIZABLE_VIDEO_STATUSES).map(() => '?').join(',')})`
+      ).run('completed', videoUrl, localPath, completedAt, videoGenId, ...Array.from(FINALIZABLE_VIDEO_STATUSES));
+      if (!completed.changes) return;
+    } else throw e;
+  }
+  if (posterLocalPath) {
+    try { db.prepare('UPDATE video_generations SET poster_local_path=? WHERE id=?').run(posterLocalPath, videoGenId); } catch (_) {}
+  }
+  if (providerResponseSnapshot) {
+    try { db.prepare('UPDATE video_generations SET provider_response_snapshot_json = ? WHERE id = ?').run(JSON.stringify(providerResponseSnapshot), videoGenId); }
+    catch (error) { log.warn('[billing] could not persist sanitized provider completion response', { video_gen_id: videoGenId, error: error.message }); }
+  }
+  // Only rows created after migration 55 opt in. Historical online records
+  // retain both their database pointers and their local files.
+  try { pruneSupersededVideoArtifacts(db, storagePath, videoGenId, localPath, log); }
+  catch (error) { log.warn('Superseded video artifact cleanup failed', { video_generation_id: videoGenId, error: error.message }); }
+  try {
+    if (row?.owner_user_id && row?.billing_authorization_id) {
+      const billing = require('./billingService');
+      const auth = billing.getAuthorization(db, row.billing_authorization_id);
+      const usage = require('./billingUsageService').textUsage(providerUsage);
+      if (require('./billingUsageService').hasTokenMeter(auth?.snapshot) && !usage) {
+        billing.markPendingReconciliation(db, { id: row.owner_user_id, role: 'admin' }, row.billing_authorization_id, {
+          provider_request_id: providerRequestId || `video-generation:${videoGenId}`,
+          reason: '视频供应商成功响应但未返回实际 token 用量',
+        });
+      } else {
+        billing.settleAuthorization(db, { id: row.owner_user_id, role: 'admin' }, row.billing_authorization_id, {
+          usage: usage || auth?.snapshot?.usage, provider_request_id: providerRequestId || `video-generation:${videoGenId}`,
+        });
+      }
+    }
+  } catch (err) {
+    log.error('[billing] video settlement failed', { video_gen_id: videoGenId, error: err.message });
+    // Preserve observed provider usage for an administrator when a historical
+    // price snapshot cannot settle it (for example, a meter migration).
+    try {
+      if (row?.owner_user_id && row?.billing_authorization_id) {
+        const observedUsage = require('./billingUsageService').textUsage(providerUsage);
+        require('./billingService').markPendingReconciliation(db, { id: row.owner_user_id, role: 'admin' }, row.billing_authorization_id, {
+          provider_request_id: providerRequestId || `video-generation:${videoGenId}`,
+          observed_usage: observedUsage || undefined,
+          reason: `视频结算失败，等待管理员核对供应商用量：${String(err.message || 'unknown error').slice(0, 180)}`,
+        });
+      }
+    } catch (reconciliationError) {
+      log.error('[billing] video settlement reconciliation failed', { video_gen_id: videoGenId, error: reconciliationError.message });
+    }
+  }
+  if (row.storyboard_id) {
+    try {
+      db.prepare(`UPDATE storyboards SET active_video_generation_id=COALESCE(active_video_generation_id, ?), video_url=?, local_path=?,
+        status='completed', error_msg=NULL, updated_at=?
+        WHERE id=? AND deleted_at IS NULL AND (active_video_generation_id IS NULL OR active_video_generation_id=?)`).run(
+        videoGenId, videoUrl, localPath, now, row.storyboard_id, videoGenId
+      );
+      log.info('Updated storyboard video' + (logLabel ? ` (${logLabel})` : ''), {
+        storyboard_id: row.storyboard_id,
+        video_url: videoUrl,
+      });
+    } catch (_) {}
+  }
+  if (row.task_id) {
+    taskService.updateTaskResult(db, row.task_id, {
+      video_generation_id: videoGenId,
+      video_url: videoUrl,
+      poster_local_path: posterLocalPath,
+      status: 'completed',
+    }, '视频生成完成');
+  }
+  // OSS is a durability concern, not a user-visible generation-success gate.
+  // Failure here leaves the completed local asset playable and schedules retry.
+  await archiveCompletedVideo(db, log, videoGenId);
+  log.info('Video generation completed' + (logLabel ? ` (${logLabel})` : ''), {
+    id: videoGenId,
+    video_url: videoUrl,
+    local_path: localPath,
+  });
+}
+
+/**
+ * Keep the bytes of a supplier output that arrived after the local generation
+ * reached a terminal state (typically a cancellation made while the submit
+ * request was still in flight). The supplier ran the job and will bill for it,
+ * so the file is worth keeping and the charge needs an admin decision.
+ *
+ * This path deliberately writes neither a completion state nor a billing
+ * entry: the authorization may already be released, and re-settling it here is
+ * exactly what corrupted the account's frozen total. It only archives the
+ * source file and opens a reconciliation case.
+ */
+async function archiveProviderOutputOnly(db, log, videoGenId, videoUrl, providerRequestId) {
+  const numericId = Number(videoGenId);
+  const row = db.prepare('SELECT * FROM video_generations WHERE id = ? AND deleted_at IS NULL').get(numericId);
+  if (!row) return null;
+  let localPath = null;
+  try {
+    const cfg = require('../config').loadConfig();
+    const storagePath = resolveStoragePath(cfg);
+    const projectSubdir = storageLayout.getProjectStorageSubdir(db, row.drama_id);
+    localPath = await downloadVideoToLocal(storagePath, videoUrl, numericId, log, projectSubdir);
+  } catch (error) {
+    log.error('Archiving cancelled generation output failed', { video_gen_id: numericId, error: error.message });
+  }
+  if (localPath) {
+    // Never replace an existing archived file: a retry may own the current one.
+    db.prepare(`UPDATE video_generations SET source_local_path = ?, updated_at = ?
+      WHERE id = ? AND deleted_at IS NULL AND source_local_path IS NULL`)
+      .run(localPath, new Date().toISOString(), numericId);
+  }
+  if (row.billing_authorization_id) {
+    try {
+      require('./billingService').markPendingReconciliation(db, { id: row.owner_user_id, role: 'admin' }, row.billing_authorization_id, {
+        provider_request_id: providerRequestId || null,
+        reason: '任务在提交在途时被取消，但供应商已建任务并可能计费，按真实用量核对',
+      });
+    } catch (error) {
+      log.warn('Cancelled generation reconciliation case failed', { video_gen_id: numericId, error: error.message });
+    }
+  }
+  log.warn('Archived cancelled generation output for reconciliation', {
+    video_gen_id: numericId, provider_task_id: providerRequestId || null, local_path: localPath,
+  });
+  return localPath;
+}
+
+async function pollProviderTaskAndFinalize(db, log, videoGenId, row, rowForAspect, providerTaskId, config, options = {}) {
+  const cfg = require('../config').loadConfig();
+  const POLL_INTERVAL_MS = 10000;
+  const { resolveVideoGenerationTimeoutMinutes } = require('../config/videoGeneration');
+  const generationTimeoutMinutes = resolveVideoGenerationTimeoutMinutes(cfg);
+  const pollMaxAttempts = Math.max(
+    1,
+    Math.ceil((generationTimeoutMinutes * 60 * 1000) / POLL_INTERVAL_MS)
+  );
+  if (row.task_id) taskService.updateTaskStatus(db, row.task_id, 'processing', 15, '任务已提交模型服务，正在等待生成结果');
+  let lastProgressState = '';
+  let lastProgressWriteAt = 0;
+  const pollResult = await videoClient.pollVideoTask(
+    db,
+    log,
+    videoGenId,
+    providerTaskId,
+    config,
+    pollMaxAttempts,
+    POLL_INTERVAL_MS,
+    ({ status }) => {
+      if (!row.task_id) return;
+      const normalized = String(status || '').toLowerCase();
+      const nowMs = Date.now();
+      if (normalized === lastProgressState && nowMs - lastProgressWriteAt < 60_000) return;
+      lastProgressState = normalized;
+      lastProgressWriteAt = nowMs;
+      const message = /queue|submitted|pending|created/.test(normalized)
+        ? '任务已提交模型服务，正在排队'
+        : /process|running|generat|in_progress/.test(normalized)
+          ? '模型服务正在生成视频'
+          : '模型服务已接收任务，正在等待结果';
+      taskService.updateTaskStatus(db, row.task_id, 'processing', 15, message);
+    },
+    options
+  );
+  if (pollResult.stopped) {
+    log.info('Provider poll stopped after local task reached a terminal state', { video_gen_id: videoGenId, status: pollResult.local_status });
+    return;
+  }
+  // The cancellation request can win while the provider query is in flight.
+  // Re-read the durable state immediately before consuming a successful
+  // response; the final write below is conditional as a second guard.
+  const localAfterPoll = db.prepare('SELECT status FROM video_generations WHERE id=? AND deleted_at IS NULL').get(Number(videoGenId));
+  if (!options.archiveOnly && (!localAfterPoll || !FINALIZABLE_VIDEO_STATUSES.has(String(localAfterPoll.status || '')))) {
+    log.info('Provider poll result ignored after local terminal state', {
+      video_gen_id: videoGenId,
+      local_status: localAfterPoll?.status || null,
+    });
+    return;
+  }
+  const now = new Date().toISOString();
+  const polledVideo = resolveRemoteVideoUrl(pollResult.video_url, pollResult.error);
+  if (options.archiveOnly) {
+    if (polledVideo.ok) await archiveProviderOutputOnly(db, log, videoGenId, polledVideo.video_url, pollResult.provider_request_id || providerTaskId);
+    else log.warn('Cancelled generation produced no archivable output', { video_gen_id: videoGenId, error: polledVideo.error });
+  } else if (polledVideo.ok) {
+    await finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, polledVideo.video_url, 'after poll', pollResult.usage, pollResult.provider_request_id || providerTaskId, pollResult.provider_response_snapshot);
+  } else {
+    setVideoGenFailed(db, videoGenId, polledVideo.error, now);
+    if (row.task_id) taskService.updateTaskError(db, row.task_id, polledVideo.error);
+    log.error('Video generation failed (after poll)', { id: videoGenId, error: polledVideo.error });
+  }
+}
+
+/**
+ * 服务重启后恢复对厂商异步任务的轮询（需已持久化 provider_task_id）
+ */
+async function resumePollForVideoGeneration(db, log, videoGenId) {
+  if (activeVideoPolls.has(videoGenId)) {
+    log.info('Video poll already active, skip resume', { videoGenId });
+    return;
+  }
+  const row = db.prepare('SELECT * FROM video_generations WHERE id = ? AND deleted_at IS NULL').get(Number(videoGenId));
+  if (!row || row.status !== 'processing') return;
+  const providerTaskId = row.provider_task_id && String(row.provider_task_id).trim();
+  if (!providerTaskId) return;
+
+  // 提交时钉住的配置优先：中转站只认建任务的那枚业务 Key，按模型名重解析可能换到另一套
+  // base_url/Key，把在途任务查到错误的供应商上。历史行没有钉住值，行为与改造前完全一致。
+  const pinnedConfigId = Number(row.ai_config_id) || null;
+  const config = pinnedConfigId
+    ? require('./aiConfigService').getConfig(db, pinnedConfigId)
+    : videoClient.getDefaultVideoConfig(db, row.model, { tenant_id: row.tenant_id, scene_defaults: false });
+  if (!config) {
+    if (pinnedConfigId) {
+      // 不能退回默认配置：那等于拿别的 Key 查这个任务。保持 processing、留住宿预授权，
+      // 交给既有对账流程，等管理员恢复该配置后即可继续轮询。
+      db.prepare('UPDATE video_generations SET error_msg = ?, updated_at = ? WHERE id = ?')
+        .run('固定配置已删除，暂停轮询以避免用错业务 Key；恢复该配置后任务会自动继续', new Date().toISOString(), Number(videoGenId));
+      log.warn('Video poll paused: pinned config missing', { videoGenId, ai_config_id: pinnedConfigId });
+      return;
+    }
+    const now = new Date().toISOString();
+    setVideoGenFailed(db, videoGenId, '未配置视频模型', now);
+    if (row.task_id) taskService.updateTaskError(db, row.task_id, '未配置视频模型');
+    return;
+  }
+
+  activeVideoPolls.add(videoGenId);
+  log.info('Resuming video generation poll after restart', {
+    videoGenId,
+    provider_task_id: providerTaskId,
+  });
+  try {
+    let aspectForVideo = row.aspect_ratio;
+    if (aspectForVideo) {
+      const n = videoClient.normalizeAspectRatioForApi(aspectForVideo);
+      if (n) aspectForVideo = n;
+    }
+    const rowForAspect = { ...row, aspect_ratio: aspectForVideo || row.aspect_ratio };
+    await pollProviderTaskAndFinalize(db, log, videoGenId, row, rowForAspect, providerTaskId, config);
+  } catch (err) {
+    const now = new Date().toISOString();
+    setVideoGenFailed(db, videoGenId, err.message, now);
+    if (row.task_id) taskService.updateTaskError(db, row.task_id, err.message);
+    log.error('Video generation resume poll error', { id: videoGenId, error: err.message });
+  } finally {
+    activeVideoPolls.delete(videoGenId);
+  }
+}
+
+/** 启动时恢复 processing 视频任务；无 provider_task_id 的保留为可显式重试。 */
+function resumeProcessingVideoGenerations(db, log) {
+  // No submit request from the previous process can still be in flight, so the
+  // in-flight markers are stale by definition. Clearing them here keeps the
+  // cancel guard from refusing cancels forever after a crash mid-submit.
+  // Legacy and hand-built schemas may lack the column entirely.
+  const markerColumns = new Set(db.prepare('PRAGMA table_info(video_generations)').all().map((c) => c.name));
+  if (markerColumns.has('provider_submit_started_at')) {
+    const clearedSubmits = db.prepare(`UPDATE video_generations SET provider_submit_started_at = NULL
+      WHERE provider_submit_started_at IS NOT NULL`).run().changes;
+    if (clearedSubmits) log.info('Cleared stale provider submit markers', { count: clearedSubmits });
+  }
+  const hasOmniJobs = !!db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'omni_video_jobs'").get();
+  const stuck = db
+    .prepare(
+      `SELECT id, task_id, billing_authorization_id, owner_user_id FROM video_generations
+       WHERE status = 'processing' AND deleted_at IS NULL
+         AND (provider_task_id IS NULL OR TRIM(provider_task_id) = '')`
+    )
+    .all();
+  const stuckMsg = '服务重启前未持久化厂商任务 ID；原请求快照已保留，请在全能创作中显式重试';
+  for (const s of stuck) {
+    const now = new Date().toISOString();
+    const omniJob = hasOmniJobs
+      ? db.prepare('SELECT request_snapshot_json FROM omni_video_jobs WHERE video_generation_id = ? ORDER BY id DESC LIMIT 1').get(s.id)
+      : null;
+    let snapshot = null;
+    try { snapshot = omniJob?.request_snapshot_json ? JSON.parse(omniJob.request_snapshot_json) : null; } catch (_) {}
+    const isEmptyOmniJob = !!omniJob && (!snapshot?.prompt || !Array.isArray(snapshot.assets) || snapshot.assets.length === 0);
+    const message = isEmptyOmniJob ? '历史空任务未实际提交模型，已标记为无效，可从任务历史中清理' : stuckMsg;
+    const status = isEmptyOmniJob ? 'invalid' : 'retryable';
+    db.prepare('UPDATE video_generations SET status = ?, error_msg = ?, updated_at = ? WHERE id = ?').run(status, message, now, s.id);
+    if (s.task_id) taskService.updateTaskError(db, s.task_id, message);
+    // 原请求未提交模型, 释放旧预授权; 否则用户显式重试会走全新冻结, 双重占用额度
+    try {
+      if (s.billing_authorization_id) require('./billingService').voidAuthorization(db, { id: s.owner_user_id, role: 'admin' }, s.billing_authorization_id, '服务重启标记可重试, 释放未提交模型的旧预授权');
+    } catch (voidError) { log.warn('void stale authorization on restart-retryable failed', { videoGenId: s.id, error: voidError.message }); }
+    log.warn(isEmptyOmniJob ? 'Marked empty omni video task invalid' : 'Marked interrupted video generation as retryable', { videoGenId: s.id });
+  }
+
+  const resumable = db
+    .prepare(
+      `SELECT id FROM video_generations
+       WHERE status = 'processing' AND deleted_at IS NULL
+         AND provider_task_id IS NOT NULL AND TRIM(provider_task_id) != ''`
+    )
+    .all();
+  if (resumable.length) {
+    log.info('Resuming video generation polls', { count: resumable.length });
+  }
+  for (const r of resumable) {
+    setImmediate(() => {
+      resumePollForVideoGeneration(db, log, r.id).catch((e) => {
+        log.error('resumePollForVideoGeneration unhandled', { videoGenId: r.id, error: e.message });
+      });
+    });
+  }
+}
+
+function reconcileUnarchivedCompletedVideos(db, log) {
+  let rows;
+  try {
+    rows = db.prepare(`SELECT id, task_id, storyboard_id FROM video_generations
+      WHERE status = 'completed' AND deleted_at IS NULL
+        AND (local_path IS NULL OR TRIM(local_path) = '')`).all();
+  } catch (_) {
+    // Compatibility for a database that has not yet gained storyboard_id.
+    rows = db.prepare(`SELECT id, task_id FROM video_generations
+      WHERE status = 'completed' AND deleted_at IS NULL
+        AND (local_path IS NULL OR TRIM(local_path) = '')`).all();
+  }
+  const at = new Date().toISOString();
+  const message = '历史视频没有本地归档文件，原供应商链接可能已过期；请重新生成。';
+  for (const row of rows) {
+    db.prepare('UPDATE video_generations SET status = ?, video_url = NULL, error_msg = ?, updated_at = ? WHERE id = ?')
+      .run('failed', message, at, row.id);
+    if (row.task_id) taskService.updateTaskError(db, row.task_id, message);
+    // Storyboards may have copied the same signed URL. Clear only the video
+    // field; local_path can also be an image cover and must be preserved.
+    if (row.storyboard_id) {
+      try {
+        const hasArchivedReplacement = db.prepare(`SELECT 1 FROM video_generations
+          WHERE storyboard_id = ? AND status = 'completed' AND local_path IS NOT NULL
+            AND TRIM(local_path) != '' AND deleted_at IS NULL LIMIT 1`).get(row.storyboard_id);
+        if (!hasArchivedReplacement) {
+          db.prepare('UPDATE storyboards SET video_url = NULL, updated_at = ? WHERE id = ?').run(at, row.storyboard_id);
+        }
+      } catch (_) {}
+    }
+  }
+  // Earlier releases allowed direct imports from a completed supplier URL.
+  // Such an asset has no bytes under storage and therefore cannot be durable.
+  try {
+    db.prepare(`UPDATE assets SET url = '', updated_at = ?
+      WHERE type = 'video' AND deleted_at IS NULL
+        AND (local_path IS NULL OR TRIM(local_path) = '')
+        AND url LIKE 'http%'`).run(at);
+  } catch (_) {}
+  if (rows.length) log.warn('Marked unarchived completed videos as failed', { count: rows.length });
+  return { reconciled: rows.length };
+}
+
+function resumePendingVideoArchives(db, log) {
+  let rows = [];
+  try { rows = db.prepare(`SELECT id FROM video_generations WHERE status = 'completed' AND local_path IS NOT NULL AND TRIM(local_path) != '' AND archive_status = 'pending' AND deleted_at IS NULL`).all(); } catch (_) { return; }
+  for (const row of rows) setImmediate(() => archiveCompletedVideo(db, log, row.id).catch((error) => log.warn('Video archive retry failed', { id: row.id, error: error.message })));
+}
+
+/**
+ * Recover the handoff between a completed post-process stage and the outer
+ * finalizer. The stage output is already local, so process() only reuses the
+ * persisted job and never submits another supplier task.
+ */
+function resumeCompletedPostprocessVideoGenerations(db, log) {
+  let rows = [];
+  try {
+    rows = db.prepare(`SELECT DISTINCT v.id
+      FROM video_generations v
+      LEFT JOIN video_upscale_jobs u ON u.video_generation_id = v.id
+      LEFT JOIN video_interpolation_jobs i ON i.video_generation_id = v.id
+      WHERE v.deleted_at IS NULL
+        AND v.source_local_path IS NOT NULL AND TRIM(v.source_local_path) != ''
+        AND COALESCE(v.postprocess_recovery_version, 0) >= 1
+        AND v.status IN ('upscale_pending','upscaling','interpolation_pending','interpolating','persisting')
+        AND (
+          (v.upscale_status = 'completed' AND u.status = 'completed' AND u.output_local_path IS NOT NULL AND TRIM(u.output_local_path) != '')
+          OR (v.interpolation_status IN ('completed','skipped') AND i.status IN ('completed','skipped') AND i.output_local_path IS NOT NULL AND TRIM(i.output_local_path) != '')
+        )
+      ORDER BY v.id`).all();
+  } catch (_) { return { queued: 0 }; }
+  for (const row of rows) {
+    setImmediate(() => resumePostprocessVideoGeneration(db, log, row.id).catch((error) => {
+      log.error('Completed post-process finalization resume failed', { video_generation_id: row.id, error: error.message });
+    }));
+  }
+  return { queued: rows.length };
+}
+
+// Historical completed rows predate poster extraction. Backfill a small batch
+// after startup and yield between files so FFmpeg work never blocks request
+// handling for an entire media library at once.
+function resumeMissingVideoPosters(db, log) {
+  let rows = [];
+  try {
+    rows = db.prepare(`SELECT id, local_path FROM video_generations
+      WHERE status = 'completed' AND deleted_at IS NULL
+        AND local_path IS NOT NULL AND TRIM(local_path) != ''
+        AND (poster_local_path IS NULL OR TRIM(poster_local_path) = '')
+      ORDER BY id DESC LIMIT 50`).all();
+  } catch (_) { return { queued: 0 }; }
+  if (!rows.length) return { queued: 0 };
+  const storagePath = resolveStoragePath(require('../config').loadConfig());
+  const processNext = () => {
+    const row = rows.shift();
+    if (!row) return;
+    const poster = createVideoPoster(storagePath, row.local_path, row.id, log);
+    if (poster) {
+      try { db.prepare('UPDATE video_generations SET poster_local_path=?, updated_at=? WHERE id=?').run(poster, new Date().toISOString(), row.id); } catch (_) {}
+    }
+    if (rows.length) setTimeout(processNext, 120);
+  };
+  setImmediate(processNext);
+  return { queued: rows.length };
+}
+
+function startPendingVideoArchiveRetry(db, log) {
+  const run = () => resumePendingVideoArchives(db, log);
+  const timer = setInterval(run, 60_000);
+  if (typeof timer.unref === 'function') timer.unref();
+  return { runNow: run, stop: () => clearInterval(timer) };
+}
+
+function loadOmniReferenceImageInputs(db, videoGenId, referenceUrls = []) {
+  const omni = db.prepare('SELECT id FROM omni_video_jobs WHERE video_generation_id = ?').get(Number(videoGenId));
+  if (!omni) return null;
+  const imageRows = db.prepare(`SELECT j.ordinal, j.snapshot_json,
+    a.width asset_width, a.height asset_height, a.file_size asset_file_size,
+    a.local_path asset_local_path
+    FROM omni_video_job_assets j LEFT JOIN assets a ON a.id=j.asset_id
+    WHERE j.omni_job_id = ? AND j.media_type = 'image' AND j.send_to_model = 1
+    ORDER BY j.ordinal`).all(omni.id);
+  return imageRows.map((item, index) => {
+    let snapshot = {};
+    try { snapshot = JSON.parse(item.snapshot_json || '{}'); } catch (_) {}
+    return {
+      url: referenceUrls[index] || snapshot.model_url || snapshot.url || snapshot.local_path || null,
+      local_path: item.asset_local_path || snapshot.local_path || null,
+      width: Number(item.asset_width || snapshot.width) || null,
+      height: Number(item.asset_height || snapshot.height) || null,
+      file_size: Number(item.asset_file_size || snapshot.file_size) || null,
+    };
+  });
+}
+
+function isProviderReachableMediaUrl(value) {
+  const url = String(value || '').trim();
+  return /^https?:\/\//i.test(url) && !/localhost|127\.0\.0\.1|\[::1\]/i.test(url);
+}
+
+async function loadOmniReferenceVideoUrls(db, cfg, storageRoot, videoGenId, log) {
+  const omni = db.prepare('SELECT id FROM omni_video_jobs WHERE video_generation_id = ?').get(Number(videoGenId));
+  if (!omni) return [];
+  const rows = db.prepare(`SELECT j.asset_id, j.alias, j.snapshot_json, a.local_path AS asset_local_path
+    FROM omni_video_job_assets j LEFT JOIN assets a ON a.id=j.asset_id
+    WHERE j.omni_job_id = ? AND j.media_type = 'video' AND j.send_to_model = 1
+    ORDER BY j.ordinal`).all(omni.id);
+  const storage = require('./mediaStorageService');
+  const urls = [];
+  for (const row of rows) {
+    let snapshot = {};
+    try { snapshot = JSON.parse(row.snapshot_json || '{}'); } catch (_) {}
+    const direct = [snapshot.model_url, snapshot.url].find(isProviderReachableMediaUrl);
+    if (direct) { urls.push(String(direct).trim()); continue; }
+    const localPath = row.asset_local_path || snapshot.local_path || null;
+    if (localPath && storage.isOss(cfg)) {
+      const record = db.prepare(`SELECT archive_status FROM media_archive_records
+        WHERE local_path = ? AND archive_status IN ('oss_synced', 'local_pruned') LIMIT 1`).get(localPath);
+      if (record) { urls.push(storage.objectUrl(cfg, localPath)); continue; }
+      const absolute = path.join(storageRoot, storage.normalizeKey(localPath));
+      if (fs.existsSync(absolute)) {
+        const mirrored = await storage.mirrorAndTrack(db, cfg, storageRoot, localPath, 'asset', row.asset_id, log, { contentType: snapshot.mime_type || 'video/mp4' });
+        urls.push(mirrored.url || storage.objectUrl(cfg, localPath));
+        continue;
+      }
+    }
+    throw new Error(`视频素材“${row.alias || row.asset_id || '未命名'}”没有模型可访问的公网地址，请重新上传后重试`);
+  }
+  return urls;
+}
+
+async function processVideoGeneration(db, log, videoGenId) {
+  if (activeVideoPolls.has(videoGenId)) {
+    log.info('Video generation already in progress, skip duplicate', { videoGenId });
+    return;
+  }
+  activeVideoPolls.add(videoGenId);
+  log.info('processVideoGeneration started', { videoGenId });
+  const row = db.prepare('SELECT * FROM video_generations WHERE id = ? AND deleted_at IS NULL').get(Number(videoGenId));
+  if (!row) {
+    activeVideoPolls.delete(videoGenId);
+    log.error('Video generation not found', { id: videoGenId });
+    return;
+  }
+  const now = new Date().toISOString();
+  try {
+    const loadConfig = require('../config').loadConfig;
+    const cfg = loadConfig();
+    const filesBaseUrl = (cfg.storage && cfg.storage.base_url) ? String(cfg.storage.base_url).replace(/\/$/, '') : '';
+    const storageLocalPath = path.isAbsolute(cfg.storage?.local_path)
+      ? cfg.storage.local_path
+      : path.join(process.cwd(), cfg.storage?.local_path || './data/storage');
+    // 已有钉住的提交配置时优先用它：与轮询/取消同源，避免重投时换一枚业务 Key。
+    // 换 Key 的代价不只是查错任务——中转站按 Key 隔离幂等键，上一次提交若「终态未知」
+    // （5xx / 传输中断），换 Key 重投会在上游建出第二个任务，等于重复计费。
+    const pinnedConfigId = Number(row.ai_config_id) || null;
+    const config = pinnedConfigId
+      ? require('./aiConfigService').getConfig(db, pinnedConfigId)
+      : videoClient.getDefaultVideoConfig(db, row.model, { tenant_id: row.tenant_id, scene_defaults: false });
+    if (!config) {
+      if (pinnedConfigId) {
+        // 与断点续轮询同一处置：保持 processing、留住宿预授权，等管理员恢复配置。
+        // 这里不能落 failed，更不能换一枚 Key 提交。
+        db.prepare('UPDATE video_generations SET status = ?, error_msg = ?, updated_at = ? WHERE id = ?')
+          .run('processing', '固定配置已删除，暂停提交以避免用错业务 Key；恢复该配置后任务会自动继续', now, videoGenId);
+        log.warn('Video submit paused: pinned config missing', { videoGenId, ai_config_id: pinnedConfigId });
+        return;
+      }
+      setVideoGenFailed(db, videoGenId, '未配置视频模型', now);
+      if (row.task_id) taskService.updateTaskError(db, row.task_id, '未配置视频模型');
+      return;
+    }
+    // 记下真正提交本任务的配置：中转站只允许建任务的同一枚业务 Key 查询/取消任务，
+    // 重启续轮询不能按模型名重新解析到另一套配置。
+    db.prepare('UPDATE video_generations SET status = ?, ai_config_id = ?, updated_at = ? WHERE id = ?')
+      .run('processing', Number(config.id) || null, now, videoGenId);
+    let reference_urls = null;
+    if (row.reference_image_urls) {
+      try {
+        reference_urls = JSON.parse(row.reference_image_urls);
+        if (!Array.isArray(reference_urls)) reference_urls = null;
+      } catch (_) {}
+    }
+    let referenceImageInputs = null;
+    let referenceVideoUrls = [];
+    // 全能工作台的音频引用与图片一样从任务快照恢复，避免依赖角色专用音色字段。
+    let voiceReferenceUrl = null;
+    let referenceAudioUrls;
+    let inputValidationVersion;
+    try {
+      const omni = db.prepare('SELECT id, request_snapshot_json FROM omni_video_jobs WHERE video_generation_id = ?').get(Number(videoGenId));
+      if (omni) {
+        referenceImageInputs = loadOmniReferenceImageInputs(db, videoGenId, reference_urls || []);
+        referenceVideoUrls = await loadOmniReferenceVideoUrls(db, cfg, storageLocalPath, videoGenId, log);
+        const audio = db.prepare(`SELECT snapshot_json FROM omni_video_job_assets
+          WHERE omni_job_id = ? AND media_type = 'audio' AND send_to_model = 1 ORDER BY ordinal LIMIT 1`).get(omni.id);
+        if (audio?.snapshot_json) {
+          const snapshot = JSON.parse(audio.snapshot_json);
+          voiceReferenceUrl = snapshot.local_path || snapshot.url || null;
+        }
+        const requestSnapshot = JSON.parse(omni.request_snapshot_json || '{}');
+        if (requestSnapshot.input_validation?.version) {
+          inputValidationVersion = requestSnapshot.input_validation.version;
+          referenceAudioUrls = db.prepare(`SELECT snapshot_json FROM omni_video_job_assets
+            WHERE omni_job_id = ? AND media_type = 'audio' AND send_to_model = 1 ORDER BY ordinal`).all(omni.id)
+            .map((item) => JSON.parse(item.snapshot_json))
+            .map((asset) => asset.model_url || asset.local_path || asset.url).filter(Boolean);
+          if (!referenceAudioUrls.length && requestSnapshot.input_validation.automatic_voice_url) {
+            referenceAudioUrls.push(requestSnapshot.input_validation.automatic_voice_url);
+          }
+          voiceReferenceUrl = referenceAudioUrls[0] || null;
+        }
+      }
+    } catch (error) {
+      // Legacy databases can briefly lack the Omni tables during startup.
+      // Do not hide material recovery errors because that would submit a
+      // generation without the selected source video.
+      if (!/no such table:\s*omni_video_/i.test(String(error?.message || ''))) throw error;
+    }
+    // 优先使用分镜自身的镜头时长（storyboard.duration），其次用 video_generations.duration
+    let effectiveDuration = row.duration || null;
+    if (row.storyboard_id) {
+      const sb = db.prepare('SELECT duration FROM storyboards WHERE id = ?').get(row.storyboard_id);
+      if (sb && sb.duration > 0) {
+        effectiveDuration = sb.duration;
+        log.info('使用分镜镜头时长', { storyboard_id: row.storyboard_id, duration: effectiveDuration, video_gen_id: videoGenId });
+      }
+    }
+    let aspectForVideo = row.aspect_ratio;
+    if (aspectForVideo) {
+      const n = videoClient.normalizeAspectRatioForApi(aspectForVideo);
+      if (n) aspectForVideo = n;
+    }
+    if (!aspectForVideo && row.drama_id) {
+      try {
+        const dramaRow = db.prepare('SELECT metadata FROM dramas WHERE id = ? AND deleted_at IS NULL').get(row.drama_id);
+        if (dramaRow && dramaRow.metadata) {
+          const meta =
+            typeof dramaRow.metadata === 'string' ? JSON.parse(dramaRow.metadata) : dramaRow.metadata;
+          if (meta && meta.aspect_ratio) {
+            aspectForVideo = videoClient.normalizeAspectRatioForApi(meta.aspect_ratio);
+          }
+        }
+      } catch (_) {}
+    }
+    const rowForAspect = { ...row, aspect_ratio: aspectForVideo || row.aspect_ratio };
+    const omniReferenceCount = Number(reference_urls?.length || 0) + referenceVideoUrls.length + (referenceAudioUrls ? referenceAudioUrls.length : voiceReferenceUrl ? 1 : 0);
+    const hasOmniRefs = omniReferenceCount > 0;
+    if (row.task_id) {
+      taskService.updateTaskStatus(
+        db,
+        row.task_id,
+        'processing',
+        5,
+        hasOmniRefs ? `正在准备 ${omniReferenceCount} 个参考素材` : '正在准备生成参数'
+      );
+    }
+    // Mark the submit as in flight. While it is set, provider_task_id may still
+    // be empty even though the request already reached the supplier, so the
+    // cancel path must not read that emptiness as "never submitted" and release
+    // the reservation. Cleared once the response is consumed, and again in the
+    // finally for the throwing path.
+    const submitStartedAt = new Date().toISOString();
+    db.prepare('UPDATE video_generations SET provider_submit_started_at = ?, updated_at = ? WHERE id = ?')
+      .run(submitStartedAt, submitStartedAt, videoGenId);
+    const result = await videoClient.callVideoApi(db, log, {
+      prompt: row.prompt,
+      model: row.model,
+      duration: effectiveDuration,
+      aspect_ratio: rowForAspect.aspect_ratio,
+      resolution: row.resolution,
+      seed: row.seed,
+      camera_fixed: row.camera_fixed,
+      watermark: row.watermark,
+      provider: row.provider,
+      drama_id: row.drama_id,
+      storyboard_id: row.storyboard_id || undefined,
+      image_url: hasOmniRefs ? undefined : row.image_url,
+      first_frame_url: hasOmniRefs ? undefined : row.first_frame_url,
+      last_frame_url: hasOmniRefs ? undefined : row.last_frame_url,
+      reference_urls,
+      reference_video_urls: referenceVideoUrls,
+      reference_image_inputs: referenceImageInputs,
+      voice_reference_url: voiceReferenceUrl,
+      reference_audio_urls: referenceAudioUrls,
+      input_validation_version: inputValidationVersion,
+      files_base_url: filesBaseUrl,
+      storage_local_path: storageLocalPath,
+      video_gen_id: videoGenId,
+      // 用刚解析出的（含租户绑定的）配置提交，避免与后续轮询用的配置不一致
+      ai_config_id: Number(config.id) || null,
+    });
+    // The submit outcome is known from here on, so the cancel guard stands
+    // down: provider_task_id is either stored or definitively absent. The
+    // finally below repeats this for the throwing path.
+    db.prepare('UPDATE video_generations SET provider_submit_started_at = NULL WHERE id = ?').run(Number(videoGenId));
+    const now2 = new Date().toISOString();
+    if (result.error) {
+      // 写请求终态未知时不释放预授权：建对账让管理员按供应商用量核实（见 setVideoGenFailed）。
+      setVideoGenFailed(db, videoGenId, result.error, now2, result.ambiguous
+        ? { unverifiedProviderResult: true, providerRequestId: result.provider_request_id }
+        : {});
+      if (row.task_id) taskService.updateTaskError(db, row.task_id, result.error);
+      log.error('Video generation failed', { id: videoGenId, error: result.error, ambiguous: !!result.ambiguous });
+      return;
+    }
+    const directVideo = resolveRemoteVideoUrl(result.video_url, result.error);
+    if (directVideo.ok) {
+      // Synchronous deliveries land here too, and they can land after a
+      // cancellation. Keep the paid bytes, never write a completion state.
+      if (!canFinalizeVideoGeneration(db, videoGenId)) {
+        await archiveProviderOutputOnly(db, log, videoGenId, directVideo.video_url, result.provider_request_id || result.task_id || null);
+        return;
+      }
+      await finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, directVideo.video_url, '', result.usage, result.provider_request_id || result.task_id, result.provider_response_snapshot);
+      return;
+    }
+    if (result.video_url) {
+      setVideoGenFailed(db, videoGenId, directVideo.error, now2);
+      if (row.task_id) taskService.updateTaskError(db, row.task_id, directVideo.error);
+      log.error('Video generation failed', { id: videoGenId, error: directVideo.error });
+      return;
+    }
+    if (result.task_id) {
+      // The submit response can land after the user cancelled: the request was
+      // already accepted upstream, and the supplier task exists and will be
+      // billed. Claim the row only while it is still ours to run. Writing
+      // status unconditionally used to revive a cancelled generation, which
+      // then settled an already-released authorization and pulled the account's
+      // frozen total below its open reservations.
+      const claimed = db.prepare(
+        'UPDATE video_generations SET status = ?, provider_task_id = ?, updated_at = ? WHERE id = ? AND status = ?'
+      ).run('processing', result.task_id, now2, videoGenId, 'processing');
+      if (!claimed.changes) {
+        const localStatus = db.prepare('SELECT status FROM video_generations WHERE id = ?').get(Number(videoGenId))?.status || null;
+        db.prepare('UPDATE video_generations SET provider_task_id = ?, updated_at = ? WHERE id = ?').run(result.task_id, now2, videoGenId);
+        log.warn('Video submit resolved after local terminal state; output will be archived without billing', {
+          video_gen_id: videoGenId, provider_task_id: result.task_id, local_status: localStatus,
+        });
+        await pollProviderTaskAndFinalize(db, log, videoGenId, row, rowForAspect, result.task_id, config, { archiveOnly: true });
+        return;
+      }
+      await pollProviderTaskAndFinalize(db, log, videoGenId, row, rowForAspect, result.task_id, config);
+      return;
+    }
+    setVideoGenFailed(db, videoGenId, '未返回 task_id 或 video_url', now2);
+    if (row.task_id) taskService.updateTaskError(db, row.task_id, '未返回 task_id 或 video_url');
+  } catch (err) {
+    const now2 = new Date().toISOString();
+    setVideoGenFailed(db, videoGenId, err.message, now2);
+    if (row && row.task_id) taskService.updateTaskError(db, row.task_id, err.message);
+    log.error('Video generation error', { id: videoGenId, error: err.message });
+  } finally {
+    db.prepare('UPDATE video_generations SET provider_submit_started_at = NULL WHERE id = ?').run(Number(videoGenId));
+    activeVideoPolls.delete(videoGenId);
+  }
+}
+
+/** Continue the persisted post-processing pipeline after a service restart.
+ * The supplier-generation bytes were already archived and billed before any
+ * optional stage started, so this re-enters with the local source and never
+ * submits the video-generation request a second time. */
+async function resumePostprocessVideoGeneration(db, log, videoGenId) {
+  const numericVideoGenId = Number(videoGenId);
+  if (activePostprocessResumes.has(numericVideoGenId)) return { status: 'already_running' };
+  activePostprocessResumes.add(numericVideoGenId);
+  try {
+    const row = db.prepare('SELECT * FROM video_generations WHERE id=? AND deleted_at IS NULL').get(Number(videoGenId));
+    if (!row?.source_local_path || row.status === 'completed' || row.status === 'billing_reconciliation') return { status: row?.status || 'missing' };
+    try {
+      await finalizeSuccessfulVideo(
+        db, log, Number(videoGenId),
+        { ...row, billing_authorization_id: null }, row,
+        `/static/${String(row.source_local_path).replace(/^\/+/, '')}`,
+        'restart-resume'
+      );
+      const after = db.prepare('SELECT status, error_msg FROM video_generations WHERE id=? AND deleted_at IS NULL').get(numericVideoGenId);
+      return { status: after?.status === 'completed' ? 'completed' : (after?.status || 'retryable'), error: after?.error_msg || null };
+    } catch (error) {
+      log.error('Post-processing pipeline resume failed', { video_generation_id: Number(videoGenId), error: error.message });
+      return { status: 'retryable', error: error.message };
+    }
+  } finally {
+    activePostprocessResumes.delete(numericVideoGenId);
+  }
+}
+
+function readReconciliationStageRows(db, videoGenId) {
+  return [
+    db.prepare(`SELECT 'upscale' AS stage, j.id, j.status, j.output_local_path, j.output_width, j.output_height,
+        j.output_duration_ms, j.output_resolution, j.output_fps, c.status AS reconciliation_status
+      FROM video_upscale_jobs j
+      JOIN billing_reconciliation_cases c ON c.authorization_id=j.billing_authorization_id
+        AND c.status IN ('resolved','waived')
+        AND json_extract(c.resolution_json, '$.postprocess_recovery.version') = 1
+      WHERE j.video_generation_id=?`).get(Number(videoGenId)),
+    db.prepare(`SELECT 'interpolation' AS stage, j.id, j.status, j.output_local_path, j.output_width, j.output_height,
+        j.output_duration_ms, j.output_resolution, j.output_fps, c.status AS reconciliation_status
+      FROM video_interpolation_jobs j
+      JOIN billing_reconciliation_cases c ON c.authorization_id=j.billing_authorization_id
+        AND c.status IN ('resolved','waived')
+        AND json_extract(c.resolution_json, '$.postprocess_recovery.version') = 1
+      WHERE j.video_generation_id=?`).get(Number(videoGenId)),
+  ].filter(Boolean);
+}
+
+/**
+ * Resolve a paid post-process stage after its billing reconciliation case is
+ * settled or waived. The provider output is already local and validated;
+ * this only adopts the durable stage row and re-enters the local finalizer.
+ */
+async function resumeResolvedPostprocessVideoGeneration(db, log, videoGenId) {
+  const numericVideoGenId = Number(videoGenId);
+  if (activeReconciliationResumes.has(numericVideoGenId)) return { status: 'already_running' };
+  activeReconciliationResumes.add(numericVideoGenId);
+  try {
+    const row = db.prepare('SELECT * FROM video_generations WHERE id=? AND deleted_at IS NULL').get(numericVideoGenId);
+    if (!row) return { status: 'missing' };
+    if (row.status === 'completed') return { status: 'completed' };
+    if (!String(row.source_local_path || '').trim()) throw new Error('缺少已归档的原始视频，无法恢复对账后的成片');
+    const stages = readReconciliationStageRows(db, numericVideoGenId);
+    const pending = stages.filter((stage) => stage.status === 'reconciliation_required'
+      && ['resolved', 'waived'].includes(String(stage.reconciliation_status || ''))
+      && String(stage.output_local_path || '').trim());
+    if (!pending.length) return { status: 'not_reconciliation' };
+
+    const storagePath = resolveStoragePath(require('../config').loadConfig());
+    for (const stage of pending) {
+      const localKey = String(stage.output_local_path).replace(/^\/+/, '');
+      const absolute = path.resolve(storagePath, localKey);
+      if (!(absolute === path.resolve(storagePath) || absolute.startsWith(path.resolve(storagePath) + path.sep))
+        || !fs.statSync(absolute, { throwIfNoEntry: false })?.isFile()) {
+        throw new Error(`${stage.stage === 'upscale' ? '超分' : '插帧'}输出文件不可读，无法恢复对账后的成片`);
+      }
+    }
+
+    const at = new Date().toISOString();
+    db.transaction(() => {
+      for (const stage of pending) {
+        const table = stage.stage === 'upscale' ? 'video_upscale_jobs' : 'video_interpolation_jobs';
+        db.prepare(`UPDATE ${table} SET status='completed', error_msg=NULL,
+            source_local_path=COALESCE(source_local_path, ?),
+            completed_at=COALESCE(completed_at, ?), updated_at=?
+          WHERE id=? AND status='reconciliation_required'`).run(row.source_local_path, at, at, stage.id);
+        if (stage.stage === 'upscale') {
+          db.prepare(`UPDATE video_generations SET status='billing_reconciliation', upscale_status='completed',
+              upscale_local_path=?, error_msg=NULL, updated_at=?
+            WHERE id=? AND status='billing_reconciliation'`).run(stage.output_local_path, at, numericVideoGenId);
+        } else {
+          db.prepare(`UPDATE video_generations SET status='billing_reconciliation', interpolation_status='completed',
+              output_width=COALESCE(?, output_width), output_height=COALESCE(?, output_height),
+              output_resolution=COALESCE(?, output_resolution), output_fps=COALESCE(?, output_fps),
+              output_duration_ms=COALESCE(?, output_duration_ms), error_msg=NULL, updated_at=?
+            WHERE id=? AND status='billing_reconciliation'`)
+            .run(stage.output_width, stage.output_height, stage.output_resolution, stage.output_fps, stage.output_duration_ms, at, numericVideoGenId);
+        }
+      }
+      const current = db.prepare('SELECT * FROM video_generations WHERE id=? AND deleted_at IS NULL').get(numericVideoGenId);
+      if (!current || current.status !== 'billing_reconciliation') return;
+      const upscaleReady = !current.upscale_resolution || current.upscale_status === 'completed' || current.upscale_status === 'skipped';
+      const interpolationReady = !current.target_fps || current.interpolation_status === 'completed' || current.interpolation_status === 'skipped';
+      const nextStatus = !upscaleReady ? 'upscale_pending' : !interpolationReady ? 'interpolation_pending' : 'persisting';
+      db.prepare(`UPDATE video_generations SET status=?, error_msg=NULL, updated_at=?
+        WHERE id=? AND status='billing_reconciliation'`).run(nextStatus, at, numericVideoGenId);
+    })();
+
+    const resumed = await resumePostprocessVideoGeneration(db, log, numericVideoGenId);
+    return { status: resumed?.status || 'scheduled', stage_count: pending.length };
+  } finally {
+    activeReconciliationResumes.delete(numericVideoGenId);
+  }
+}
+
+function deleteById(db, log, id) {
+  return db.transaction(() => {
+    const referenced = db.prepare(`SELECT 1 FROM storyboards
+      WHERE playback_video_generation_id=? AND deleted_at IS NULL LIMIT 1`).get(Number(id))
+      || db.prepare(`SELECT 1 FROM omni_video_sequence_shots s JOIN omni_video_sequences q ON q.id=s.sequence_id
+        WHERE s.playback_video_generation_id=? AND s.deleted_at IS NULL AND q.deleted_at IS NULL LIMIT 1`).get(Number(id));
+    if (referenced) throw Object.assign(new Error('该成片仍被有效镜头引用，无法删除'), { code: 'VIDEO_IN_USE' });
+    const result = db.prepare('UPDATE video_generations SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL').run(new Date().toISOString(), Number(id));
+    return result.changes > 0;
+  }).immediate();
+}
+
+module.exports = {
+  setVideoGenFailed,
+  syncVideoGenerationFailure,
+  list,
+  listHomepageDefaultVideos,
+  getById,
+  playbackGeneration,
+  deleteById,
+  processVideoGeneration,
+  archiveCompletedVideo,
+  resumePendingVideoArchives,
+  resumeCompletedPostprocessVideoGenerations,
+  resumeMissingVideoPosters,
+  startPendingVideoArchiveRetry,
+  resumeProcessingVideoGenerations,
+  resumePollForVideoGeneration,
+  reconcileUnarchivedCompletedVideos,
+  resumePostprocessVideoGeneration,
+  resumeResolvedPostprocessVideoGeneration,
+  loadOmniReferenceImageInputs,
+  loadOmniReferenceVideoUrls,
+  targetVideoPixelsForAspect,
+  normalizeFinalVideoToContract,
+  pruneSupersededVideoArtifacts,
+  publicVideoUrl,
+};

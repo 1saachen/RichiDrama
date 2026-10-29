@@ -1,0 +1,175 @@
+const response = require('../response');
+const imageService = require('../services/imageService');
+const taskService = require('../services/taskService');
+const backgroundExtractionService = require('../services/backgroundExtractionService');
+
+function routes(db, cfg, log) {
+  return {
+    list: (req, res) => {
+      try {
+        const query = { ...req.query, owner_user_id: req.auth.id };
+        const { items, total, page, pageSize } = imageService.list(db, query);
+        response.successWithPagination(res, items, total, page, pageSize);
+      } catch (err) {
+        log.error('images list', { error: err.message });
+        response.internalError(res, err.message);
+      }
+    },
+    create: (req, res) => {
+      try {
+        const body = req.body || {};
+        if (body.layer_decomposition === true) return response.badRequest(res, '当前图片生成接口不支持图层拆分');
+        const creativeBoard = body.source_context === 'creative_board';
+        if (creativeBoard) {
+          require('../services/creativeBoardService').assertBoard(db, body.board_id, req.auth.id);
+          if (body.drama_id || body.storyboard_id || body.scene_id) return response.badRequest(res, '纯画布图片生成不能绑定旧工作流');
+          if (!String(body.idempotency_key || '').trim()) return response.badRequest(res, '图片生成请求缺少幂等键');
+          const prior = db.prepare('SELECT id,board_id FROM image_generations WHERE owner_user_id=? AND board_request_id=?').get(req.auth.id, String(body.idempotency_key));
+          if (prior) {
+            if (Number(prior.board_id) !== Number(body.board_id)) return response.badRequest(res, '幂等键已用于其他画布');
+            return response.success(res, imageService.getById(db, prior.id));
+          }
+          const refs = Array.isArray(body.reference_sources) ? body.reference_sources : [];
+          if (refs.length > 10 || body.reference_images?.length) return response.badRequest(res, '纯画布参考图须从已授权素材选择');
+          const localReferences = [];
+          for (const ref of refs) {
+            const item = require('../services/creativeBoardService').ownedMedia(db, ref.source_type, ref.source_id, req.auth.id);
+            if (!item || (ref.source_type === 'asset' && item.type !== 'image') || (ref.source_type === 'video_generation')) return response.badRequest(res, '参考图不存在或无权访问');
+            if (!item.local_path) return response.badRequest(res, '参考图尚未保存到本地');
+            localReferences.push(item.local_path);
+          }
+          body.reference_images = localReferences;
+          if (!body.size && !body.aspect_ratio) return response.badRequest(res, '请选择画布图片尺寸');
+          if (body.draft_node_id != null && (typeof body.draft_node_id !== 'string' || body.draft_node_id.length > 200)) return response.badRequest(res, 'draft_node_id 无效');
+        } else {
+          if (body.board_id != null) return response.badRequest(res, 'board_id 仅用于纯画布生成');
+          if (!Number.isInteger(Number(body.drama_id)) || Number(body.drama_id) <= 0) return response.badRequest(res, '请选择计费归属项目后再生成');
+        }
+        if (body.drama_id) {
+          const own = require('../services/projectAccessService').access(db, Number(body.drama_id), req.auth.id);
+          if (!own) return response.notFound(res, '项目不存在');
+        }
+        if (body.storyboard_id && require('../services/generationSubmissionGuard').findActiveImageForStoryboard(db, {
+          ownerUserId: req.auth.id,
+          storyboardId: body.storyboard_id,
+        })) return response.badRequest(res, '当前镜头已有图片生成任务，请等待任务结束后再生成');
+        const billing = require('../services/billingService');
+        // The current provider adapters request exactly one image (n: 1) and
+        // completion persists one image row. Reject a mismatched count instead
+        // of freezing several images then settling one.
+        const requestedCount = body.count == null ? 1 : Number(body.count);
+        if (!Number.isSafeInteger(requestedCount) || requestedCount !== 1) {
+          return response.badRequest(res, '当前图片接口每次仅支持生成 1 张');
+        }
+        const tenant = require('../services/tenantService').tenantForUser(db, req.auth.id);
+        const aiOptions = tenant ? { tenant_id: tenant.id } : {};
+        let imageConfig = require('../services/aiConfigService').listConfigs(db, body.service_type || 'image', aiOptions)[0]
+          || require('../services/aiConfigService').listConfigs(db, 'storyboard_image', aiOptions)[0];
+        if (!body.model && body.storyboard_id) {
+          const sceneDefault = require('../services/aiConfigService').listConfigs(db, 'storyboard_image', aiOptions).find(config => config.scene_default);
+          if (sceneDefault) imageConfig = sceneDefault;
+        }
+        const model = String(body.model || imageConfig?.default_model || imageConfig?.model?.[0] || '').trim();
+        if (!model) return response.badRequest(res, '请选择图片模型后再生成');
+        const billingTarget = require('../services/aiConfigService').resolveBillingTarget(db, body.service_type || 'image', model, body.ai_config_id, aiOptions);
+        if (!String(body.idempotency_key || '').trim()) return response.badRequest(res, '图片生成请求缺少幂等键，请刷新后重试');
+        const authorization = billing.createAuthorization(db, req.auth, {
+          idempotency_key: String(body.idempotency_key).trim(),
+          service_type: body.service_type || 'image', model: billingTarget.billing_key, provider_model: billingTarget.provider_model, provider: billingTarget.provider,
+          usage: { image: 1 },
+          pricing_context: require('../services/imageBillingService').imagePricingContext(body),
+          reference_type: 'image_generation', reference_id: body.board_id || body.drama_id || null, drama_id: body.drama_id || null, source_kind: creativeBoard ? 'creative_board' : 'image_generation', source_id: body.board_id || body.storyboard_id || null,
+        });
+        const rec = imageService.create(db, log, { ...body, model, owner_user_id: req.auth.id, tenant_id: tenant?.id || null, billing_authorization_id: authorization.authorization_id });
+        response.created(res, rec);
+      } catch (err) {
+        log.error('images create', { error: err.message });
+        response.internalError(res, err.message);
+      }
+    },
+    get: (req, res) => {
+      try {
+        const ownership = db.prepare('SELECT board_id,owner_user_id FROM image_generations WHERE id=? AND deleted_at IS NULL').get(Number(req.params.id));
+        if (ownership?.board_id != null && Number(ownership.owner_user_id) !== Number(req.auth.id)) return response.notFound(res, '记录不存在');
+        const item = imageService.getById(db, req.params.id);
+        if (!item) return response.notFound(res, '记录不存在');
+        response.success(res, item);
+      } catch (err) {
+        log.error('images get', { error: err.message });
+        response.internalError(res, err.message);
+      }
+    },
+    delete: (req, res) => {
+      try {
+        const ownership = db.prepare('SELECT board_id,owner_user_id FROM image_generations WHERE id=? AND deleted_at IS NULL').get(Number(req.params.id));
+        if (ownership?.board_id != null && Number(ownership.owner_user_id) !== Number(req.auth.id)) return response.notFound(res, '记录不存在');
+        const ok = imageService.deleteById(db, log, req.params.id);
+        if (!ok) return response.notFound(res, '记录不存在');
+        response.success(res, { message: '删除成功' });
+      } catch (err) {
+        log.error('images delete', { error: err.message });
+        response.internalError(res, err.message);
+      }
+    },
+    scene: (req, res) => {
+      try {
+        const task = taskService.createTaskFromContext(db, log, 'image_generation', req.params.scene_id);
+        setTimeout(() => taskService.updateTaskResult(db, task.id, []), 100);
+        response.success(res, { task_id: task.id });
+      } catch (err) {
+        log.error('images scene', { error: err.message });
+        response.internalError(res, err.message);
+      }
+    },
+    episodeBackgrounds: (req, res) => {
+      try {
+        const list = imageService.getBackgroundsForEpisode(db, req.params.episode_id);
+        response.success(res, list);
+      } catch (err) {
+        log.error('images episode backgrounds', { error: err.message });
+        response.internalError(res, err.message);
+      }
+    },
+    episodeBackgroundsExtract: (req, res) => {
+      try {
+        const body = req.body || {};
+        const taskId = backgroundExtractionService.extractBackgroundsForEpisode(
+          db,
+          cfg,
+          log,
+          req.params.episode_id,
+          body.model,
+          body.style,
+          body.language
+        );
+        response.success(res, { task_id: taskId, status: 'pending', message: '场景提取任务已创建，正在后台处理...' });
+      } catch (err) {
+        log.error('images episode backgrounds extract', { error: err.message });
+        if (err.message && (err.message.includes('script content') || err.message.includes('not found'))) {
+          return response.badRequest(res, err.message);
+        }
+        response.internalError(res, err.message || '任务创建失败');
+      }
+    },
+    episodeBatch: (req, res) => {
+      try {
+        response.success(res, []);
+      } catch (err) {
+        log.error('images episode batch', { error: err.message });
+        response.internalError(res, err.message);
+      }
+    },
+    upload: (req, res) => {
+      try {
+        const body = req.body || {};
+        const item = imageService.upload(db, log, body);
+        response.created(res, item);
+      } catch (err) {
+        log.error('images upload', { error: err.message });
+        response.internalError(res, err.message);
+      }
+    },
+  };
+}
+
+module.exports = routes;

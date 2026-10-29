@@ -1,0 +1,54 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_REVISION: ${APP_REVISION:-local}
+    image: ${MINIDRAMA_IMAGE:-local-minidrama:latest}
+    container_name: ${MINIDRAMA_CONTAINER_NAME:-local-minidrama}
+    restart: unless-stopped
+    ports:
+      # 宿主机端口 10588（内网调试/备用）→ 容器内 5679
+      # 对外访问走 80 端口的 lens-rhyme-nginx，用域名 drama.richbest.cn
+      - "10588:5679"
+    volumes:
+      # 数据与代码目录分离：SQLite 库 + 所有上传/生成素材。
+      # 默认使用固定宿主机目录，避免重新克隆/替换仓库目录时丢失旧素材 ID。
+      - ${MINIDRAMA_DATA_DIR:-/data/minidrama-data}:/app/backend-node/data
+    # Load the legacy file first, then let .prod.env override it. Both paths
+    # are optional so an existing server and a migrated server can coexist.
+    env_file:
+      - path: ./minidrama.oss.env
+        required: false
+      - path: ./.prod.env
+        required: false
+    environment:
+      - NODE_ENV=production
+      - PORT=5679
+      - APP_REVISION=${APP_REVISION:-local}
+      # Legacy MINIDRAMA_OSS_* values are mapped by config at runtime.
+      # Do not inject CFG_STORAGE defaults here: Compose interpolation happens
+      # before env_file is read and would otherwise force storage.type=local.
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:5679/ready',(r)=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      default: {}
+      # 加入 lens-rhyme 网络，使其 nginx 能通过容器名反代到本应用
+      lens-rhyme:
+        aliases:
+          - minidrama-app
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  lens-rhyme:
+    external: true
+    name: lens-rhyme_default

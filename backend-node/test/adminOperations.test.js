@@ -1,0 +1,282 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { getDb, closeDb } = require('../src/db');
+const { runMigrationsAndEnsure } = require('../src/db/migrate');
+const operations = require('../src/services/adminOperationsService');
+const billing = require('../src/services/billingService');
+const reports = require('../src/services/operationsReportService');
+const adminRoutes = require('../src/routes/admin');
+
+function responseRecorder() {
+  return { statusCode: null, body: null, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; } };
+}
+
+test('admin high-impact production actions reject requests without confirmation metadata before querying a job', async () => {
+  const routes = adminRoutes({ prepare() { throw new Error('database must not be read before confirmation'); } });
+  const res = responseRecorder();
+  await routes.retryArchive({ body: {}, params: { id: '1' }, auth: { id: 1, role: 'admin' } }, res);
+  assert.equal(res.statusCode, 400);
+  assert.match(res.body.error.message, /确认/);
+});
+
+test('operations projections paginate video production and keep optional stages distinct from failures', () => {
+  const dbPath = path.join(os.tmpdir(), `lmd-operations-${Date.now()}.db`);
+  const db = getDb({ path: dbPath, type: 'sqlite' });
+  try {
+    runMigrationsAndEnsure(db);
+    const now = '2026-08-17T01:00:00.000Z';
+    db.prepare("INSERT INTO users (username,password_hash,role,is_active,created_at,updated_at) VALUES ('op-admin','x','admin',1,?,?)").run(now, now);
+    const userId = db.prepare("SELECT id FROM users WHERE username='op-admin'").get().id;
+    db.prepare("INSERT INTO video_generations (owner_user_id,model,status,provider_task_id,local_path,archive_status,error_msg,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)")
+      .run(userId, 'seedance', 'completed', 'provider-1', 'videos/one.mp4', 'pending', null, now, now);
+    const videoId = db.prepare('SELECT id FROM video_generations').get().id;
+    db.prepare("INSERT INTO media_archive_records (local_path,source_type,source_id,archive_status,archive_attempts,created_at,updated_at) VALUES (?,?,?,?,?,?,?)")
+      .run('videos/one.mp4', 'video_generation', videoId, 'pending', 2, now, now);
+    const list = operations.listProduction(db, { page: 1, page_size: 20, status: 'completed' });
+    assert.equal(list.total, 1);
+    assert.equal(list.items[0].stages.find((stage) => stage.key === 'upscale').status, 'not_selected');
+    assert.equal(list.items[0].error_summary, null);
+    const detail = operations.productionDetail(db, videoId);
+    assert.equal(detail.provider_task_id, 'provider-1');
+    assert.equal(detail.archive_record_status, 'pending');
+    assert.equal(operations.listArchives(db, { status: 'pending' }).total, 1);
+    const overview = operations.overview(db, {});
+    assert.equal(overview.production.completed, 1);
+    assert.equal(overview.storage.find((item) => item.status === 'pending').count, 1);
+    const settings = operations.saveAlertSettings(db, { archive_failed_count: 2 });
+    assert.equal(settings.archive_failed_count, 2);
+    db.prepare("UPDATE media_archive_records SET archive_status='failed', archive_error=? WHERE id=1").run('archive, retry required');
+    assert.equal(operations.overview(db, {}).alerts.some((alert) => alert.key === 'archive_failed'), false);
+    operations.saveAlertSettings(db, { archive_failed_count: 1 });
+    assert.equal(operations.overview(db, {}).alerts.some((alert) => alert.key === 'archive_failed'), true);
+    const csv = operations.productionCsv(db, { status: 'completed' });
+    assert.match(csv, /^\uFEFFtask_id,username,project_title/);
+    assert.match(csv, /videos\/one\.mp4/);
+    const report = reports.recordDailyReport(db, new Date('2026-08-17T00:00:00.000Z'));
+    assert.equal(report.report_date, '2026-08-17');
+    assert.equal(reports.listReports(db, {}).total, 1);
+    reports.recordDailyReport(db, new Date('2026-08-17T03:00:00.000Z'));
+    assert.equal(reports.listReports(db, {}).total, 1);
+
+    db.prepare(`INSERT INTO billing_transactions
+      (id,user_id,type,amount_micro,balance_after_micro,frozen_after_micro,created_at)
+      VALUES (?,?,?,?,?,?,?)`).run('authorization-1', userId, 'authorization', 500000, 0, 500000, now);
+    db.prepare(`INSERT INTO billing_reconciliation_cases
+      (id,authorization_id,user_id,service_type,model,status,due_at,created_at)
+      VALUES (?,?,?,?,?,?,?,?)`).run('reconciliation-1', 'authorization-1', userId, 'video', 'seedance', 'pending', now, now);
+    const reconciliations = billing.pagedReconciliationCases(db, { page: 1, page_size: 10, status: 'pending', model: 'seedance' });
+    assert.equal(reconciliations.total, 1);
+    assert.equal(reconciliations.items[0].frozen_amount, 50);
+  } finally {
+    closeDb();
+    for (const suffix of ['', '-wal', '-shm']) try { fs.unlinkSync(dbPath + suffix); } catch (_) {}
+  }
+});
+
+test('failed production detail returns the immutable prompt and material reproduction snapshot', () => {
+  const dbPath = path.join(os.tmpdir(), `lmd-production-reproduction-${Date.now()}.db`);
+  let db = getDb({ path: dbPath, type: 'sqlite' });
+  try {
+    runMigrationsAndEnsure(db);
+    const now = '2026-09-02T02:00:00.000Z';
+    db.prepare("INSERT INTO users (username,password_hash,role,is_active,created_at,updated_at) VALUES ('replay-admin','x','admin',1,?,?)").run(now, now);
+    const ownerId = db.prepare("SELECT id FROM users WHERE username='replay-admin'").get().id;
+    const dramaId = Number(db.prepare("INSERT INTO dramas (title,owner_user_id,created_at,updated_at) VALUES ('复现项目',?,?,?)").run(ownerId, now, now).lastInsertRowid);
+    const episodeId = Number(db.prepare("INSERT INTO episodes (drama_id,episode_number,title,created_at,updated_at) VALUES (?,1,'第一集',?,?)").run(dramaId, now, now).lastInsertRowid);
+    const storyboardId = Number(db.prepare("INSERT INTO storyboards (episode_id,storyboard_number,title,status,created_at,updated_at) VALUES (?,1,'失败镜头','failed',?,?)").run(episodeId, now, now).lastInsertRowid);
+    const assetId = Number(db.prepare("INSERT INTO assets (drama_id,owner_user_id,name,type,local_path,created_at,updated_at) VALUES (?,?,'角色参考','image','projects/replay/role.png',?,?)").run(dramaId, ownerId, now, now).lastInsertRowid);
+    const videoId = Number(db.prepare(`INSERT INTO video_generations
+      (drama_id,storyboard_id,owner_user_id,provider,prompt,model,duration,aspect_ratio,resolution,status,error_msg,created_at,updated_at)
+      VALUES (?,?,?,'chatfire','实际提交提示词','seedance-replay',8,'16:9','720p','failed','供应商拒绝',?,?)`).run(dramaId, storyboardId, ownerId, now, now).lastInsertRowid);
+    const requestSnapshot = {
+      original_prompt: '用户完整提示词 @角色参考', prompt: '实际提交提示词',
+      prompt_document: { text: '用户完整提示词 @角色参考', refs: [{ asset_id: assetId, alias: '角色参考' }] },
+      model: 'seedance-replay', creation_mode: 'multi_reference', duration: 8,
+      aspect_ratio: '16:9', resolution: '720p', audio_strategy: 'reference_only',
+      post_process: { keep_original_audio: false, audio_volume: 1, audio_fade_seconds: 0 },
+    };
+    const jobId = Number(db.prepare(`INSERT INTO omni_video_jobs
+      (video_generation_id,owner_user_id,prompt,model_requested,model_resolved,request_snapshot_json,storyboard_id,created_at,updated_at)
+      VALUES (?,?,?,'seedance-replay','seedance-replay',?,?,?,?)`).run(videoId, ownerId, '实际提交提示词', JSON.stringify(requestSnapshot), storyboardId, now, now).lastInsertRowid);
+    db.prepare(`INSERT INTO omni_video_job_assets
+      (omni_job_id,asset_id,ordinal,alias,media_type,role,usage,send_to_model,snapshot_json,created_at)
+      VALUES (?,?,1,'角色参考','image','reference','reference',1,?,?)`).run(jobId, assetId, JSON.stringify({ asset_id: assetId, alias: '角色参考', type: 'image', local_path: 'projects/replay/role.png', send_to_model: true }), now);
+    db.prepare('UPDATE assets SET local_path=? WHERE id=?').run('projects/replay/current-role.png', assetId);
+    db.prepare(`INSERT INTO omni_video_job_assets
+      (omni_job_id,asset_id,ordinal,alias,media_type,role,usage,send_to_model,snapshot_json,created_at)
+      VALUES (?,NULL,2,'远程临时参考','image','reference','reference',1,?,?)`).run(jobId, JSON.stringify({ alias: '远程临时参考', type: 'image', url: 'https://supplier.example/signed.png' }), now);
+
+    const detail = operations.productionDetail(db, videoId);
+    assert.equal(detail.reproduction.prompt, '用户完整提示词 @角色参考');
+    assert.equal(detail.reproduction.provider_prompt, '实际提交提示词');
+    assert.equal(detail.reproduction.settings.model, 'seedance-replay');
+    assert.equal(detail.reproduction.materials[0].asset_id, assetId);
+    assert.equal(detail.reproduction.materials[0].local_path, 'projects/replay/role.png');
+    assert.equal(detail.reproduction.materials[0].send_to_model, true);
+    assert.equal(detail.reproduction.materials[1].local_path, null);
+    assert.equal(detail.reproduction.materials[1].available, false);
+    assert.equal(detail.reproduction.unavailable_material_count, 1);
+    assert.equal(detail.reproduction.can_open_workbench, true);
+    assert.equal(detail.reproduction.episode_id, episodeId);
+
+    closeDb();
+    db = getDb({ path: dbPath, type: 'sqlite' });
+    const restored = operations.productionDetail(db, videoId);
+    assert.equal(restored.reproduction.prompt, '用户完整提示词 @角色参考');
+    assert.equal(restored.reproduction.materials[0].local_path, 'projects/replay/role.png');
+    db.prepare('UPDATE storyboards SET deleted_at=? WHERE id=?').run(now, storyboardId);
+    assert.equal(operations.productionDetail(db, videoId).reproduction.can_open_workbench, true);
+  } finally {
+    closeDb();
+    for (const suffix of ['', '-wal', '-shm']) try { fs.unlinkSync(dbPath + suffix); } catch (_) {}
+  }
+});
+
+test('operations action queue excludes failed attempts replaced by a later successful retry', () => {
+  const dbPath = path.join(os.tmpdir(), `lmd-operations-retry-${Date.now()}.db`);
+  const db = getDb({ path: dbPath, type: 'sqlite' });
+  try {
+    runMigrationsAndEnsure(db);
+    const before = '2026-09-01T01:00:00.000Z';
+    const after = '2026-09-01T02:00:00.000Z';
+    db.prepare("INSERT INTO users (username,password_hash,role,is_active,created_at,updated_at) VALUES ('retry-owner','x','user',1,?,?)").run(before, before);
+    const ownerId = db.prepare("SELECT id FROM users WHERE username='retry-owner'").get().id;
+    const failedStoryboard = Number(db.prepare("INSERT INTO video_generations (owner_user_id,storyboard_id,model,status,error_msg,created_at,updated_at) VALUES (?,101,'seedance','failed','old failure',?,?)").run(ownerId, before, before).lastInsertRowid);
+    db.prepare("INSERT INTO video_generations (owner_user_id,storyboard_id,model,status,created_at,updated_at) VALUES (?,101,'seedance','completed',?,?)").run(ownerId, after, after);
+    const failedLegacy = Number(db.prepare("INSERT INTO video_generations (owner_user_id,model,prompt,status,error_msg,created_at,updated_at) VALUES (?,'seedance','legacy retry prompt','failed','old legacy failure',?,?)").run(ownerId, before, before).lastInsertRowid);
+    db.prepare("INSERT INTO video_generations (owner_user_id,model,prompt,status,created_at,updated_at) VALUES (?,'seedance','legacy retry prompt','completed',?,?)").run(ownerId, after, after);
+    const failedLegacyEdited = Number(db.prepare("INSERT INTO video_generations (owner_user_id,model,prompt,status,error_msg,created_at,updated_at) VALUES (?,'seedance-pro','draft before retry','failed','old edited failure','2026-09-01T03:00:00.000Z','2026-09-01T03:00:00.000Z')").run(ownerId).lastInsertRowid);
+    db.prepare("INSERT INTO video_generations (owner_user_id,model,prompt,status,created_at,updated_at) VALUES (?,'seedance-pro','edited retry prompt','completed','2026-09-01T03:12:00.000Z','2026-09-01T03:12:00.000Z')").run(ownerId);
+    const unrelatedFailure = Number(db.prepare("INSERT INTO video_generations (owner_user_id,storyboard_id,model,status,error_msg,created_at,updated_at) VALUES (?,202,'seedance','failed','still failed',?,?)").run(ownerId, after, after).lastInsertRowid);
+
+    const actionIds = operations.overview(db, {}).action_queue.map((item) => item.id);
+    assert.equal(actionIds.includes(failedStoryboard), false);
+    assert.equal(actionIds.includes(failedLegacy), false);
+    assert.equal(actionIds.includes(failedLegacyEdited), false);
+    assert.equal(actionIds.includes(unrelatedFailure), true);
+  } finally {
+    closeDb();
+    for (const suffix of ['', '-wal', '-shm']) try { fs.unlinkSync(dbPath + suffix); } catch (_) {}
+  }
+});
+
+test('billing ledgers filter by Shanghai calendar day and user role without changing user scope', () => {
+  const dbPath = path.join(os.tmpdir(), `lmd-billing-ledger-filters-${Date.now()}.db`);
+  const db = getDb({ path: dbPath, type: 'sqlite' });
+  try {
+    runMigrationsAndEnsure(db);
+    const created = '2026-08-17T00:00:00.000Z';
+    db.prepare("INSERT INTO users (username,password_hash,role,is_active,created_at,updated_at) VALUES ('ledger-admin','x','admin',1,?,?)").run(created, created);
+    db.prepare("INSERT INTO users (username,password_hash,display_name,role,is_active,created_at,updated_at) VALUES ('ledger-user','x','账本用户','user',1,?,?)").run(created, created);
+    const adminId = db.prepare("SELECT id FROM users WHERE username='ledger-admin'").get().id;
+    const userId = db.prepare("SELECT id FROM users WHERE username='ledger-user'").get().id;
+    const insertTransaction = db.prepare('INSERT INTO billing_transactions (id,user_id,type,amount_micro,balance_after_micro,frozen_after_micro,created_at) VALUES (?,?,?,?,?,?,?)');
+    insertTransaction.run('ledger-admin-17', adminId, 'adjustment', 100000, 100000, 0, '2026-08-17T00:00:00.000Z');
+    insertTransaction.run('ledger-user-17', userId, 'adjustment', 100000, 100000, 0, '2026-08-17T15:59:59.999Z');
+    insertTransaction.run('ledger-user-18', userId, 'adjustment', 100000, 200000, 0, '2026-08-17T16:00:00.000Z');
+    const insertUsage = db.prepare('INSERT INTO billing_usage_logs (id,user_id,transaction_id,authorization_id,service_type,model,usage_json,charged_micro,snapshot_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)');
+    insertUsage.run('usage-admin-17', adminId, 'ledger-admin-17', 'auth-admin-17', 'video', 'seedance', '{}', 100000, '{}', '2026-08-17T00:00:00.000Z');
+    insertUsage.run('usage-user-17', userId, 'ledger-user-17', 'auth-user-17', 'video', 'seedance', '{}', 100000, '{}', '2026-08-17T15:59:59.999Z');
+    insertUsage.run('usage-user-18', userId, 'ledger-user-18', 'auth-user-18', 'video', 'seedance', '{}', 100000, '{}', '2026-08-17T16:00:00.000Z');
+
+    const userTransactions = billing.pagedTransactions(db, { page: 1, page_size: 20, role: 'user', date_from: '2026-08-17', date_to: '2026-08-17' });
+    assert.equal(userTransactions.total, 1);
+    assert.equal(userTransactions.items[0].username, 'ledger-user');
+    const adminUsage = billing.pagedUsage(db, { page: 1, page_size: 20, role: 'admin', date_from: '2026-08-17', date_to: '2026-08-17' });
+    assert.equal(adminUsage.total, 1);
+    assert.equal(adminUsage.items[0].username, 'ledger-admin');
+    const userUsage = billing.pagedUsage(db, { page: 1, page_size: 20, role: 'user', date_from: '2026-08-17', date_to: '2026-08-17' });
+    assert.equal(userUsage.items[0].display_name, '账本用户');
+    assert.equal(billing.listTransactions(db, { user_id: userId, role: 'admin', date_from: '2026-08-17', date_to: '2026-08-17' }).length, 0);
+  } finally {
+    closeDb();
+    for (const suffix of ['', '-wal', '-shm']) try { fs.unlinkSync(dbPath + suffix); } catch (_) {}
+  }
+});
+
+test('historical unassigned usage provides a filter-scoped owner and source overview', () => {
+  const dbPath = path.join(os.tmpdir(), `lmd-historical-usage-${Date.now()}.db`);
+  const db = getDb({ path: dbPath, type: 'sqlite' });
+  try {
+    runMigrationsAndEnsure(db);
+    const created = '2026-08-17T00:00:00.000Z';
+    db.prepare("INSERT INTO users (username,password_hash,display_name,role,is_active,created_at,updated_at) VALUES ('history-a','x','历史甲','user',1,?,?)").run(created, created);
+    db.prepare("INSERT INTO users (username,password_hash,display_name,role,is_active,created_at,updated_at) VALUES ('history-b','x','历史乙','user',1,?,?)").run(created, created);
+    const userA = db.prepare("SELECT id FROM users WHERE username='history-a'").get().id;
+    const userB = db.prepare("SELECT id FROM users WHERE username='history-b'").get().id;
+    const insertUsage = db.prepare('INSERT INTO billing_usage_logs (id,user_id,drama_id,source_kind,service_type,model,usage_json,charged_micro,snapshot_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)');
+    insertUsage.run('history-a-17', userA, null, 'tool_run', 'image', 'model-a', '{}', 100000, '{}', '2026-08-17T01:00:00.000Z');
+    insertUsage.run('history-b-17', userB, null, 'omni_video', 'video', 'model-b', '{}', 300000, '{}', '2026-08-17T02:00:00.000Z');
+    insertUsage.run('history-a-18', userA, null, 'tool_run', 'image', 'model-a', '{}', 900000, '{}', '2026-08-18T01:00:00.000Z');
+
+    const overview = billing.unassignedProjectUsage(db, { date_from: '2026-08-17', date_to: '2026-08-17' });
+    assert.equal(overview.summary.records, 2);
+    assert.equal(overview.summary.users, 2);
+    assert.equal(overview.summary.charged, 40);
+    assert.equal(overview.by_user[0].display_name, '历史乙');
+    assert.equal(overview.by_user[0].charged, 30);
+    assert.equal(overview.by_source.find((row) => row.source_kind === 'tool_run').charged, 10);
+    assert.equal(overview.items.length, 2);
+
+    const projectPage = billing.projectUsage(db, { date_from: '2026-08-17', date_to: '2026-08-17' });
+    assert.equal(projectPage.historical_unassigned.charged, 40);
+  } finally {
+    closeDb();
+    for (const suffix of ['', '-wal', '-shm']) try { fs.unlinkSync(dbPath + suffix); } catch (_) {}
+  }
+});
+
+test('LAS operations projection exposes duration, failure phase and TOS transit usage', () => {
+  const dbPath = path.join(os.tmpdir(), `lmd-operations-las-${Date.now()}.db`);
+  const db = getDb({ path: dbPath, type: 'sqlite' });
+  try {
+    runMigrationsAndEnsure(db);
+    const auth = require('../src/services/authService');
+    const admin = auth.ensureBootstrapAdmin(db, { info() {}, warn() {}, error() {} });
+    const user = auth.createUser(db, { username: 'las-viewer', password: 'test-password' }, admin.id);
+    db.prepare('INSERT INTO dramas (id, owner_user_id, title, created_at, updated_at) VALUES (7,?,?,?,?)').run(user.id, 'LAS 项目', '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z');
+    db.prepare(`INSERT INTO assets (id, drama_id, owner_user_id, name, type, local_path, created_at, updated_at) VALUES (1,7,?,?,'video','input/x.mp4',?,?)`)
+      .run(user.id, '原片', '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z');
+    const insert = db.prepare(`INSERT INTO las_media_jobs(id,owner_user_id,drama_id,source_asset_id,idempotency_key,stage,input_json,status,submitted_at,completed_at,error_msg,tos_objects_json,tos_cleanup_at,tos_cleanup_attempts,tos_policy,created_at,updated_at)
+      VALUES(?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    insert.run('job-done', user.id, 7, 'k1', 'inpaint', JSON.stringify({ stage: 'inpaint', model_level: 'pro' }), 'completed',
+      '2026-09-01T00:01:00.000Z', '2026-09-01T00:11:00.000Z', null, JSON.stringify({ input: { bytes: 1048576 }, output_bytes: 2097152 }), '2026-09-01T00:11:05.000Z', 0, 'cleanup', '2026-09-01T00:00:00.000Z', '2026-09-01T00:11:05.000Z');
+    insert.run('job-provider-fail', user.id, 7, 'k2', 'translate', JSON.stringify({ stage: 'translate', output_language: 'en-US' }), 'failed',
+      '2026-09-01T01:00:00.000Z', null, 'LAS 任务失败：business_code=50001', null, null, 0, 'cleanup', '2026-09-01T01:00:00.000Z', '2026-09-01T01:20:00.000Z');
+    insert.run('job-legacy', user.id, 7, 'k3', 'inpaint', JSON.stringify({ stage: 'inpaint', model_level: 'lite' }), 'completed',
+      null, null, null, JSON.stringify({ input: { bytes: 4096 } }), null, 0, null, '2026-09-01T02:00:00.000Z', '2026-09-01T02:30:00.000Z');
+    insert.run('job-reconcile', user.id, 7, 'k4', 'inpaint', JSON.stringify({ stage: 'inpaint', model_level: 'lite' }), 'reconciliation',
+      '2026-09-01T03:00:00.000Z', null, 'LAS 提交结果不确定', null, null, 0, 'cleanup', '2026-09-01T03:00:00.000Z', '2026-09-01T03:05:00.000Z');
+
+    const page = operations.listLas(db, { page_size: 50 });
+    assert.equal(page.total, 4);
+    const byId = new Map(page.items.map((item) => [item.id, item]));
+    assert.equal(byId.get('job-done').provider_elapsed_ms, 10 * 60 * 1000);
+    assert.equal(byId.get('job-done').transit_bytes, 1048576 + 2097152);
+    assert.equal(byId.get('job-done').tos_policy, 'cleanup');
+    assert.equal(byId.get('job-done').failure_phase, null);
+    assert.equal(byId.get('job-provider-fail').failure_phase, 'provider');
+    assert.equal(byId.get('job-reconcile').failure_phase, 'reconcile');
+    assert.equal(byId.get('job-legacy').tos_policy, null);
+    assert.equal(byId.get('job-provider-fail').username, 'las-viewer');
+    assert.equal(byId.get('job-done').project_title, 'LAS 项目');
+    assert.equal(byId.get('job-done').model_level, 'pro');
+
+    const summary = operations.lasSummary(db);
+    assert.equal(summary.total, 4);
+    assert.equal(summary.completed, 2);
+    assert.equal(summary.failed, 1);
+    assert.equal(summary.reconciling, 1);
+    assert.equal(summary.pending_transit_bytes, 0, '历史对象不计入待清理');
+    assert.equal(summary.history_transit_bytes, 4096, '历史保留占用仍要可见');
+    assert.equal(summary.average_provider_ms, 10 * 60 * 1000);
+    assert.equal(summary.failure_phases.provider, 1);
+    assert.equal(summary.failure_phases.reconcile, 1);
+  } finally {
+    closeDb();
+    for (const suffix of ['', '-wal', '-shm']) try { fs.unlinkSync(dbPath + suffix); } catch (_) {}
+  }
+});

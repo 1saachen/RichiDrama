@@ -1,0 +1,64 @@
+name: Preview Cleanup
+
+on:
+  pull_request_target:
+    types: [closed]
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: preview-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    if: vars.ENABLE_SERVER_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Remove closed PR preview
+        if: github.event_name == 'pull_request_target'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: root
+          key: ${{ secrets.SERVER_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          script: |
+            if [ -f /data/apps/LocalMiniDrama/deploy/preview-remove ]; then
+              bash /data/apps/LocalMiniDrama/deploy/preview-remove '${{ github.event.pull_request.number }}'
+            else
+              bash /usr/local/lib/richidrama-preview/preview-remove '${{ github.event.pull_request.number }}'
+            fi
+      - name: Mark closed PR preview deployments inactive
+        if: ${{ always() && github.event_name == 'pull_request_target' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          ids="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/deployments?environment=preview&sha=${SHA}" --jq '.[].id')"
+          # auto_inactive=false: deactivating this PR's records must not also
+          # deactivate other open PRs' preview deployments.
+          for deployment_id in $ids; do
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/deployments/${deployment_id}/statuses" -f state=inactive -f auto_inactive=false >/dev/null
+          done
+      - name: Remove expired previews
+        if: github.event_name != 'pull_request_target'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: root
+          key: ${{ secrets.SERVER_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          script: |
+            if [ -f /data/apps/LocalMiniDrama/deploy/preview-cleanup ]; then
+              bash /data/apps/LocalMiniDrama/deploy/preview-cleanup
+            else
+              bash /usr/local/lib/richidrama-preview/preview-cleanup
+            fi

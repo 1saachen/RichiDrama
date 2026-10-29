@@ -1,0 +1,155 @@
+name: PR Preview
+
+# Previews chain after Validation (validation -> preview): the smoke deploy
+# runs only once the Validation run for the same head commit has succeeded.
+# workflow_run always resolves this file from the default branch and
+# attributes the run to main, so the deployment record cannot be a job-level
+# `environment:` (it would anchor to main and PR pages would report the
+# branch as never deployed); the workflow creates it against the PR head
+# branch explicitly.
+on:
+  workflow_run:
+    workflows: [Validation]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open internal PR number
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  deployments: write
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: preview-${{ github.event.workflow_run.head_branch || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: >-
+      vars.ENABLE_SERVER_DEPLOY == 'true' &&
+      (
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch != 'main')
+      )
+    name: Deploy PR preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Resolve and validate internal PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+            data="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          else
+            # Validation approved exactly this commit; deploy only when an
+            # open internal PR is headed by it.
+            sha="$WORKFLOW_SHA"
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+            data="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/pulls" | \
+              jq -c --arg sha "$sha" '[.[] | select(.state == "open" and .base.ref == "main" and .head.sha == $sha)][0] // empty')"
+            [[ -n "$data" ]] || { echo 'No open internal PR is headed by the validated commit.' >&2; exit 1; }
+          fi
+          test "$(jq -r .state <<<"$data")" = open
+          test "$(jq -r .base.ref <<<"$data")" = main
+          test "$(jq -r .head.repo.full_name <<<"$data")" = "$GITHUB_REPOSITORY"
+          association="$(jq -r .author_association <<<"$data")"
+          [[ "$association" == MEMBER || "$association" == COLLABORATOR || "$association" == OWNER ]]
+          sha="$(jq -r .head.sha <<<"$data")"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          pr="$(jq -r .number <<<"$data")"
+          [[ "$pr" =~ ^[1-9][0-9]*$ ]]
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${sha}" -f state=pending -f context='preview / smoke' -f description='Preview deployment is running' -f "target_url=$RUN_URL" >/dev/null
+          # Anchor the deployment record to the PR head branch (see file
+          # header); the recorded sha must be the commit Validation approved.
+          branch="$(jq -r .head.ref <<<"$data")"
+          [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]]
+          payload="$(jq -cn --arg ref "$branch" '{ref:$ref,environment:"preview",auto_merge:false,required_contexts:[],production_environment:false}')"
+          response="$(printf '%s\n' "$payload" | gh api -X POST "repos/${GITHUB_REPOSITORY}/deployments" --input -)"
+          deployment_id="$(jq -r .id <<<"$response")"
+          [[ "$deployment_id" =~ ^[0-9]+$ ]]
+          [[ "$(jq -r .sha <<<"$response")" = "$sha" ]]
+          echo "deployment_id=$deployment_id" >> "$GITHUB_OUTPUT"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/deployments/${deployment_id}/statuses" -f state=in_progress -f auto_inactive=false >/dev/null
+      - name: Deploy isolated preview
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: root
+          key: ${{ secrets.SERVER_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          command_timeout: 40m
+          script: |
+            set -euo pipefail
+            sha='${{ steps.pr.outputs.sha }}'
+            pr='${{ steps.pr.outputs.pr }}'
+            repo='/data/apps/LocalMiniDrama'
+            incoming="/data/minidrama-incoming/${sha}.tar.gz"
+            bootstrap="/data/minidrama-bootstrap/${sha}"
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$pr" =~ ^[1-9][0-9]*$ ]]
+            test -d "$repo/.git"
+            mkdir -p /data/minidrama-incoming /data/minidrama-bootstrap
+            timeout 180s git -C "$repo" fetch --no-tags origin "refs/pull/${pr}/head"
+            test "$(git -C "$repo" rev-parse FETCH_HEAD)" = "$sha"
+            git -C "$repo" archive --format=tar.gz --output="$incoming" "$sha"
+            rm -rf "$bootstrap"
+            mkdir -p "$bootstrap"
+            tar -xzf "$incoming" -C "$bootstrap"
+            bash "$bootstrap/deploy/preview-deploy" "$pr" "$sha"
+      - name: Remove server-side source
+        if: always() && steps.pr.outputs.sha != ''
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: root
+          key: ${{ secrets.SERVER_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          script: |
+            set -euo pipefail
+            sha='${{ steps.pr.outputs.sha }}'
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+            incoming="/data/minidrama-incoming/${sha}.tar.gz"
+            bootstrap="/data/minidrama-bootstrap/${sha}"
+            [[ "$(realpath -m "$incoming")" == "/data/minidrama-incoming/${sha}.tar.gz" ]]
+            [[ "$(realpath -m "$bootstrap")" == "/data/minidrama-bootstrap/${sha}" ]]
+            rm -f -- "$incoming"
+            rm -rf -- "$bootstrap"
+      - name: Mark preview successful
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          DEPLOYMENT_ID: ${{ steps.pr.outputs.deployment_id }}
+          # Mirrors the HOST scheme in deploy/preview-deploy.
+          PREVIEW_URL: http://pr-${{ steps.pr.outputs.pr }}.preview.drama.richbest.cn/
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" -f state=success -f context='preview / smoke' -f description='Approved preview passed' -f "target_url=$RUN_URL" >/dev/null
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/deployments/${DEPLOYMENT_ID}/statuses" -f state=success -f auto_inactive=false -f "environment_url=$PREVIEW_URL" -f "log_url=$RUN_URL" >/dev/null
+      - name: Mark preview failed
+        if: ${{ !success() && steps.pr.outputs.sha != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          DEPLOYMENT_ID: ${{ steps.pr.outputs.deployment_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" -f state=failure -f context='preview / smoke' -f description='Preview deployment failed' -f "target_url=$RUN_URL" >/dev/null
+          if [[ -n "$DEPLOYMENT_ID" ]]; then
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/deployments/${DEPLOYMENT_ID}/statuses" -f state=failure -f auto_inactive=false -f "log_url=$RUN_URL" >/dev/null
+          fi

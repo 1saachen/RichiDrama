@@ -1,0 +1,913 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+
+const readSource = (relativePath) => readFile(new URL(relativePath, import.meta.url), 'utf8')
+
+test('自由创作导入防重复提交状态所需的 Vue API', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+
+  assert.match(source, /import \{[^}]*\breactive\b[^}]*\} from 'vue'/)
+  assert.match(source, /const retryingJobIds = reactive\(new Set\(\)\)/)
+})
+
+test('自由创作只渲染一个提示词编辑器', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+  const editorTags = source.match(/<OmniAssetPromptEditor\b/g) || []
+
+  assert.equal(editorTags.length, 1)
+  assert.match(source, /<div class="shot-script"[^>]*><OmniAssetPromptEditor\s+:key="activeShotId"\s+ref="promptEditorRef"\s+v-model="prompt"/)
+  assert.match(source, /class="insert-at-caret"/)
+  assert.match(source, /promptEditorRef\?\.insertAtCaret\(promptAssetFor\(asset\)\)/)
+  assert.match(source, /@keydown\.up\.prevent="selectRelative\(-1\)"/)
+  assert.match(source, /@keydown\.down\.prevent="selectRelative\(1\)"/)
+})
+
+test('维护者工作流保留一键入口、缺图报价和分镜实时刷新', async () => {
+  const [film, freeCreate, characters, scenes, props] = await Promise.all([
+    readSource('../src/views/FilmCreate.vue'),
+    readSource('../src/views/FreeCreate.vue'),
+    readSource('../src/composables/filmCreate/useCharacters.js'),
+    readSource('../src/composables/filmCreate/useScenes.js'),
+    readSource('../src/composables/filmCreate/useProps.js'),
+  ])
+
+  assert.match(film, /v-if="workflowStage === 'script'" class="section card pipeline-section"/)
+  assert.match(film, /const pipelinePanelExpanded = ref\(false\)/)
+  assert.doesNotMatch(film, /v-model="resourceImageModel"/)
+  assert.match(film, /批量上传至素材库/)
+  assert.match(film, /v-model="showResourceBatchImageDialog"/)
+  assert.match(film, /v-model="resourceBatchImageModel"/)
+  assert.match(film, /预计消耗 \{\{ resourceBatchImageQuote\.amount \}\} 积分/)
+  assert.match(film, /accountAPI\.quoteResourceImages/)
+  assert.match(film, /onGenerateCharacterImage\(item, model\)/)
+  assert.match(film, /onGenerateSceneImage\(item, sceneUseQuadGrid\.value, model\)/)
+  assert.match(film, /onGeneratePropImage\(item, propUseQuadGrid\.value, model\)/)
+  assert.match(film, /AI 生成分镜/)
+  assert.match(film, /每段\(秒\)/)
+  assert.match(film, /\.storyboard-stage-active \.workflow-shell\{[^}]*overflow:clip!important/)
+  assert.match(film, /freeCreateRef\.value/)
+  assert.match(freeCreate, /defineExpose\(\{ refreshProjectShots, refreshCollaboration \}\)/)
+  assert.match(characters, /characterAPI\.generateImage\(char\.id, model \|\| undefined/)
+  assert.match(scenes, /model: model \|\| undefined/)
+  assert.match(props, /propAPI\.generateImage\(prop\.id, model \|\| undefined/)
+})
+
+test('自由创作报价由后端按模型的有效计量单位计算', async () => {
+  const [source, apiSource] = await Promise.all([
+    readSource('../src/views/FreeCreate.vue'),
+    readSource('../src/api/omniVideo.js'),
+  ])
+
+  const quoteHandler = source.slice(source.indexOf('async function quoteCurrentRequest'), source.indexOf('function confirmSubmit'))
+  assert.match(apiSource, /request\.post\('\/omni-video-jobs\/quote', body\)/)
+  assert.match(quoteHandler, /model: currentCapability\.value\.model/)
+  assert.match(quoteHandler, /duration: normalizeDuration\(duration\.value\)/)
+  assert.match(source, /quoteHasVideoInput = computed\(\(\) => requestMaterialRouting\.value\.sent\.video > 0\)/)
+  assert.match(source, /quoteHasAudioInput = computed\(\(\) => requestMaterialRouting\.value\.sent\.audio > 0\)/)
+  assert.match(quoteHandler, /has_video_input: quoteHasVideoInput\.value/)
+  assert.match(quoteHandler, /has_audio: quoteHasAudioInput\.value/)
+  assert.doesNotMatch(quoteHandler, /usage:\s*\{\s*second:/)
+})
+
+test('共享标签栏自带跳转与创建逻辑，任何页面都能复用', async () => {
+  const [source, header, list, router] = await Promise.all([
+    readSource('../src/views/FilmList.vue'),
+    readSource('../src/components/ui/AppHeader.vue'),
+    readSource('../src/views/CreativeBoardList.vue'),
+    readSource('../src/router/index.js'),
+  ])
+
+  assert.match(source, /<AppHeader\s+active="projects"/)
+  // 标签栏不再依赖页面级事件处理器，换成查询参数交回首页执行。
+  assert.doesNotMatch(header, /defineEmits/)
+  assert.match(source, /function applyRouteIntent\(\)/)
+  assert.match(source, /router\.replace\(\{ path: '\/' \}\)/)
+  for (const command of ['project', 'omni', 'board', 'import', 'theme', 'deleted', 'config', 'account', 'logout']) {
+    assert.match(header, new RegExp(`command="${command}"`))
+  }
+  // 标签栏结构：项目、画布、素材、全能创作、AI 工具、运营。
+  assert.match(header, /@click="router\.push\('\/'\)">项目<\/button>/)
+  assert.match(header, /@click="router\.push\('\/creative-boards'\)">画布<\/button>/)
+  assert.match(header, /@click="startOmniProject\(router\)">全能创作<\/button>/)
+  assert.match(header, /to: '\/ai-tools\/reverse-prompt'/)
+  assert.match(header, /title: '视频本地化', group: '视频工作流', to: '\/ai-tools\/video-localization'/)
+  assert.match(header, /:command="tool\.to"/)
+  assert.match(header, /command="\/media-library"/)
+  // 画布有独立列表页，并复用同一个标签栏。
+  assert.match(router, /path: '\/creative-boards', name: 'creative-board-list'/)
+  assert.match(list, /<AppHeader active="boards"/)
+})
+
+test('自由创作素材上传区保留可识别的大图预览', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+
+  assert.match(source, /grid-template-columns:minmax\(300px,340px\) minmax\(0,1fr\) minmax\(280px,320px\)!important/)
+  assert.match(source, /\.material-pool\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)!important;gap:8px;max-height:264px\}/)
+  assert.match(source, /\.material-card\{height:auto!important;min-height:126px;display:grid;grid-template-rows:minmax\(94px,1fr\) auto\}/)
+})
+
+test('分镜生成操作保留 main 的紫色可用与禁用层级', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+
+  assert.match(source, /creation-generate-actions \.generate-button\.el-button--primary:not\(\.is-disabled\):not\(:disabled\)/)
+  assert.match(source, /creation-generate-actions \.generate-button\.el-button--primary\.is-disabled/)
+  assert.match(source, /border-color:color-mix\(in srgb,var\(--studio-accent\) 52%,var\(--border-color\)\)!important/)
+})
+
+test('镜头素材仅移出本镜，项目素材归档与全局解除引用分离', async () => {
+  const [filmSource, freeSource, librarySource, apiSource] = await Promise.all([
+    readSource('../src/views/FilmCreate.vue'),
+    readSource('../src/views/FreeCreate.vue'),
+    readSource('../src/views/MediaLibrary.vue'),
+    readSource('../src/api/omniVideo.js'),
+  ])
+
+  // 旧分镜工作台已删除；「移出本镜 vs 归档/解除」的分离由 FreeCreate 与 MediaLibrary 承载。
+  assert.doesNotMatch(filmSource, /sb-omni-material-delete/)
+  assert.match(freeSource, /class="material-delete"/)
+  assert.match(freeSource, /title="移出当前镜头"/)
+  assert.match(freeSource, /@click\.stop="remove\(asset\.id\)"/)
+  assert.match(freeSource, /当前镜头的“移出”是一个完整的镜头级动作/)
+  assert.match(freeSource, /refs: \(promptDocument\.value\?\.refs \|\| \[\]\)\.filter\(\(ref\) => Number\(ref\.asset_id\) !== Number\(id\)\)/)
+  assert.doesNotMatch(freeSource, /function deleteMaterialAsset/)
+  assert.match(freeSource, /!asset\.archived_at/)
+  assert.match(freeSource, /await omniVideoAPI\.linkProjectResource\(\{/)
+  assert.match(librarySource, /确定归档该素材/)
+  assert.match(librarySource, /一键归档/)
+  assert.match(librarySource, /从全部可编辑镜头解除并归档/)
+  assert.match(librarySource, /async function forceDetachItem/)
+  assert.match(apiSource, /forceDetachAsset\(id\)/)
+})
+
+test('角色资源卡和编辑器按图片、内容与底部操作分层', async () => {
+  const source = await readSource('../src/views/FilmCreate.vue')
+
+  const cardBranch = source.match(/<template v-else-if="resourceCatalogType === 'character'">(.+?)<\/template>/)?.[1] || ''
+  assert.match(cardBranch, /class="character-card-edit"[^>]*@click="openResourceEditor\(resourceCatalogType, item\)"/)
+  assert.match(cardBranch, /class="character-card-delete"[\s\S]*type="danger"[\s\S]*>删除<\/el-button>/)
+  // 资源浏览器是唯一管理面：上传图/认证/生成图必须在卡片直达；音色与试听仍只在编辑器内。
+  assert.match(cardBranch, /onUploadResourceClick/)
+  assert.match(cardBranch, /onSd2PrimaryAction/)
+  assert.match(cardBranch, /generateResourceCatalogItem/)
+  assert.doesNotMatch(cardBranch, /素材库|绑定音色|更换音色|试听/)
+  assert.match(source, /class="resource-hosting-status"/)
+  assert.match(source, /resourceHostingStatusClass\(item\)/)
+  assert.match(source, /class="ref-image-remove" aria-label="移除参考图"/)
+  assert.match(source, /@click\.stop="removeEditCharacterReferenceImage">×<\/button>/)
+  assert.match(source, /@click="onEditCharacterGenerateImage">生成角色图/)
+  assert.match(source, /\.ref-image-meta\{[^}]*flex-direction:column[^}]*align-items:flex-start/)
+  assert.match(source, /class="character-field-actions"[\s\S]*extractEditCharacterDescription/)
+  assert.match(source, /class="character-field-actions"[\s\S]*doGenerateCharacterPrompt/)
+  assert.match(source, /label="音色参考"[\s\S]*class="character-inline-control"/)
+  assert.match(source, /\.character-inline-control\{[^}]*align-items:flex-end[^}]*justify-content:space-between/)
+  assert.match(source, /class="character-editor-footer"/)
+  assert.match(source, /@opened="resetCharacterEditorScroll"/)
+  assert.match(source, /function resetCharacterEditorScroll\(\)[\s\S]*\.character-editor-dialog \.el-dialog__body/)
+  assert.match(source, /@click="onEditCharacterSd2Action">\{\{ sd2ActionLabel\(editCharacterForm\) \}\}/)
+  assert.match(source, /失败原因/)
+  assert.match(source, /绑定音色/)
+  assert.match(source, /音色已绑定/)
+  assert.match(source, /更换音色/)
+  assert.match(source, /试听/)
+  assert.match(source, /onSd2VoicePrimaryAction\(editCharacterForm\.value\)/)
+  assert.match(source, /onSd2VoiceReplace\(editCharacterForm\.value\)/)
+  assert.match(source, /\.resource-browser-select\{[^}]*background:transparent;box-shadow:none\}/)
+  assert.match(source, /\.resource-browser-card-actions\.character-card-actions\{justify-content:space-between/)
+  assert.match(source, /\.character-card-actions \.character-card-delete\{border-color:[^}]*background:[^}]*color:/)
+})
+
+test('统一资源浏览器的卡片操作会换行，资源页可纵向滚动', async () => {
+  const source = await readSource('../src/views/FilmCreate.vue')
+
+  assert.match(source, /\.resource-browser-card-actions\{display:flex;flex-wrap:wrap/)
+  assert.match(source, /\.resources-stage-active>\.main\{display:block;overflow-y:auto/)
+  assert.match(source, /\.resources-stage-active \.resource-browser-grid\{min-height:15rem;max-height:min\(52dvh,34rem\);overflow:auto\}/)
+})
+
+test('提示词富文本编辑器优先处理滚轮，不被工作台外层取消', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+
+  assert.match(source, /textarea\.el-textarea__inner, \.prompt-rich-editor/)
+  assert.match(source, /panel\.scrollHeight <= panel\.clientHeight/)
+})
+
+test('提示词引用使用稳定素材别名并展示更清晰的缩略图', async () => {
+  const [workbench, editor] = await Promise.all([
+    readSource('../src/views/FreeCreate.vue'),
+    readSource('../src/components/OmniAssetPromptEditor.vue'),
+  ])
+
+  assert.match(workbench, /function assetDisplayName\(asset\)/)
+  assert.match(workbench, /legacy_aliases: assetLegacyAliases\(asset\)/)
+  assert.match(workbench, /:assets="promptAssets"/)
+  assert.match(workbench, /:reference-document="promptDocument"/)
+  assert.match(editor, /referenceDocument/)
+  assert.match(editor, /function assetMatchesAlias\(asset, alias\)/)
+  assert.match(editor, /width:30px; height:30px/)
+})
+
+test('提示词引用只解析当前镜头工作集，不能借用其他镜头素材', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+
+  assert.match(source, /<OmniAssetPromptEditor[\s\S]*:assets="promptAssets"/)
+  assert.match(source, /项目库素材必须先“加入本镜”/)
+})
+
+test('新建项目镜头先切换到服务端返回的空素材工作集', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+
+  assert.match(source, /const newShot = projectShot\(shot\)/)
+  assert.match(source, /shots\.value = list\s*loadShot\(newShot\)\s*await persistShotOrder\(list\)/)
+  assert.match(source, /不能在排序、视频列表等[\s\S]*错误显示“已加入本镜”/)
+})
+
+test('统一资源中心以可搜索的单一资源浏览器代替三列长列表', async () => {
+  const source = await readSource('../src/views/FilmCreate.vue')
+
+  for (const marker of [
+    'class="resource-browser-tabs"',
+    'class="resource-browser"',
+    'const resourceCatalogTabs = computed',
+    'const filteredResourceCatalogItems = computed',
+    '搜索${resourceCatalogMeta.label}名称或描述',
+    'key: \'with-image\'',
+    'key: \'missing-image\'',
+    'class="resource-browser-grid"',
+  ]) {
+    assert.ok(source.includes(marker), `missing resource browser marker: ${marker}`)
+  }
+  assert.match(source, /项目素材.*分镜中按需加入/)
+  assert.match(source, /\.resource-center-grid,\.resource-media-library\{display:none\}/)
+})
+
+test('分镜素材区默认只展示本镜工作集，项目素材通过检索面板按需加入', async () => {
+  const [source, libraryDialog] = await Promise.all([
+    readSource('../src/views/FreeCreate.vue'),
+    readSource('../src/components/ProjectAssetLibraryDialog.vue'),
+  ])
+
+  assert.match(source, /v-for="asset in chosenAssets"/)
+  assert.match(source, /current-shot-material-pool/)
+  assert.match(source, /projectLibraryOpen = ref\(false\)/)
+  assert.match(source, /<ProjectAssetLibraryDialog/)
+  assert.match(source, /const filteredProjectLibraryAssets = computed/)
+  assert.match(source, /:assets="filteredProjectLibraryAssets"/)
+  assert.match(libraryDialog, /点击素材加入或移出本镜/)
+  assert.match(libraryDialog, /v-for="asset in assets"/)
+  assert.match(libraryDialog, /project-asset-library-grid/)
+})
+
+test('视频素材缩略图失败时回退到视频首帧或占位图', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+
+  assert.match(source, /assetThumbnailFailed\(asset\)/)
+  assert.match(source, /markAssetThumbnailFailed\(asset\)/)
+  assert.match(source, /class="material-video-preview"/)
+  assert.match(source, /assetVideoPreviewFailed\(asset\)/)
+  assert.match(source, /markAssetVideoPreviewFailed\(asset\)/)
+  assert.match(source, /class="material-video-placeholder"/)
+})
+
+test('提示词引用只改变勾选态，不清空已加入本镜的素材', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+
+  assert.match(source, /勾选只代表提示词中的 @ 引用；本镜已加入素材由 selectedOrder 独立保存/)
+  assert.match(source, /selected\.value = new Set\(referencedIds\)/)
+  const handler = source.slice(source.indexOf('function setPromptReferences'), source.indexOf('function showCertificationError'))
+  assert.match(handler, /selected\.value = new Set\(referencedIds\)/)
+  assert.doesNotMatch(handler, /selectedOrder\.value/)
+  assert.match(source, /const referencedAssets = computed\(\(\) => chosenAssets\.value\.filter/)
+  assert.match(source, /v-for="asset in referencedAssets"/)
+})
+
+test('视频生成允许纯文本提示词并使用模型素材上限', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+  assert.doesNotMatch(source, /请先在提示词中插入至少一个\s*@\s*素材/)
+  assert.match(source, /total:\s*15,\s*image:\s*9,\s*video:\s*3,\s*audio:\s*3/)
+  assert.match(source, /creationMode\.value === 'first_last_frame'[\s\S]*\['first_frame', 'last_frame'\]\.includes\(asset\.usage\)/)
+})
+
+test('从项目素材库加入本镜不会自动改写提示词', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+  const handler = source.slice(source.indexOf('function toggleProjectLibraryAsset'), source.indexOf('function onMaterialCardClick'))
+
+  assert.match(handler, /addShotMaterial\(asset\)/)
+  assert.doesNotMatch(handler, /selected\.value\.add/)
+  assert.doesNotMatch(handler, /insertAtCaret/)
+})
+
+test('镜头素材集合从镜头保存的 assets 恢复，未引用素材不丢失', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+  const handler = source.slice(source.indexOf('function loadShot'), source.indexOf('async function loadShotHistory'))
+
+  assert.match(handler, /const materialIds = \(shot\.assets \|\| \[\]\)\.map/)
+  assert.match(handler, /selectedOrder\.value = \[\.\.\.new Set\(materialIds\)\]/)
+  assert.match(source, /:class="\{ selected: selected\.has\(asset\.id\), 'is-readonly': reproductionMode \}"/)
+})
+
+test('切换镜头时立即隔离上一镜头的生成记录', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+  const handler = source.slice(source.indexOf('function loadShot'), source.indexOf('async function loadShotHistory'))
+
+  assert.match(handler, /shotHistory\.value = \[\]/)
+  assert.match(handler, /shotHistoryShotId\.value = shot\.id/)
+  assert.match(source, /Number\(shotHistoryShotId\.value\) === Number\(currentShot\.value\?\.id\)/)
+  assert.doesNotMatch(source, /生成记录加载失败，已保留当前列表/)
+})
+
+test('工作台不以镜头时长重复模拟生成进度', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+
+  assert.match(source, /class="generation-progress"[^>]*role="status"/)
+  assert.match(source, /class="time-ruler" aria-label="镜头时长"><span>时长 \{\{ duration \}\} 秒<\/span><span>最多 \{\{ maxDuration \}\} 秒<\/span>/)
+  assert.doesNotMatch(source, /class="time-ruler"><span>0秒<\/span><div><i/)
+})
+
+test('主工作台使用真实媒体主舞台和可搜索创作档案而不是卡片墙', async () => {
+  const source = await readSource('../src/views/FilmList.vue')
+
+  for (const marker of [
+    'class="media-stage"',
+    'class="media-canvas"',
+    'class="records-panel"',
+    'class="record-search"',
+    'class="record-list"',
+    'class="media-filmstrip"',
+  ]) {
+    assert.ok(source.includes(marker), `missing redesigned project desk marker: ${marker}`)
+  }
+  assert.match(source, /const allRecords = computed/)
+  assert.match(source, /const filteredRecords = computed/)
+  assert.match(source, /omniVideoAPI\.assets\(\{ page: 1, page_size: 40 \}\)/)
+  assert.match(source, /videosAPI\.list\(\{ page: 1, page_size: 12, status: 'completed' \}\)/)
+  assert.match(source, /<template v-if="heroVideos\.length"><video v-for="video in heroVideos"/)
+  assert.match(source, /\.media-stage::before \{ content: none; \}/)
+  assert.match(source, /@click="openRecord\(record\)"/)
+  assert.match(source, /class="record-actions record-actions--panel"/)
+  assert.match(source, /@click\.stop="deleteRecord\(record\)"/)
+  // 创作记录必须覆盖三类创作：短剧、全能视频和纯画布。
+  assert.match(source, /type: 'board'/)
+  assert.match(source, /else if \(record\?\.type === 'board'\) router\.push\(`\/creative-boards\/\$\{record\.id\}`\)/)
+  assert.match(source, /record\?\.type === 'board'\) return deleteCreativeBoard\(record\.source\)/)
+  assert.doesNotMatch(source, /<div class="project-grid"/)
+  assert.doesNotMatch(source, /class="command-dock"/)
+  assert.match(source, /\.film-list \{ height: 100vh; height: 100dvh; min-height: 0; overflow: hidden; \}/)
+  assert.doesNotMatch(source, /records-scrim/)
+  assert.doesNotMatch(source, /\.records-workspace \{ position: fixed;/)
+  assert.match(source, /projects-wrap\.showing-records/)
+})
+
+test('workbench and media library expose the premium entry surfaces', async () => {
+  const [tools, library] = await Promise.all([
+    readSource('../src/views/AITools.vue'),
+    readSource('../src/views/MediaLibrary.vue'),
+  ])
+
+  assert.match(tools, /class="tool-manifesto"/)
+  assert.match(tools, /class="directory-list"/)
+  // 标题改为单行展示，不再强制换行。
+  assert.match(tools, /<h1>AI <em>工具箱<\/em><\/h1>/)
+  assert.match(tools, /manifesto-copy h1 \{[^}]*white-space:nowrap/)
+  assert.doesNotMatch(tools, /灵感不该|困在工具里/)
+  assert.doesNotMatch(tools, /class="tool-grid"/)
+  assert.match(library, /class="page-header library-header"/)
+  assert.match(library, /\{\{ projectDramaId \? '项目媒体素材库' : '媒体素材库' \}\}/)
+  assert.match(library, /上传素材/)
+  // 上传限制改为失败时按需提示，不再常驻占一行版面。
+  assert.doesNotMatch(library, /上传限制：图片/)
+  assert.match(library, /omniVideoAPI\.refreshAssetCertification/)
+  assert.match(library, /class="media-preview-dialog"/)
+  assert.match(library, /\.media-preview-dialog \.el-dialog__body\)[^}]*overflow-y: auto/)
+  assert.doesNotMatch(library, /ASSET ATLAS|SELECT A CAPABILITY|RICH MEDIA · AI STUDIO/)
+  assert.match(library, /Asset room: a full-height library rail/)
+})
+
+test('专项工具页沿用中文工作台标签和产品主色', async () => {
+  const [workbench, media] = await Promise.all([
+    readSource('../src/views/ToolWorkbench.vue'),
+    readSource('../src/views/ToolMediaGeneration.vue'),
+  ])
+
+  for (const marker of ['创作工具', "content:'创作输入'", "content:'运行历史'", "content:'生成结果'"]) {
+    assert.match(workbench, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  }
+  assert.doesNotMatch(workbench, /AI RUN STUDIO|INPUT DECK|RUN ARCHIVE|OUTPUT STAGE/)
+  assert.match(workbench, /<template v-else-if="kind === 'reverse_prompt'">[\s\S]*ToolAssetSelector/)
+  assert.doesNotMatch(workbench, /<template v-else><ToolAssetSelector/)
+  assert.match(media, /<h1 id="tool-title">\{\{ media === 'image' \? '生成单张图片' : '直接生成单个视频' \}\}<\/h1>/)
+  assert.match(media, /<h2>素材库<\/h2>/)
+  assert.match(media, /class="history-toggle"/)
+  assert.doesNotMatch(media, /OUTPUT PREVIEW/)
+})
+
+test('单视频工具直达生成并引用账号全部素材', async () => {
+  const [media, selector] = await Promise.all([
+    readSource('../src/views/ToolMediaGeneration.vue'),
+    readSource('../src/components/ToolAssetSelector.vue'),
+  ])
+
+  // 拖拽与 @ 能力由提示词编辑器承载，banner 只保留「无需项目」。
+  assert.match(media, /<li>无需项目<\/li>/)
+  assert.doesNotMatch(media, /支持 @ 素材|支持拖入素材/)
+  assert.match(media, /source_context: 'single_video_tool'/)
+  assert.match(media, /media === 'image' && !Number\(dramaId\.value\)/)
+  assert.match(media, /omniVideoAPI\.create\(\{/)
+  assert.match(media, /asset_selection_policy: 'all_selected'/)
+  assert.match(media, /creation_mode: mode\.value === 'first_last' \? 'first_last_frame' : 'multi_reference'/)
+  assert.match(media, /\['image', 'video', 'audio'\]/)
+  assert.match(media, /window\.setTimeout\(\(\) => load\(true\), 4000\)/)
+  assert.match(media, /omniVideoAPI\.list\(\{ tool_only: 1 \}\)/)
+  assert.match(media, /videosAPI\.list\(\{ page_size: 30, tool_only: 1 \}\)/)
+  assert.match(media, /history_kind: 'legacy'/)
+  assert.doesNotMatch(media, /label: '组生组图'|value: 'batch'/)
+  // 旧状态即使残留 batch，也必须继续按无参考素材提交，避免改变历史载荷语义。
+  assert.match(media, /mode\.value === 'text' \|\| mode\.value === 'batch'/)
+  assert.match(selector, /scope: 'project', drama_id: Number\(props\.dramaId\)/)
+  assert.match(selector, /scope: 'global'/)
+  assert.match(selector, /loadScope\(\{ scope: 'all', type, keyword \}\)/)
+  assert.match(selector, /可引用项目素材和个人素材/)
+  assert.match(selector, /drama_id: Number\(props\.dramaId\) \|\| undefined/)
+  assert.match(selector, /multiple/)
+  assert.match(selector, /Promise\.allSettled\(requests\)/)
+  assert.match(media, /historyKey\(featured\) === historyKey\(item\)/)
+  assert.match(media, /historyExpanded = ref\(false\)/)
+  assert.match(media, /featured\.value = null[\s\S]*created = await omniVideoAPI\.create/)
+  assert.match(media, /history_kind: 'omni'[\s\S]*await load\(true, submittedPreview\)/)
+  assert.match(media, /currentSubmissionKey = ref\(''\)/)
+  assert.match(media, /chooseToolMediaFeatured\(items\.value, \{/)
+  assert.match(media, /currentSubmissionKey: currentSubmissionKey\.value/)
+  assert.match(media, /currentSubmissionKey\.value = historyKey\(submittedPreview\)/)
+  assert.match(media, /video_model: getDefaultCapabilityModel\(capabilities\.value\)/)
+  assert.match(media, /activeStatuses\.has\(featured\.value\?\.status\)/)
+  assert.match(media, /\.featured\s*>\s*footer\s*\{[\s\S]*position:\s*static/)
+  assert.match(media, /grid-template-rows:\s*minmax\(0,\s*1fr\)\s*auto/)
+  assert.match(media, /OmniAssetPromptEditor/)
+  assert.match(media, /prompt_document: promptDocument\.value/)
+  assert.match(media, /include-generation-quote/)
+  assert.match(media, /:has-video-input="quoteHasVideoInput"/)
+  assert.match(media, /:has-audio-input="quoteHasAudioInput"/)
+  // 素材路由压缩为单行结果描述，适配层实现细节不再暴露给用户。
+  assert.match(media, /视频参考仅取画面帧，动作与节奏不会保留/)
+  assert.doesNotMatch(media, /平台接入：当前适配层/)
+  assert.match(media, /materialRouting\.value\.sent\.video > 0/)
+  assert.match(media, /@pick="onPromptAssetPick"/)
+  assert.match(selector, /beginAssetPointerDrag/)
+  assert.match(selector, /assets-loaded/)
+  assert.match(selector, /<article[\s\S]*role="button"[\s\S]*@pointerdown="promptDraggable && beginAssetPointerDrag\(\$event, asset\)"/)
+  assert.match(media, /:prompt-draggable="media === 'video'"/)
+  assert.match(selector, /@keydown\.enter\.prevent="select\(asset\)"/)
+  assert.match(media, /class="setup-grid"/)
+  assert.match(media, /\.setup-grid \{[\s\S]*grid-template-columns: minmax\(360px, \.8fr\) minmax\(0, 1\.2fr\)/)
+  assert.match(media, /class="output-grid" aria-label="生成规格与结果预览"/)
+  assert.match(media, /\.output-grid \{[\s\S]*grid-template-columns: minmax\(320px, \.58fr\) minmax\(0, 1\.42fr\)/)
+  assert.match(media, /\.spec-panel :deep\(\.generation-settings\) \{ grid-template-columns: minmax\(0, 1fr\); \}/)
+  assert.match(media, /\.spec-panel :deep\(\.ui-choice-field__panel\) \{[\s\S]*position: absolute/)
+  assert.match(selector, /<el-radio-button value="library">从项目素材库导入<\/el-radio-button>/)
+  assert.match(selector, /class="source-tabs"/)
+  assert.match(selector, /min-height: 44px/)
+  assert.match(selector, /source === 'library' \? label : '上传到素材库'/)
+  assert.match(selector, /上传后保存到个人素材库，可立即引用。/)
+  assert.doesNotMatch(selector, /我的全部素材（含项目素材）/)
+  assert.match(selector, /draggable="false"/)
+  assert.match(selector, /@dragstart\.prevent/)
+  assert.doesNotMatch(media, /历史默认折叠，减少页面干扰|@click="load">刷新/)
+  assert.match(media, /\.tool-content \{[\s\S]*display: grid/)
+  assert.doesNotMatch(media, /\.tool-content \{[^}]*grid-template-columns/)
+  assert.match(media, /downloadResult/)
+  assert.match((await readSource('../src/views/ToolWorkbench.vue')), /row-gap:1rem;[\s\S]*height:100%;[\s\S]*overflow:hidden/)
+})
+
+test('剧本工具仍要求项目，自由全能生成允许可选的计费归属项目', async () => {
+  const [workbench, media, freeCreate] = await Promise.all([
+    readSource('../src/views/ToolWorkbench.vue'),
+    readSource('../src/views/ToolMediaGeneration.vue'),
+    readSource('../src/views/FreeCreate.vue'),
+  ])
+
+  assert.match(workbench, /计费归属项目/)
+  assert.match(workbench, /dramaAPI\.list\(\{\s*page_size:\s*100\s*\}\)/)
+  assert.match(workbench, /drama_id:\s*Number\(dramaId\.value\)/)
+  assert.doesNotMatch(media, /source_context: 'single_video_tool',[^}]*drama_id:/)
+  assert.match(freeCreate, /计费归属项目（可选）/)
+  assert.match(freeCreate, /placeholder="不关联项目" aria-label="选择计费归属项目"/)
+  assert.match(freeCreate, /class="billing-project-field" aria-labelledby="billing-project-title"/)
+  assert.match(freeCreate, /仅用于账单归类；不选择也可生成。/)
+  assert.match(freeCreate, /\.\.\.\(optionalDramaId \? \{ drama_id: optionalDramaId \} : \{\}\)/)
+  assert.match(freeCreate, /:disabled="[^"]*!!sequence\?\.drama_id[^"]*"/)
+  assert.match(freeCreate, /if \(Number\(seq\?\.drama_id\)\) freeProjectId\.value = Number\(seq\.drama_id\)/)
+  assert.doesNotMatch(freeCreate, /请选择计费归属项目并补齐生成参数/)
+})
+
+test('film creation keeps an episode switcher in the global header', async () => {
+  const source = await readSource('../src/views/FilmCreate.vue')
+  assert.match(source, /class="header-episode-select"/)
+  assert.match(source, /aria-label="切换当前剧集"/)
+  assert.match(source, /@change="onEpisodeSelect"/)
+})
+
+test('brand marks and production summaries use the current product language', async () => {
+  const [freeCreate, filmList, admin, account] = await Promise.all([
+    readSource('../src/views/FreeCreate.vue'),
+    readSource('../src/views/FilmList.vue'),
+    readSource('../src/views/AdminConsole.vue'),
+    readSource('../src/views/AccountCenter.vue'),
+  ])
+  assert.match(freeCreate, /src="\/brand\/richi-logo-color\.png"/)
+  assert.doesNotMatch(freeCreate, /content:'◢'/)
+  assert.doesNotMatch(filmList, /content:'◢'/)
+  assert.match(admin, /latestExecutedStage\(row\)/)
+  assert.match(admin, /materialUsageLabel\(material\.usage\)/)
+  assert.doesNotMatch(admin, /素材可用于本地复现|打开制作台复现不会调用模型或产生计费/)
+  assert.match(account, /class="model-list" role="list"/)
+  assert.match(account, /max-width:none/)
+})
+
+test('generation settings keep configured model identifiers unchanged', async () => {
+  const source = await readSource('../src/components/GenerationSettings.vue')
+  // 展示名只来自模型目录；下拉的 value 仍是配置里的模型 id，前端不得内置厂商别名。
+  assert.match(source, /return modelLabel\(modelNames\.value, model\)/)
+  assert.match(source, /label: displayModelName\(item\.model\), description: item\.is_default \? '默认模型' : '', value: item\.model/)
+  assert.doesNotMatch(source, /Seedance .*标准版|可灵视频模型|万相视频模型|混元视频模型/)
+})
+
+test('generation settings use model capabilities to filter source resolutions', async () => {
+  const [source, config] = await Promise.all([
+    readSource('../src/components/GenerationSettings.vue'),
+    readSource('../src/components/AIConfigContent.vue'),
+  ])
+  assert.match(source, /selectedVideoCapability/)
+  assert.match(source, /limits\?\.resolutions/)
+  assert.match(source, /resolutionOptions = computed/)
+  assert.match(source, /当前模型不支持/)
+  assert.match(source, /需要 1080p 成片时可启用 AI 超分/)
+  assert.match(config, /"models":\{"模型 ID"/)
+  assert.doesNotMatch(config, /duration_seconds/)
+})
+
+test('generation settings use the selected model duration capability without broadening the fallback', async () => {
+  const [source, tool, filmCreate] = await Promise.all([
+    readSource('../src/components/GenerationSettings.vue'),
+    readSource('../src/views/ToolMediaGeneration.vue'),
+    readSource('../src/views/FilmCreate.vue'),
+  ])
+  assert.match(source, /limits\?\.duration\?\.max/)
+  assert.match(source, /modelMaxDuration/)
+  assert.match(tool, /<GenerationSettings[\s\S]*:max-duration="15"/)
+  assert.match(filmCreate, /<GenerationSettings[\s\S]*:max-duration="15"/)
+})
+
+test('generation settings hide aspect ratios that the selected model cannot use', async () => {
+  const source = await readSource('../src/components/GenerationSettings.vue')
+  assert.match(source, /limits\?\.aspect_ratios/)
+  assert.match(source, /aspectRatioOptions = computed/)
+  assert.match(source, /aspectRatioInvalid/)
+  assert.match(source, /当前模型不支持.*画幅/)
+})
+
+test('generation settings refresh the full video quote when billable inputs change', async () => {
+  const source = await readSource('../src/components/GenerationSettings.vue')
+  assert.match(source, /omniVideoAPI\.quoteBilling\(\{/)
+  assert.match(source, /videosAPI\.postprocessQuote\(\{/)
+  assert.match(source, /estimated_total_points: results\.reduce\(\(sum, item\) => sum \+ item\.points, 0\)/)
+  assert.match(source, /value\.value\.video_model[\s\S]*value\.value\.duration[\s\S]*value\.value\.resolution/)
+  assert.match(source, /props\.hasVideoInput[\s\S]*props\.hasAudioInput/)
+  assert.match(source, /const revision = \+\+quoteRevision[\s\S]*if \(props\.includeGenerationQuote && !includeGeneration\)/)
+})
+
+test('project storyboard generation settings include the video generation quote', async () => {
+  const [filmCreate, freeCreate] = await Promise.all([
+    readSource('../src/views/FilmCreate.vue'),
+    readSource('../src/views/FreeCreate.vue'),
+  ])
+  assert.match(filmCreate, /<GenerationSettings :model-value="projectGenerationSettings"[^>]*include-generation-quote/)
+  assert.match(filmCreate, /<FreeCreate[\s\S]*embedded/)
+  assert.match(freeCreate, /<GenerationSettings[\s\S]*include-generation-quote[\s\S]*:has-video-input="quoteHasVideoInput"[\s\S]*:has-audio-input="quoteHasAudioInput"/)
+  assert.match(freeCreate, /quoteHasVideoInput = computed\(\(\) => requestMaterialRouting\.value\.sent\.video > 0\)/)
+  assert.match(freeCreate, /quoteHasAudioInput = computed\(\(\) => requestMaterialRouting\.value\.sent\.audio > 0\)/)
+})
+
+test('运营页面始终提供单一路径返回', async () => {
+  const [consoleSource, reportsSource] = await Promise.all([
+    readSource('../src/views/AdminConsole.vue'),
+    readSource('../src/views/OperationsScale.vue'),
+  ])
+
+  // 运营台自身返回主页；告警报表返回运营台，不并排两个返回按钮。
+  assert.match(consoleSource, /返回主页/)
+  assert.match(reportsSource, /返回运营台/)
+  assert.match(reportsSource, /\$router\.push\('\/admin'\)/)
+  assert.doesNotMatch(reportsSource, /返回主页/)
+})
+
+test('运营账本提供日期和角色筛选，列表操作保持中性层级', async () => {
+  const source = await readSource('../src/views/AdminConsole.vue')
+
+  // 资金流水与模型用量共享同一条筛选工具栏，aria-label 使用中性表述。
+  assert.match(source, /aria-label="按日期筛选账务"/)
+  assert.match(source, /label="管理员" value="admin"/)
+  assert.match(source, /label="普通用户" value="user"/)
+  assert.match(source, /aria-label="按用户筛选"/)
+  assert.match(source, /filteredBillingUsers/)
+  assert.match(source, /billingUserLabel/)
+  assert.match(source, /user_id: null/)
+  assert.match(source, /billingFilterParams/)
+  assert.match(source, /filters\.billing\.user_id/)
+  assert.match(source, /class="balance-adjust-action"/)
+  assert.match(source, /\.balance-adjust-action\)\{padding:\.28rem/)
+})
+
+test('运营模型用量同时显示账号与显示名，避免把账号误认为用户名称', async () => {
+  const source = await readSource('../src/views/AdminConsole.vue')
+
+  assert.match(source, /<el-table-column prop="username" label="账号" min-width="110"\/>/)
+  assert.match(source, /<el-table-column prop="display_name" label="显示名" min-width="110"\/>/)
+  assert.match(source, /<el-table-column prop="display_name" label="显示名" min-width="100"\/>/)
+})
+
+test('运营价目表展示条件费率，支持审计带视频和不带视频输入', async () => {
+  const source = await readSource('../src/views/AdminConsole.vue')
+
+  // 审计实现字段（default_rate_id/来源/核验时间）不进入运营 UI，仅保留条件费率与计价说明。
+  assert.match(source, /label="条件费率"/)
+  assert.doesNotMatch(source, /默认命中：/)
+  assert.match(source, /has_video_input: \{ true: '带视频', false: '不带视频' \}/)
+  assert.match(source, /fps_tier: '帧率档'/)
+  assert.match(source, /pricing_note/)
+})
+
+test('运营后台支持查看和调整用户项目分组', async () => {
+  const source = await readSource('../src/views/AdminConsole.vue')
+
+  assert.match(source, /label="项目分组"/)
+  assert.match(source, /openUserGroup/)
+  assert.match(source, /saveUserGroup/)
+  assert.match(source, /adminAPI\.setTenantMember/)
+  assert.match(source, /使用所选分组绑定的 API 与价目表/)
+})
+
+test('创作账号不再加载运营专属 AI 配置资源，管理员可直达项目分组 API 设置', async () => {
+  const [film, filmList, config, header, admin] = await Promise.all([
+    readSource('../src/views/FilmCreate.vue'),
+    readSource('../src/views/FilmList.vue'),
+    readSource('../src/components/AIConfigContent.vue'),
+    readSource('../src/components/ui/AppHeader.vue'),
+    readSource('../src/views/AdminConsole.vue'),
+  ])
+
+  assert.match(film, /v-if="isAdmin" class="btn-ai-config"/)
+  assert.match(film, /v-if="isAdmin" v-model="showAiConfigDialog"/)
+  assert.match(film, /由项目分组统一配置/)
+  assert.match(filmList, /if \(!isAdmin\) return/)
+  assert.match(config, /user\?\.console_access !== true/)
+  assert.match(header, /command="group-settings"/)
+  assert.match(header, /项目分组 API/)
+  assert.match(admin, /route\.query\.settings === 'tenants'/)
+  assert.match(admin, /AI \/ SD2 配置/)
+  assert.match(admin, /:tenant-id="configTenant.id"/)
+})
+
+test('项目分组从专属 AI／SD2 页面维护默认配置，价目保存不覆盖绑定', async () => {
+  const [source, aiConfig] = await Promise.all([
+    readSource('../src/views/AdminConsole.vue'),
+    readSource('../src/components/AIConfigContent.vue'),
+  ])
+
+  assert.match(source, /AI \/ SD2 配置/)
+  assert.match(source, /:tenant-id="configTenant.id"/)
+  assert.match(source, /保存价目不会改动这些配置/)
+  assert.match(source, /ai_configs: \(tenant\.configs \|\| \[\]\)\.map/)
+  assert.match(source, /adminAPI\.updateTenant\(tenantForm\.id, \{ name: tenantForm\.name\.trim\(\) \}\)/)
+  assert.doesNotMatch(source, /v-model="tenantForm\.name" :disabled="!!tenantForm\.id"/)
+  assert.match(aiConfig, /const tenantId = computed/)
+  assert.match(aiConfig, /tenant_id: tenantId\.value/)
+})
+
+test('AI 配置编辑弹窗脱离父弹窗裁切并保持表单区域可滚动', async () => {
+  const source = await readSource('../src/components/AIConfigContent.vue')
+
+  assert.match(source, /class="config-editor-dialog"/)
+  assert.match(source, /width="min\(640px, calc\(100vw - 32px\)\)"/)
+  assert.match(source, /class="config-editor-dialog"[\s\S]*?append-to-body/)
+  assert.match(source, /\.config-editor-dialog\.el-dialog[\s\S]*?max-height: calc\(100dvh - 32px\)/)
+  assert.match(source, /\.config-editor-dialog \.el-dialog__body[\s\S]*?overflow-y: auto/)
+  assert.match(source, /\.config-editor-dialog \.el-dialog__footer[\s\S]*?flex: 0 0 auto/)
+})
+
+test('Richbest 配置使用官方素材库语义并保留兼容服务类型', async () => {
+  const source = await readSource('../src/components/AIConfigContent.vue')
+  assert.match(source, /<el-option label="素材库上传" value="jimeng2_character_auth" \/>/)
+  assert.match(source, /图片、视频或音频/)
+  assert.match(source, /一个角色可使用多份独立素材/)
+  assert.match(source, /configDisplayName\(row\)/)
+  assert.match(source, /Richbest 素材库上传/)
+  assert.doesNotMatch(source, /label="角色素材登记"/)
+})
+
+test('运营工作台把纵向滚动交给页面，表格只承接横向滚动', async () => {
+  const source = await readSource('../src/views/AdminConsole.vue')
+
+  assert.match(source, /:global\(body\)\{overflow-x:hidden!important;overflow-y:auto!important\}/)
+  assert.match(source, /\.console,\.console\.overview-mode,\.console\.workspace-mode\{height:auto!important;max-height:none!important;overflow:visible!important;overscroll-behavior:auto\}/)
+  assert.match(source, /\.overview-mode \.hero-grid>\.command-card,\.overview-mode \.dashboard-grid>\.command-card\{height:auto!important;max-height:none!important;overflow:visible!important\}/)
+  assert.match(source, /\.workspace-mode>\.workbench>\.table-scroll\{overflow-x:auto\}/)
+})
+
+test('账户和运营页面使用工作台层级而非传统驾驶舱卡片墙', async () => {
+  const [account, admin, trendChart] = await Promise.all([
+    readSource('../src/views/AccountCenter.vue'),
+    readSource('../src/views/AdminConsole.vue'),
+    readSource('../src/components/OperationsTrendChart.vue'),
+  ])
+
+  assert.match(account, /账户与用量/)
+  assert.match(account, /我的账户/)
+  assert.match(account, /class="account-header"/)
+  assert.match(account, /class="account-tabs"/)
+  assert.match(account, /Account workspace: calm ledger hierarchy/)
+  assert.match(admin, /<h1>运营工作台<\/h1>/)
+  assert.match(admin, /当前待办/)
+  assert.match(admin, /<OperationsTrendChart :trend="overview\?\.trend \|\| \[\]"/)
+  assert.match(trendChart, /近七日生产/)
+  assert.match(trendChart, /from 'echarts\/core'/)
+  assert.match(trendChart, /echarts\.init\(chartElement\.value/)
+  assert.match(admin, /Operations workspace: clear priorities/)
+  assert.match(admin, /在一屏内完成“发现问题、判断生产、进入处置”/)
+  assert.match(admin, /\.overview-mode \.trend-card :deep\(\.operations-echart\)\{height:11rem/)
+  assert.doesNotMatch(admin, /AI 漫剧运营驾驶舱/)
+})
+
+test('共享额度账单提供受控消费明细和资金流水双视图', async () => {
+  const [account, api] = await Promise.all([
+    readSource('../src/views/AccountCenter.vue'),
+    readSource('../src/api/account.js'),
+  ])
+
+  assert.match(account, /消费明细/)
+  assert.match(account, /资金流水/)
+  assert.match(account, /isOrganizationAdmin/)
+  assert.match(account, /usageFilters\.user_id/)
+  assert.match(account, /formatChinaDateTime\(row\.created_at\)/)
+  assert.match(account, /row\.display_name \|\| row\.username/)
+  assert.match(account, /row\.project_title_snapshot/)
+  assert.match(api, /usageMembers: \(\) => request\.get\('\/billing\/usage-members'\)/)
+})
+
+test('账户安全表单使用收缩安全布局并把冻结说明放入额度卡片', async () => {
+  const account = await readSource('../src/views/AccountCenter.vue')
+
+  assert.doesNotMatch(account, /账单怎么看/)
+  assert.match(account, /按实际用量结算；失败自动退还。/)
+  assert.match(account, /class="panel security-card security-card--password"/)
+  assert.match(account, /security-view \{ display:grid; grid-template-columns:1fr 1fr/)
+  assert.match(account, /security-form-fields--password/)
+  assert.doesNotMatch(account, /<el-form inline>/)
+})
+
+test('工作区在缩放时让舞台优先收缩，运营导航提供图标语义', async () => {
+  const [base, workspaces, admin, free, film] = await Promise.all([
+    readSource('../src/styles/base.css'),
+    readSource('../src/styles/workspaces.css'),
+    readSource('../src/views/AdminConsole.vue'),
+    readSource('../src/views/FreeCreate.vue'),
+    readSource('../src/views/FilmCreate.vue'),
+  ])
+
+  assert.match(base, /Zoom-safe baseline/)
+  assert.match(workspaces, /grid-template-columns: var\(--ui-rail-width\) minmax\(0, 1fr\) var\(--ui-inspector-width\)/)
+  assert.match(admin, /<component :is="item\.icon" \/>/)
+  assert.match(admin, /\.workspace-nav button \.el-icon/)
+  assert.match(admin, /\.metric-card>\.el-icon/)
+  assert.match(free, /缩放与窄屏：三栏按可用宽度收缩/)
+  assert.match(free, /grid-template-columns:minmax\(196px,230px\) minmax\(0,1fr\) minmax\(292px,350px\)/)
+  assert.match(free, /project-storyboard-page \.workbench\{height:min\(820px,calc\(100dvh - 120px\)\)/)
+  assert.match(film, /\.film-create>\.main\{width:100%;max-width:none/)
+  assert.match(film, /A restrained sense of motion keeps the production flow visually alive/)
+  assert.match(film, /@keyframes workflow-orbit/)
+  assert.doesNotMatch(film, /storyboard-workbench-toolbar/)
+})
+
+test('主页使用本地完成视频组成可控轮播舞台', async () => {
+  const source = await readSource('../src/views/FilmList.vue')
+
+  assert.match(source, /const heroVideos = computed/)
+  assert.match(source, /const activeHeroVideo = computed/)
+  assert.match(source, /const heroVideoElements = new Map\(\)/)
+  assert.match(source, /const incomingHeroVideoKey = ref\(''\)/)
+  assert.match(source, /function revealHeroVideo\(video, element\)/)
+  assert.match(source, /requestVideoFrameCallback/)
+  assert.match(source, /旧视频保持全亮。新视频在上层完成淡入后，才替换当前视频。/)
+  assert.doesNotMatch(source, /:poster="heroPoster/)
+  assert.doesNotMatch(source, /<img v-else-if="heroMedia\[0\]"/)
+  assert.match(source, /const recentSeen = new Set\(\)/)
+  assert.match(source, /const defaultSeen = new Set\(\)/)
+  assert.match(source, /同一项目的多个成片也属于可轮播作品/)
+  assert.doesNotMatch(source, /const projects = new Set\(\)/)
+  assert.match(source, /\.slice\(0, 4\)/)
+  assert.doesNotMatch(source, /class="hero-video-preload"/)
+  assert.match(source, /@loadeddata="markHeroVideoReady\(video, \$event\)" @canplay="markHeroVideoReady\(video, \$event\)"/)
+  assert.match(source, /@timeupdate="maybeAdvanceHeroVideo\(video, \$event\)"/)
+  assert.match(source, /@error="discardHeroVideo\(video\)"/)
+  assert.match(source, /class="hero-video-controls"/)
+  assert.match(source, /\.hero-video-layer\.is-ready\.is-incoming\{z-index:3;opacity:1\}/)
+  assert.match(source, /\.media-stage>\.media-canvas\{position:absolute;z-index:0;inset:0;isolation:isolate\}/)
+  assert.match(source, /onBeforeUnmount\(\(\) => \{ stopHeroRotation\(\); window\.clearTimeout\(heroVideoRevealTimer\); window\.clearTimeout\(heroVideoTransitionTimer\); pauseInactiveHeroVideos\(''\) \}\)/)
+})
+
+test('无作品账号使用固定的全局默认媒体资源', async () => {
+  const source = await readSource('../src/views/FilmList.vue')
+  assert.match(source, /const defaultHeroVideos = ref\(\[\]\)/)
+  assert.match(source, /videosAPI\.defaultHomepageVideos\(\)/)
+  assert.match(source, /recentVideos\.length \? recentVideos : defaults/)
+  assert.match(source, /\.slice\(0, 3\)/)
+  assert.doesNotMatch(source, /MediaRecorder|captureStream\(/)
+})
+
+test('项目详情按分集、资源、成果和成员组织制作入口', async () => {
+  const source = await readSource('../src/views/DramaDetail.vue')
+
+  assert.match(source, /aria-label="项目工作区"/)
+  for (const label of ['分集', '制作资源', '成果', '成员与设置']) assert.ok(source.includes(`label:'${label}'`))
+  assert.match(source, /<ProjectResults/)
+  assert.match(source, /<ProjectMembers/)
+  assert.match(source, /<ProjectMediaResources/)
+})
+
+test('视频创作界面展示已持久化的任务进度和最近状态说明', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+  assert.match(source, /class="generation-progress"/)
+  assert.match(source, /const generationProgress = computed/)
+  assert.match(source, /const generationProgressIndeterminate = computed/)
+  assert.match(source, /generationProgressIndeterminate \? '生成中'/)
+  assert.match(source, /generation-progress-scan/)
+  assert.match(source, /task_progress/)
+  assert.match(source, /task_message/)
+  assert.match(source, /const pollingJobIds = new Set\(\)/)
+  assert.match(source, /状态连接暂不可用，正在重试/)
+  assert.match(source, /activeGenerationStatuses\.has\(job\.status\)/)
+  assert.match(source, /generationStallMinutes/)
+  assert.match(source, /任务仍在进行，可先编辑其他镜头。/)
+})
+
+test('成片操作栏不会覆盖视频，嵌入分镜保持三栏创作节奏', async () => {
+  const [free, film] = await Promise.all([
+    readSource('../src/views/FreeCreate.vue'),
+    readSource('../src/views/FilmCreate.vue'),
+  ])
+
+  const playablePreviewStart = free.indexOf('<template v-if="activeVideoUrl && !previewVideoError && !previewVideoProgress">')
+  const videoStageStart = free.indexOf('<div class="video-stage has-video"', playablePreviewStart)
+  const frameActionsStart = free.indexOf('<div class="frame-actions"', videoStageStart)
+  assert.ok(playablePreviewStart >= 0 && videoStageStart > playablePreviewStart && frameActionsStart > videoStageStart, 'preview controls and frame actions must wait for a playable video')
+  assert.doesNotMatch(free.slice(videoStageStart, frameActionsStart), /<div class="frame-actions"/)
+  assert.match(free, /\.frame-actions\{display:flex;flex:0 0 auto/)
+  assert.match(film, /左侧导航栏已移除，工作区占满整个视口宽度/)
+  assert.match(free, /project-storyboard-page \.creation-panel\{grid-column:1;grid-row:1/)
+  assert.match(free, /project-storyboard-page \.center-stage\{grid-column:2;grid-row:1/)
+  assert.match(free, /project-storyboard-page \.shot-panel\{grid-column:3;grid-row:1/)
+  assert.match(free, /独立自由创作与项目分镜使用同一工作台方向/)
+  assert.match(free, /omni-page:not\(\.project-storyboard-page\) \.creation-panel\{grid-column:1;grid-row:1/)
+  assert.match(free, /omni-page:not\(\.project-storyboard-page\) \.shot-panel\{grid-column:3;grid-row:1/)
+  assert.match(free, /shot-video-placeholder\{background:radial-gradient\(circle at 50% 42%,#704cff/)
+  assert.match(free, /<section v-else class="generation-stage-status"/)
+  assert.match(free, /generation-error-copy/)
+  assert.match(free, /video-stage\.has-video::before\{display:none!important\}/)
+  assert.match(free, /generation-stage-status\.is-failed/)
+})
+
+test('生产工作流保持稳定导航、比例预览和可展开的次要信息', async () => {
+  const [film, free] = await Promise.all([
+    readSource('../src/views/FilmCreate.vue'),
+    readSource('../src/views/FreeCreate.vue'),
+  ])
+
+  assert.match(film, /\.workflow-step:hover,\.workflow-step\.active\{transform:none!important\}/)
+  assert.match(film, /\.workflow-step\.active\{animation:none!important\}/)
+  assert.match(film, /script-story-block/)
+  assert.match(film, /script-content-block/)
+  assert.match(film, /剧本确认后，再集中准备可复用资源。/)
+  assert.match(film, /资源会在分镜中按需选择、拖入提示词并形成 @ 引用。/)
+  assert.doesNotMatch(film, /\.el-textarea__inner\.is-focus\)\{outline-offset:/)
+  assert.match(film, /\.merge-stage-active \.video-option-hint,\.merge-stage-active \.video-watermark-input\{grid-column:1 \/ -1;width:100%;min-width:0/)
+  assert.match(film, /\.merge-stage-active \.main>:is\(\.merge-settings,\.merge-output\)\{overflow-y:auto;overscroll-behavior-y:contain/)
+  assert.match(free, /'--preview-aspect-ratio': previewAspectRatio/)
+  assert.match(free, /<template v-if="activeVideoUrl && !previewVideoError && !previewVideoProgress">[\s\S]*<div class="video-stage has-video"/)
+  assert.match(free, /\.project-storyboard-page \.player-tools\{flex:0 0 44px;min-height:44px;overflow:visible\}/)
+  assert.match(free, /\.project-storyboard-page \.video-stage\{flex:0 0 auto!important;width:auto;height:clamp\(190px,28dvh,300px\);margin:12px auto!important;aspect-ratio:var\(--preview-aspect-ratio,16 \/ 9\)\}/)
+  assert.match(free, /video-stage\.has-video \.main-video\{inset:0!important;transform:none\}/)
+  assert.match(free, /class="creation-secondary-section"/)
+  assert.match(free, /videoModelState === 'required'/)
+  assert.match(free, /请选择视频模型/)
+  assert.match(free, /暂无可用视频模型/)
+  assert.match(free, /:video-model-invalid="videoModelState !== 'ready'"/)
+})
+
+test('切换成片先预加载下一条，再替换主播放器画面', async () => {
+  const source = await readSource('../src/views/FreeCreate.vue')
+
+  assert.match(source, /<template v-if="mediaLayers\.length"><video v-for="layer in mediaLayers" :key="layer\.id" :src="layer\.url"/)
+  assert.match(source, /function promoteMediaLayer\(id\)/)
+  assert.match(source, /@canplay="promoteMediaLayer\(layer\.id\)" @error="discardMediaLayer\(layer\.id\)"/)
+  assert.match(source, /mediaLayers\.value = \[current\]/)
+  assert.match(source, /main-video\.is-ready\{opacity:1;pointer-events:auto\}/)
+})

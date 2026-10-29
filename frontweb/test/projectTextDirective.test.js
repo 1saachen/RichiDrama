@@ -1,0 +1,94 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { reactive } from 'vue'
+import { browserModuleUrl, moduleSourceUrl } from './helpers/browserModule.js'
+
+test('directive discards late bindings after permission toggles, target changes, and unmount', async t => {
+  const session = reactive({ id: 1, enabled: true, canEdit: true, error: '' })
+  globalThis.directiveSession = session
+  const requests = []
+  globalThis.directiveBind = (target, listener) => new Promise(resolve => {
+    const entry = { target, disposed: 0, changes: [] }
+    entry.finish = value => {
+      listener(value)
+      resolve({ dispose() { entry.disposed++ }, change(value) { entry.changes.push(value) }, restoreDraft() { if (entry.changes.length) listener(entry.changes.at(-1)) } })
+    }
+    requests.push(entry)
+  })
+  const directive = (await import(await browserModuleUrl(new URL('../src/directives/projectText.js', import.meta.url), {
+    vue: import.meta.resolve('vue'),
+    '@/composables/useProjectCollaboration': moduleSourceUrl(`export const projectSession = globalThis.directiveSession; export const bindProjectText = (...args) => globalThis.directiveBind(...args); export const projectPresence = () => {};`),
+    '@/utils/projectSnapshots': moduleSourceUrl('export const projectSnapshot = () => null'),
+  }))).default
+  class Input extends EventTarget {
+    value = ''
+    readOnly = false
+    matches() { return true }
+  }
+  const input = new Input()
+  const previousDocument = globalThis.document
+  globalThis.document = { activeElement: null }
+  t.after(() => {
+    directive.beforeUnmount(input)
+    globalThis.document = previousDocument
+    delete globalThis.directiveSession; delete globalThis.directiveBind
+  })
+  const binding = id => ({ value: { kind: 'storyboards', id, field: 'description' } })
+  directive.mounted(input, binding(1))
+  assert.equal(requests.length, 1)
+  session.enabled = false
+  session.enabled = true
+  assert.equal(requests.length, 2)
+  requests[1].finish('当前正文')
+  await Promise.resolve()
+  requests[0].finish('过期正文')
+  await Promise.resolve()
+  assert.equal(input.value, '当前正文')
+  assert.equal(requests[0].disposed, 1)
+  input.value = '当前修改'; input.dispatchEvent(new Event('input'))
+  assert.deepEqual(requests[1].changes, ['当前修改'])
+  assert.deepEqual(requests[0].changes, [])
+  input.value = '刷新返回的旧正文'
+  directive.updated(input, binding(1))
+  assert.equal(input.value, '当前修改')
+  assert.deepEqual(requests[1].changes, ['当前修改'], 'restoring a draft must not create another local edit')
+
+  directive.updated(input, binding(2))
+  directive.updated(input, binding(3))
+  requests[3].finish('镜头三')
+  requests[2].finish('镜头二')
+  await Promise.resolve()
+  assert.equal(input.value, '镜头三')
+  assert.equal(requests[2].disposed, 1)
+  directive.updated(input, binding(4))
+  directive.beforeUnmount(input)
+  requests[4].finish('卸载后的文本')
+  await Promise.resolve()
+  assert.equal(input.value, '镜头三')
+  assert.equal(requests[4].disposed, 1)
+})
+
+test('directive waits for a project id before binding text', t => {
+  const session = reactive({ id: null, enabled: true, canEdit: true, invalidTargets: [] })
+  globalThis.directiveSession = session
+  const requested = []
+  globalThis.directiveBind = target => { requested.push(target); return Promise.resolve(null) }
+  const input = new EventTarget()
+  input.value = ''
+  input.readOnly = false
+  input.matches = () => true
+  t.after(() => { delete globalThis.directiveSession; delete globalThis.directiveBind })
+  // Import a fresh directive so this test owns its reactive session.
+  return browserModuleUrl(new URL('../src/directives/projectText.js', import.meta.url), {
+    vue: import.meta.resolve('vue'),
+    '@/composables/useProjectCollaboration': moduleSourceUrl('export const projectSession = globalThis.directiveSession; export const bindProjectText = (...args) => globalThis.directiveBind(...args); export const projectPresence = () => {}; // id readiness'),
+    '@/utils/projectSnapshots': moduleSourceUrl('export const projectSnapshot = () => null'),
+  }).then(async url => {
+    const directive = (await import(url)).default
+    directive.mounted(input, { value: { kind: 'dramas', id: 2, field: 'description' } })
+    assert.equal(requested.length, 0)
+    session.id = 2
+    assert.equal(requested.length, 1)
+    directive.beforeUnmount(input)
+  })
+})

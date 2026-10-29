@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#080b12" />
+    <link rel="icon" type="image/png" href="/brand/richi-logo-color.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      // Apply the persisted theme before Vite loads any module or route chunk.
+      // This prevents the browser's white canvas from showing during navigation.
+      (function () {
+        var theme = localStorage.getItem('lmd-theme') === 'light' ? 'light' : 'dark'
+        document.documentElement.classList.add(theme)
+        var background = theme === 'light' ? '#f2f3f7' : '#080b12'
+        document.documentElement.style.backgroundColor = background
+        document.querySelector('meta[name="theme-color"]').setAttribute('content', background)
+      })()
+    </script>
+    <title>瑞池传媒短剧平台 - AI 短剧生成工具</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

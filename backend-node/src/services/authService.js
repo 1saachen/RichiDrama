@@ -1,0 +1,261 @@
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const fs = require('fs');
+const path = require('path');
+
+const TOKEN_TTL = process.env.AUTH_TOKEN_TTL || '24h';
+const DEVELOPMENT_JWT_SECRET = 'local-mini-drama-development-secret-change-me';
+const isProduction = process.env.NODE_ENV === 'production';
+
+function now() { return new Date().toISOString(); }
+
+function runtimeSetting(db, key) {
+  try { return db.prepare('SELECT setting_value FROM runtime_settings WHERE setting_key = ?').get(key)?.setting_value || null; } catch (_) { return null; }
+}
+
+function saveRuntimeSetting(db, key, value) {
+  const at = now();
+  db.prepare(`INSERT INTO runtime_settings (setting_key, setting_value, created_at, updated_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value, updated_at = excluded.updated_at`).run(key, value, at, at);
+  return value;
+}
+
+function jwtSecret(db) {
+  const configured = process.env.AUTH_JWT_SECRET;
+  if (configured) {
+    if (isProduction && configured.length < 32) throw new Error('生产环境 AUTH_JWT_SECRET 至少需要 32 位');
+    return configured;
+  }
+  if (!isProduction) return DEVELOPMENT_JWT_SECRET;
+  const saved = runtimeSetting(db, 'auth.jwt_secret');
+  if (saved) return saved;
+  return saveRuntimeSetting(db, 'auth.jwt_secret', crypto.randomBytes(48).toString('base64url'));
+}
+
+function validateRuntimeSecurity(db) {
+  // Environment values win. When absent, a production-only random secret is
+  // persisted in SQLite so ordinary code updates do not invalidate sessions.
+  jwtSecret(db);
+}
+
+function writeInitialCredentials(db, username, password) {
+  if (!isProduction || !db.name || db.name === ':memory:') return;
+  const target = path.join(path.dirname(db.name), 'initial-admin-credentials.txt');
+  if (fs.existsSync(target)) return;
+  fs.writeFileSync(target, `Initial administrator credentials (delete this file after first login)\nusername=${username}\npassword=${password}\n`, { mode: 0o600 });
+}
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
+  if (typeof password !== 'string' || !password.length) throw new Error('密码不能为空');
+  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `scrypt$${salt}$${derived}`;
+}
+
+function verifyPassword(password, encoded) {
+  const [kind, salt, expected] = String(encoded || '').split('$');
+  if (kind !== 'scrypt' || !salt || !expected) return false;
+  const actual = crypto.scryptSync(String(password || ''), salt, 64).toString('hex');
+  return crypto.timingSafeEqual(Buffer.from(actual, 'hex'), Buffer.from(expected, 'hex'));
+}
+
+function publicUser(row) {
+  return { must_change_password: !!row.must_change_password, id: row.id, username: row.username, display_name: row.display_name, role: row.role, console_access: !!row.console_access, account_kind: row.account_kind || (row.role === 'admin' ? 'platform_admin' : 'creator'), is_active: !!row.is_active, created_at: row.created_at, last_login_at: row.last_login_at };
+}
+
+function ensureBootstrapAdmin(db, log) {
+  let user = db.prepare('SELECT * FROM users ORDER BY id LIMIT 1').get();
+  if (!user) {
+    const username = process.env.INITIAL_ADMIN_USERNAME || 'admin';
+    const password = process.env.INITIAL_ADMIN_PASSWORD || (isProduction ? crypto.randomBytes(18).toString('base64url') : 'admin123456');
+    const at = now();
+    const info = db.prepare(`INSERT INTO users (username, password_hash, display_name, role, console_access, account_kind, is_active, created_at, updated_at)
+      VALUES (?, ?, '平台管理员', 'admin', 1, 'platform_admin', 1, ?, ?)`)
+      .run(username, hashPassword(password), at, at);
+    user = db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
+    db.prepare(`INSERT INTO billing_accounts (user_id, updated_at) VALUES (?, ?)`).run(user.id, at);
+    writeInitialCredentials(db, username, password);
+    log.warn('Created initial administrator. Change its password before production use.', { username, credentials_file: isProduction ? 'data/initial-admin-credentials.txt' : null });
+  }
+  for (const table of ['dramas', 'image_generations', 'video_generations', 'async_tasks', 'assets', 'omni_video_sequences', 'omni_video_jobs', 'tool_runs']) {
+    try { db.prepare(`UPDATE ${table} SET owner_user_id = ? WHERE owner_user_id IS NULL`).run(user.id); } catch (_) {}
+  }
+  // New and upgraded single-project installations always have an explicit
+  // default tenant, while preserving every historical owner relationship.
+  try { require('./tenantService').ensureDefaultTenant(db, user.id); } catch (error) { log.warn('Default tenant adoption skipped', { error: error.message }); }
+  return user;
+}
+
+function requestUsesHttps(req) {
+  if (req?.secure || req?.protocol === 'https') return true;
+  const forwarded = String(req?.headers?.['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  return forwarded === 'https';
+}
+
+function sessionCookieOptions(req) {
+  const sameSite = String(process.env.AUTH_COOKIE_SAME_SITE || 'lax').toLowerCase();
+  const normalizedSameSite = ['lax', 'strict', 'none'].includes(sameSite) ? sameSite : 'lax';
+  // Browser media tags cannot attach the SPA's Authorization header. They use
+  // this HttpOnly cookie instead, so a direct HTTP deployment must not receive
+  // a Secure-only cookie that the browser will silently discard.
+  const configuredSecure = process.env.AUTH_COOKIE_SECURE;
+  const secure = normalizedSameSite === 'none'
+    ? true
+    : configuredSecure === 'true'
+      ? true
+      : configuredSecure === 'false'
+        ? false
+        : requestUsesHttps(req);
+  return {
+    httpOnly: true,
+    secure,
+    sameSite: normalizedSameSite,
+    path: '/',
+    maxAge: 24 * 60 * 60 * 1000,
+  };
+}
+
+function login(db, username, password) {
+  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(String(username || '').trim());
+  if (!user || !user.is_active || !verifyPassword(password, user.password_hash)) return null;
+  if (user.must_change_password && (!user.temporary_password_expires_at || user.temporary_password_expires_at <= now())) return null;
+  const at = now();
+  db.prepare('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?').run(at, at, user.id);
+  return issueSession(db, { ...user, last_login_at: at });
+}
+
+function issueSession(db, user) {
+  const publicData = publicUser(user);
+  const token = jwt.sign({ sub: user.id, role: user.role, username: user.username, session_version: user.session_version || 0 }, jwtSecret(db), { expiresIn: TOKEN_TTL });
+  return { token, user: publicData };
+}
+
+function normalizeUsername(username) {
+  // 不限制用户名字符集（中文/符号等均可）；仅要求非空、去除首尾空白、
+  // 长度按字符数 1-64，防止空用户名与超长滥用。
+  const value = String(username || '').trim();
+  const chars = Array.from(value);
+  if (!chars.length || chars.length > 64) {
+    throw new Error('用户名需为 1-64 个字符');
+  }
+  return value;
+}
+
+function usernameTakenError() {
+  return Object.assign(new Error('该用户名已被使用'), { status: 400, code: 'USERNAME_TAKEN' });
+}
+
+function isUsernameConstraintError(error) {
+  return String(error?.code || '').startsWith('SQLITE_CONSTRAINT')
+    && /\busers\.username\b/i.test(String(error?.message || ''));
+}
+
+function register(db, input) {
+  validateNewPassword(input.password);
+  const user = createUser(db, {
+    username: input.username,
+    password: input.password,
+    display_name: input.display_name,
+  }, null);
+  return login(db, user.username, input.password);
+}
+
+function authenticate(db, token) {
+  const claims = jwt.verify(token, jwtSecret(db));
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(claims.sub);
+  if (!user || !user.is_active) {
+    const error = new Error('账号不可用');
+    error.code = 'ACCOUNT_DISABLED';
+    throw error;
+  }
+  if ((claims.session_version ?? 0) !== (user.session_version || 0)) throw new jwt.JsonWebTokenError('登录状态已失效');
+  if (user.must_change_password && (!user.temporary_password_expires_at || user.temporary_password_expires_at <= now())) throw new jwt.JsonWebTokenError('临时密码已过期');
+  return publicUser(user);
+}
+
+function createUser(db, input, actorId) {
+  const username = normalizeUsername(input.username);
+  const at = now();
+  const platformAdmin = input.account_kind === 'platform_admin' || input.console_access === true;
+  if (db.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) throw usernameTakenError();
+  let info;
+  try {
+    info = db.prepare(`INSERT INTO users (username, password_hash, display_name, role, console_access, account_kind, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(username, hashPassword(input.password), String(input.display_name || username).trim(), platformAdmin ? 'admin' : 'user', platformAdmin ? 1 : 0, platformAdmin ? 'platform_admin' : 'creator', input.is_active === false ? 0 : 1, at, at);
+  } catch (error) {
+    if (isUsernameConstraintError(error)) throw usernameTakenError();
+    throw error;
+  }
+  const id = Number(info.lastInsertRowid);
+  db.prepare('INSERT INTO billing_accounts (user_id, updated_at) VALUES (?, ?)').run(id, at);
+  try { require('./tenantService').ensureDefaultTenant(db, actorId); } catch (_) {}
+  // 新账号自动加入“新用户默认分组”（未标记时回退默认项目组），
+  // 管理端显式指定的分组在路由层随后覆盖。
+  try { require('./tenantService').ensureNewUserMembership(db, id); } catch (_) {}
+  return db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+}
+
+function validateNewPassword(password) {
+  if (typeof password !== 'string' || Array.from(password).length < 8 || Array.from(password).length > 128) throw Object.assign(new Error('新密码需为 8–128 个字符'), { status: 400, code: 'INVALID_PASSWORD' });
+}
+
+function replacePassword(db, userId, password, temporary = false) {
+  validateNewPassword(password);
+  const expiresAt = temporary ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() : null;
+  db.prepare(`UPDATE users SET password_hash = ?, session_version = session_version + 1,
+    must_change_password = ?, temporary_password_expires_at = ?, updated_at = ? WHERE id = ?`)
+    .run(hashPassword(password), temporary ? 1 : 0, expiresAt, now(), userId);
+  return expiresAt;
+}
+
+function changePassword(db, userId, oldPassword, newPassword) {
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+  if (!user || !verifyPassword(oldPassword, user.password_hash)) throw new Error('当前密码不正确');
+  validateNewPassword(newPassword);
+  if (verifyPassword(newPassword, user.password_hash)) throw new Error('新密码不能与当前密码相同');
+  replacePassword(db, userId, newPassword);
+}
+
+function changeUsername(db, userId, username) {
+  const next = normalizeUsername(username);
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(userId));
+  if (!user) throw new Error('账户不存在');
+  if (user.username === next) return user;
+  const duplicate = db.prepare('SELECT id FROM users WHERE username = ? AND id != ?').get(next, user.id);
+  if (duplicate) throw usernameTakenError();
+  try {
+    db.prepare('UPDATE users SET username = ?, updated_at = ? WHERE id = ?').run(next, now(), user.id);
+  } catch (error) {
+    if (isUsernameConstraintError(error)) throw usernameTakenError();
+    throw error;
+  }
+  return db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+}
+
+function changeDisplayName(db, userId, displayName) {
+  // 显示名不限制字符集；trim 后最长 64 字符，允许留空（回退展示用户名）。
+  const value = String(displayName ?? '').trim();
+  if (Array.from(value).length > 64) throw new Error('显示名最长 64 个字符');
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(userId));
+  if (!user) throw new Error('账户不存在');
+  if ((user.display_name || '') === value) return user;
+  db.prepare('UPDATE users SET display_name = ?, updated_at = ? WHERE id = ?').run(value, now(), user.id);
+  return db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+}
+
+function updateUser(db, id, input) {
+  const updates = [], params = [];
+  if (input.display_name !== undefined) { updates.push('display_name = ?'); params.push(String(input.display_name || '').trim()); }
+  if (input.account_kind !== undefined || input.console_access !== undefined || input.role !== undefined) {
+    const platformAdmin = input.account_kind === 'platform_admin' || input.console_access === true || (input.role === 'admin' && input.console_access !== false);
+    updates.push('role = ?', 'console_access = ?', 'account_kind = ?');
+    params.push(platformAdmin ? 'admin' : 'user', platformAdmin ? 1 : 0, platformAdmin ? 'platform_admin' : 'creator');
+  }
+  if (input.is_active !== undefined) { updates.push('is_active = ?'); params.push(input.is_active ? 1 : 0); }
+  if (input.password) { validateNewPassword(input.password); updates.push('password_hash = ?', 'session_version = session_version + 1', 'must_change_password = 1', 'temporary_password_expires_at = ?'); params.push(hashPassword(input.password), new Date(Date.now() + 86400000).toISOString()); }
+  if (!updates.length) return db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  params.push(now(), id);
+  db.prepare(`UPDATE users SET ${updates.join(', ')}, updated_at = ? WHERE id = ?`).run(...params);
+  return db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+}
+module.exports = { verifyPassword, validateNewPassword, replacePassword, validateRuntimeSecurity, ensureBootstrapAdmin, sessionCookieOptions, login, register, authenticate, createUser, updateUser, changePassword, changeUsername, changeDisplayName, issueSession, publicUser, jwtSecret };
