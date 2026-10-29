@@ -1,0 +1,475 @@
+const path = require('path');
+const fs = require('fs');
+const { getFfmpegPath, getFfprobePath, hasLocalFfmpeg } = require('../utils/ffmpegPath');
+const storageLayout = require('./storageLayout');
+
+function ownerId(actor) {
+  if (actor == null) return null;
+  return Number(typeof actor === 'object' ? actor.id : actor);
+}
+
+// Older merge rows may have drama_id = 0/NULL even though episode_id points
+// to a valid project. Resolve ownership from the episode first and only use
+// the merge's direct drama reference when the episode no longer exists.
+function scopedMergeFromSql() {
+  return `FROM video_merges vm
+    LEFT JOIN episodes e ON e.id = vm.episode_id AND e.deleted_at IS NULL
+    LEFT JOIN dramas episode_drama ON episode_drama.id = e.drama_id AND episode_drama.deleted_at IS NULL
+    LEFT JOIN dramas merge_drama ON merge_drama.id = vm.drama_id AND merge_drama.deleted_at IS NULL
+    WHERE vm.deleted_at IS NULL`;
+}
+
+function scopedMergeOwnerSql() {
+  return 'CASE WHEN e.id IS NOT NULL THEN episode_drama.owner_user_id ELSE merge_drama.owner_user_id END';
+}
+
+function scopedMergeDramaSql() {
+  return 'CASE WHEN e.id IS NOT NULL THEN e.drama_id ELSE vm.drama_id END';
+}
+
+function list(db, query = {}, actor = null) {
+  const scopedOwner = ownerId(actor);
+  let sql = scopedMergeFromSql();
+  const params = [];
+  if (query.episode_id) {
+    sql += ' AND vm.episode_id = ?';
+    params.push(query.episode_id);
+  }
+  if (query.drama_id) {
+    sql += ` AND ${scopedMergeDramaSql()} = ?`;
+    params.push(query.drama_id);
+  }
+  if (scopedOwner != null) {
+    sql += ` AND ${scopedMergeDramaSql()} IN (${require('./projectAccessService').projectIdsSql(db, scopedOwner)})`;
+  }
+  const rows = db.prepare('SELECT vm.* ' + sql + ' ORDER BY vm.created_at DESC').all(...params);
+  return rows.map(rowToItem);
+}
+
+function rowToItem(r) {
+  return {
+    id: r.id,
+    episode_id: r.episode_id,
+    drama_id: r.drama_id,
+    title: r.title,
+    provider: r.provider,
+    status: r.status,
+    merged_url: r.merged_url,
+    duration: r.duration ?? undefined,
+    task_id: r.task_id,
+    error_msg: r.error_msg ?? undefined,
+    created_at: r.created_at,
+    completed_at: r.completed_at,
+  };
+}
+
+function getById(db, id, actor = null) {
+  const scopedOwner = ownerId(actor);
+  let sql = `SELECT vm.* ${scopedMergeFromSql()}
+    AND vm.id = ?`;
+  // scopedMergeFromSql contributes the FROM/WHERE before the id predicate;
+  // keep the id first in the bound parameter list for readability below.
+  const reorderedParams = [Number(id)];
+  if (scopedOwner != null) {
+    sql += ` AND ${scopedMergeDramaSql()} IN (${require('./projectAccessService').projectIdsSql(db, scopedOwner)})`;
+  }
+  const r = db.prepare(sql).get(...reorderedParams);
+  return r ? rowToItem(r) : null;
+}
+
+function create(db, log, req, actor = null) {
+  const episodeId = Number(req.episode_id);
+  const episode = db.prepare(`SELECT e.id, e.drama_id, d.owner_user_id
+    FROM episodes e JOIN dramas d ON d.id = e.drama_id
+    WHERE e.id = ? AND e.deleted_at IS NULL AND d.deleted_at IS NULL`).get(episodeId);
+  if (!episode) {
+    const error = new Error('剧集不存在');
+    error.code = 'NOT_FOUND';
+    throw error;
+  }
+  const actorId = ownerId(actor);
+  if (actorId != null && !require('./projectAccessService').access(db, episode.drama_id, actorId)?.can_edit) {
+    const error = new Error('资源不存在');
+    error.code = 'NOT_FOUND';
+    throw error;
+  }
+  const requestedDramaId = req.drama_id == null || req.drama_id === '' ? 0 : Number(req.drama_id);
+  const hasDramaReference = requestedDramaId !== 0;
+  if (!Number.isInteger(requestedDramaId) || (hasDramaReference && requestedDramaId !== Number(episode.drama_id))) {
+    const error = new Error('episode_id 与 drama_id 不匹配');
+    error.code = 'BAD_REQUEST';
+    throw error;
+  }
+  // Preserve the historical API behavior: an omitted drama_id is stored as
+  // 0. Ownership reads resolve it through episode_id without rewriting data.
+  const dramaId = hasDramaReference ? requestedDramaId : 0;
+  const now = new Date().toISOString();
+  const taskService = require('./taskService');
+  const task = taskService.createTaskFromContext(db, log, 'video_merge', String(episodeId || ''), actorId);
+  const mergeOptionsJson = (() => {
+    const o = req.merge_options;
+    if (o && typeof o === 'object') return JSON.stringify(o);
+    return '{}';
+  })();
+  const info = db.prepare(
+    `INSERT INTO video_merges (episode_id, drama_id, title, provider, model, status, scenes, merge_options, task_id, created_at)
+     VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`
+  ).run(
+    episodeId || 0,
+    dramaId || 0,
+    req.title ?? null,
+    req.provider || 'ffmpeg',
+    req.model ?? null,
+    req.scenes ? JSON.stringify(req.scenes) : '[]',
+    mergeOptionsJson,
+    task.id,
+    now
+  );
+  return { merge_id: info.lastInsertRowid, task_id: task.id, ...getById(db, info.lastInsertRowid) };
+}
+
+function deleteById(db, log, id, actor = null) {
+  const now = new Date().toISOString();
+  const scopedOwner = ownerId(actor);
+  if (scopedOwner != null) {
+    if (!getById(db, id, actor)) return false;
+  }
+  const result = db.prepare(
+    'UPDATE video_merges SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL'
+  ).run(now, Number(id));
+  return result.changes > 0;
+}
+
+/** 获取 storage 根目录（绝对路径） */
+function getStorageRoot() {
+  const loadConfig = require('../config').loadConfig;
+  const cfg = loadConfig();
+  const p = cfg.storage?.local_path || './data/storage';
+  return path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+}
+
+/** 将 video_url 解析为本地文件路径，或下载到 temp 返回路径 */
+async function resolveVideoToLocalPath(videoUrl, baseUrl, storageRoot, tempDir, index, log) {
+  if (!videoUrl || typeof videoUrl !== 'string') return null;
+  const u = videoUrl.trim();
+  if (/\.(?:jpg|jpeg|png|gif|webp)(?:[?#].*)?$/i.test(u)) {
+    log.warn('Video merge: rejected image path as video input', { index, url: u });
+    return null;
+  }
+  // 1) URL 以 baseUrl 开头（如 http://localhost:5679/static）-> 对应 storageRoot 下相对路径
+  if (baseUrl && (u.startsWith(baseUrl) || u.startsWith(baseUrl.replace(/\/$/, '')))) {
+    const base = baseUrl.replace(/\/$/, '');
+    const rel = u.startsWith(base + '/') ? u.slice(base.length + 1) : u.slice(base.length).replace(/^\//, '');
+    if (rel && !rel.startsWith('http')) {
+      const localPath = path.join(storageRoot, rel.replace(/\//g, path.sep));
+      if (fs.existsSync(localPath)) {
+        log.info('Video merge: using local static file', { index, path: localPath });
+        return localPath;
+      }
+    }
+  }
+  // 2) 已是本地绝对路径且存在
+  if (path.isAbsolute(u) && fs.existsSync(u)) {
+    log.info('Video merge: using absolute path', { index, path: u });
+    return u;
+  }
+  // 3) 相对路径（相对 storageRoot）
+  if (!u.startsWith('http://') && !u.startsWith('https://')) {
+    const localPath = path.join(storageRoot, u.replace(/^\//, '').replace(/\//g, path.sep));
+    if (fs.existsSync(localPath)) {
+      log.info('Video merge: using relative path', { index, path: localPath });
+      return localPath;
+    }
+  }
+  // 4) 远程 URL：下载到 temp
+  const ext = u.includes('.mp4') ? '.mp4' : u.includes('.webm') ? '.webm' : '.mp4';
+  const destPath = path.join(tempDir, `dl_${Date.now()}_${index}${ext}`);
+  try {
+    const res = await fetch(u, { method: 'GET' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    fs.writeFileSync(destPath, buf);
+    log.info('Video merge: downloaded to temp', { index, dest: destPath });
+    return destPath;
+  } catch (e) {
+    log.warn('Video merge: download failed', { index, url: u, error: e.message });
+    return null;
+  }
+}
+
+/** 使用 ffmpeg concat 合并多个视频文件 */
+function runFfmpegConcat(localPaths, outputPath, log) {
+  const ffmpegBin = getFfmpegPath();
+  const isWin = process.platform === 'win32';
+  const listFile = path.join(path.dirname(outputPath), `concat_list_${Date.now()}.txt`);
+  try {
+    const lines = localPaths.map((p) => {
+      const normalized = p.replace(/\\/g, '/');
+      return `file '${normalized.replace(/'/g, "'\\''")}'`;
+    });
+    fs.writeFileSync(listFile, lines.join('\n'), 'utf8');
+    const { spawnSync } = require('child_process');
+    const args = [
+      '-f', 'concat',
+      '-safe', '0',
+      '-i', listFile,
+      // 不使用 stream copy：不同供应商的视频编码、音轨或时间基不一致时，
+      // copy 会生成能下载但浏览器显示 0:00 的损坏 MP4。统一重编码并写入
+      // faststart 索引，确保在线播放和 Range 请求都可用。
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-crf', '23',
+      '-pix_fmt', 'yuv420p',
+      '-an',
+      '-movflags', '+faststart',
+      '-y',
+      outputPath,
+    ];
+    const result = spawnSync(ffmpegBin, args, { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+    if (result.error) {
+      log.warn('Video merge: ffmpeg spawn error', { error: result.error.message });
+      return false;
+    }
+    if (result.status !== 0) {
+      log.warn('Video merge: ffmpeg failed', { stderr: result.stderr?.slice(-500) });
+      return false;
+    }
+    return true;
+  } finally {
+    try { if (fs.existsSync(listFile)) fs.unlinkSync(listFile); } catch (_) {}
+  }
+}
+
+/**
+ * 异步处理视频合成：优先使用 ffmpeg 真正合并多段视频；失败或无 ffmpeg 时用首段作为 merged_url。
+ */
+async function processVideoMerge(db, log, mergeId, baseUrl) {
+  const r = db.prepare('SELECT * FROM video_merges WHERE id = ? AND deleted_at IS NULL').get(mergeId);
+  if (!r) return;
+  const taskId = r.task_id;
+  const episodeId = r.episode_id;
+  let scenes = [];
+  try {
+    scenes = JSON.parse(r.scenes || '[]');
+  } catch (_) {
+    log.warn('video merge parse scenes failed', { merge_id: mergeId });
+  }
+  const originalSceneCount = scenes.length;
+  scenes = scenes.filter((scene) => {
+    const url = scene?.video_url == null ? '' : String(scene.video_url).trim();
+    return url && !/\.(?:jpg|jpeg|png|gif|webp)(?:[?#].*)?$/i.test(url);
+  });
+  if (scenes.length !== originalSceneCount) {
+    log.warn('Video merge: removed non-video scene inputs', {
+      merge_id: mergeId,
+      removed: originalSceneCount - scenes.length,
+    });
+  }
+  const now = new Date().toISOString();
+  db.prepare('UPDATE video_merges SET status = ? WHERE id = ?').run('processing', mergeId);
+  const taskService = require('./taskService');
+  if (scenes.length === 0) {
+    db.prepare('UPDATE video_merges SET status = ?, error_msg = ? WHERE id = ?').run('failed', '无有效视频片段', mergeId);
+    if (taskId) taskService.updateTaskError(db, taskId, '无有效视频片段');
+    return;
+  }
+  const first = scenes[0];
+  const mergedUrlFallback = first && first.video_url ? first.video_url : null;
+  if (!mergedUrlFallback) {
+    db.prepare('UPDATE video_merges SET status = ?, error_msg = ? WHERE id = ?').run('failed', '首段无视频地址', mergeId);
+    if (taskId) taskService.updateTaskError(db, taskId, '首段无视频地址');
+    return;
+  }
+
+  const totalDuration = scenes.reduce((sum, s) => sum + (Number(s.duration) || 0), 0);
+  const storageRoot = getStorageRoot();
+  const tempDir = path.join(require('os').tmpdir(), 'drama-video-merge');
+  if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+
+  const localPaths = [];
+  const toCleanup = [];
+  for (let i = 0; i < scenes.length; i++) {
+    const p = await resolveVideoToLocalPath(
+      scenes[i].video_url,
+      baseUrl,
+      storageRoot,
+      tempDir,
+      i,
+      log
+    );
+    if (p) {
+      localPaths.push(p);
+      if (p.startsWith(tempDir)) toCleanup.push(p);
+    }
+  }
+
+  const ffmpegAvailable = hasLocalFfmpeg();
+  log.info('Video merge: ffmpeg check', {
+    merge_id: mergeId,
+    has_ffmpeg: ffmpegAvailable,
+    ffmpeg_path: getFfmpegPath(),
+    local_video_count: localPaths.length,
+    cwd: process.cwd(),
+  });
+
+  let mergedRelativePath = null;
+  if (localPaths.length > 0 && ffmpegAvailable && localPaths.length <= 100) {
+    const projectSubdir = storageLayout.getProjectStorageSubdir(db, r.drama_id);
+    const sub = projectSubdir && String(projectSubdir).trim();
+    const mergedDir = sub
+      ? path.join(storageRoot, sub, 'videos', 'merged')
+      : path.join(storageRoot, 'videos', 'merged');
+    if (!fs.existsSync(mergedDir)) fs.mkdirSync(mergedDir, { recursive: true });
+    const outputFileName = `merged_${Date.now()}.mp4`;
+    const outputPath = path.join(mergedDir, outputFileName);
+    const ok = runFfmpegConcat(localPaths, outputPath, log);
+    if (ok && fs.existsSync(outputPath)) {
+      mergedRelativePath = sub
+        ? path.join(sub, 'videos', 'merged', outputFileName).replace(/\\/g, '/')
+        : path.join('videos', 'merged', outputFileName).replace(/\\/g, '/');
+      log.info('Video merge completed (ffmpeg)', { merge_id: mergeId, episode_id: episodeId, output: mergedRelativePath });
+    }
+  }
+
+  let mergeOpts = {};
+  try {
+    mergeOpts = JSON.parse(r.merge_options || '{}');
+  } catch (_) {
+    mergeOpts = {};
+  }
+  const postNeed =
+    !!mergeOpts.burn_narration_subtitles
+    || !!mergeOpts.burn_dialogue_audio
+    || !!(mergeOpts.watermark_text && String(mergeOpts.watermark_text).trim());
+  if (mergedRelativePath && ffmpegAvailable && postNeed) {
+    const mergedAbsPath = path.join(storageRoot, mergedRelativePath.replace(/\//g, path.sep));
+    if (fs.existsSync(mergedAbsPath)) {
+      const mergedPP = require('./mergedEpisodePostProcess');
+      const post = await mergedPP.runMergedEpisodePostProcess(db, log, {
+        mergedAbsPath,
+        storageRoot,
+        scenes,
+        episodeId,
+        mergeOpts,
+      });
+      if (post.ok && post.relativePath) {
+        mergedRelativePath = post.relativePath;
+        log.info('Video merge: merged episode post-process', { merge_id: mergeId, out: mergedRelativePath });
+      } else if (post.error && post.error !== 'NO_POST_OPTS') {
+        log.warn('Video merge: post-process skipped', { merge_id: mergeId, err: post.error });
+      }
+    }
+  }
+
+  for (const p of toCleanup) {
+    try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
+  }
+
+  if (!mergedRelativePath) {
+    const message = '视频合成未生成本地文件，不能使用可能过期的供应商链接作为成片。请检查 ffmpeg 后重试。';
+    db.prepare('UPDATE video_merges SET status = ?, merged_url = NULL, error_msg = ? WHERE id = ?').run('failed', message, mergeId);
+    if (taskId) taskService.updateTaskError(db, taskId, message);
+    log.warn('Video merge failed without a local output', { merge_id: mergeId, episode_id: episodeId });
+    return;
+  }
+  const finalMergedUrl = mergedRelativePath;
+  db.prepare(
+    'UPDATE video_merges SET status = ?, merged_url = ?, duration = ?, completed_at = ?, error_msg = ? WHERE id = ?'
+  ).run('completed', finalMergedUrl, Math.round(totalDuration) || null, now, null, mergeId);
+  db.prepare('UPDATE episodes SET video_url = ?, status = ?, updated_at = ? WHERE id = ?').run(finalMergedUrl, 'completed', now, episodeId);
+  await registerMergedFinalAsset(db, log, { episodeId, mergeId, localPath: finalMergedUrl, storageRoot });
+  if (taskId) {
+    taskService.updateTaskResult(db, taskId, { merge_id: mergeId, video_url: finalMergedUrl, duration: Math.round(totalDuration) });
+  }
+}
+
+// 成片是项目的持久资产：登记进 assets 后，投流剪辑/视频本地化等按素材取数的入口
+// 才能直接选用应用内制作的剧集成片（episodes.video_url 本身不在素材表）。
+// 按 episode 幂等：重组合并更新同一素材；任何失败都不得改变合并的完成态。
+async function registerMergedFinalAsset(db, log, { episodeId, mergeId, localPath, storageRoot }) {
+  try {
+    const episode = db.prepare('SELECT id, drama_id, episode_number, title FROM episodes WHERE id = ? AND deleted_at IS NULL').get(episodeId);
+    if (!episode?.drama_id) return null;
+    const drama = db.prepare('SELECT id, owner_user_id FROM dramas WHERE id = ? AND deleted_at IS NULL').get(episode.drama_id);
+    if (!drama) return null;
+    const abs = path.join(storageRoot, localPath.replace(/\//g, path.sep));
+    if (!fs.existsSync(abs)) return null;
+    const assetService = require('./assetService');
+    const existing = db.prepare("SELECT id FROM assets WHERE deleted_at IS NULL AND source_type = 'merged_final' AND json_extract(metadata_json, '$.episode_id') = ?").get(episodeId);
+    let width = null;
+    let height = null;
+    let duration = null;
+    try {
+      // 回填循环里逐集探测；execFileSync 会在事件循环上反复卡顿，改异步 execFile。
+      const { execFile } = require('node:child_process');
+      const { promisify } = require('node:util');
+      const info = JSON.parse((await promisify(execFile)(getFfprobePath(), ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type,width,height', '-of', 'json', abs], { windowsHide: true, maxBuffer: 8 * 1024 * 1024, timeout: 30000 })).stdout);
+      const video = (info.streams || []).find((stream) => stream.codec_type === 'video');
+      width = video?.width ?? null;
+      height = video?.height ?? null;
+      duration = Number.isFinite(Number(info.format?.duration)) && Number(info.format.duration) > 0 ? Number(info.format.duration) : null;
+    } catch (_) { log.warn('成片探测失败，素材按无规格登记', { episode_id: episodeId, path: localPath }); }
+    const fields = {
+      drama_id: episode.drama_id, owner_user_id: drama.owner_user_id,
+      type: 'video', category: 'final', source_type: 'merged_final',
+      local_path: localPath, url: `/static/${localPath}`,
+      file_size: fs.statSync(abs).size, duration, width, height,
+      metadata: { episode_id: episodeId, merge_id: mergeId, episode_title: episode.title || '' },
+      processing_status: 'ready',
+    };
+    let assetId;
+    if (existing) {
+      assetService.update(db, log, existing.id, fields);
+      assetId = existing.id;
+    } else {
+      const name = `第${episode.episode_number || 0}集 成片${episode.title ? `：${episode.title}` : ''}`;
+      assetId = assetService.create(db, log, { ...fields, name }).id;
+    }
+    const mediaStorage = require('./mediaStorageService');
+    const cfg = require('../config').loadConfig();
+    if (mediaStorage.isOss(cfg)) {
+      try { await mediaStorage.mirrorAndTrack(db, cfg, storageRoot, localPath, 'asset', assetId, log); }
+      catch (error) { log.warn('成片 OSS 镜像待重试', { asset_id: assetId, error: error.message }); }
+    }
+    log.info('成片已登记为项目素材', { asset_id: assetId, episode_id: episodeId, merge_id: mergeId, updated: !!existing });
+    return assetId;
+  } catch (error) {
+    log.warn('成片登记为素材失败（不影响合并结果）', { episode_id: episodeId, error: error.message });
+    return null;
+  }
+}
+
+// 历史成片回填：登记逻辑上线前合并完成的剧集不在素材表里。自动修复历史数据必须
+// 显式触发（管理员端点 + confirm），这里只提供幂等的批量入口，逐条复用登记函数。
+async function backfillMergedFinalAssets(db, log, cfg) {
+  const raw = cfg?.storage?.local_path || './data/storage';
+  const storageRoot = path.isAbsolute(raw) ? raw : path.join(process.cwd(), raw);
+  const { normalizeMediaReference } = require('./mediaAuthorizationService');
+  const episodes = db.prepare(`SELECT e.id, e.video_url FROM episodes e
+    JOIN dramas d ON d.id = e.drama_id AND d.deleted_at IS NULL
+    WHERE e.deleted_at IS NULL AND e.video_url IS NOT NULL AND TRIM(e.video_url) <> ''
+      AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.deleted_at IS NULL AND a.source_type = 'merged_final'
+        AND json_extract(a.metadata_json, '$.episode_id') = e.id)
+    ORDER BY e.id`).all();
+  const result = { candidates: episodes.length, registered: 0, skipped: 0 };
+  for (const episode of episodes) {
+    const localPath = normalizeMediaReference(episode.video_url, storageRoot);
+    const abs = localPath ? path.join(storageRoot, localPath.replace(/\//g, path.sep)) : null;
+    if (!abs || !fs.existsSync(abs)) { result.skipped += 1; continue; }
+    const merge = db.prepare("SELECT id FROM video_merges WHERE episode_id = ? AND status = 'completed' AND deleted_at IS NULL ORDER BY completed_at DESC, id DESC LIMIT 1").get(episode.id);
+    const assetId = await registerMergedFinalAsset(db, log, { episodeId: episode.id, mergeId: merge?.id ?? null, localPath, storageRoot });
+    if (assetId) result.registered += 1; else result.skipped += 1;
+  }
+  log.info('历史成片素材回填完成', result);
+  return result;
+}
+
+module.exports = {
+  list,
+  getById,
+  create,
+  deleteById,
+  processVideoMerge,
+  registerMergedFinalAsset,
+  backfillMergedFinalAssets,
+};

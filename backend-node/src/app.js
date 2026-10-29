@@ -1,0 +1,267 @@
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const { randomUUID } = require('crypto');
+const { getDb } = require('./db/index.js');
+const { loadConfig, getActiveProfile } = require('./config/index.js');
+const logger = require('./logger.js');
+const { setupRouter } = require('./routes/index.js');
+const response = require('./response.js');
+
+function resolveHttpErrorStatus(err) {
+  if (err?.code === 'LIMIT_FILE_SIZE' || String(err?.message || '').includes('File too large')) return 413;
+  const status = Number(err?.status || err?.statusCode);
+  return Number.isInteger(status) && status >= 400 && status < 500 ? status : 500;
+}
+
+function revisionInfo() {
+  const revision = String(process.env.APP_REVISION || '').trim();
+  return revision ? { revision } : {};
+}
+
+function readinessStatus(db, webDist) {
+  const checks = { database: false, frontend: false };
+  try {
+    checks.database = db.prepare('SELECT 1 AS ok').get()?.ok === 1;
+  } catch (_) {}
+  checks.frontend = fs.existsSync(path.join(webDist, 'index.html'));
+  return {
+    status: checks.database && checks.frontend ? 'ready' : 'not_ready',
+    checks,
+    profile: getActiveProfile(),
+    ...revisionInfo(),
+  };
+}
+
+function createApp() {
+  const config = loadConfig();
+  const db = getDb(config.database);
+  const { runMigrationsAndEnsure } = require('./db/migrate.js');
+  runMigrationsAndEnsure(db);
+  const { ensureBootstrapAdmin, validateRuntimeSecurity } = require('./services/authService');
+  validateRuntimeSecurity(db);
+  ensureBootstrapAdmin(db, logger);
+  // A successful call without verifiable usage remains frozen for reconciliation.
+  // This sweep makes the timeout release deterministic even if no request follows it.
+  const billingService = require('./services/billingService');
+  try { billingService.recoverInterruptedImageReconciliations(db); }
+  catch (error) { logger.warn('interrupted image billing recovery failed', { error: error.message }); }
+  try {
+    const result = billingService.recoverCompletedVideoReconciliations(db);
+    if (result.recovered) logger.warn('recovered completed video billing reconciliations', result);
+  } catch (error) { logger.warn('completed video billing recovery failed', { error: error.message }); }
+  try {
+    const result = billingService.recoverInterruptedTextReconciliations(db);
+    if (result.recovered) logger.warn('recovered interrupted text billing reconciliations', result);
+  } catch (error) { logger.warn('interrupted text billing recovery failed', { error: error.message }); }
+  // 后处理阶段（插帧/超分）滞留授权兜底：未调用供应商的自动释放，已调用的转待对账
+  try {
+    const result = billingService.recoverStuckStageAuthorizations(db);
+    if (result.voided || result.reconciled) logger.warn('recovered stuck stage authorizations', result);
+  } catch (error) { logger.warn('stuck stage authorization recovery failed', { error: error.message }); }
+  // 历史计费流水的分组快照回填（幂等，仅填 NULL 行；未启用分组的环境自动跳过）
+  try {
+    const result = billingService.backfillTenantSnapshots(db);
+    if (result && !result.skipped && (result.transactions || result.usage_logs)) {
+      logger.info('billing tenant snapshot backfilled', result);
+    }
+  } catch (error) { logger.warn('billing tenant snapshot backfill failed', { error: error.message }); }
+  const reconcileExpired = () => {
+    try {
+      const result = billingService.expireReconciliationCases(db);
+      if (result.expired) logger.warn('billing reconciliation cases expired', result);
+    } catch (error) { logger.warn('billing reconciliation sweep failed', { error: error.message }); }
+  };
+  reconcileExpired();
+  const reconciliationTimer = setInterval(reconcileExpired, 60 * 1000);
+  if (typeof reconciliationTimer.unref === 'function') reconciliationTimer.unref();
+
+  // 厂商锁定模式：在迁移完成后同步 vendor_lock 配置
+  const { applyVendorLock } = require('./services/aiConfigService');
+  applyVendorLock(db, logger, config);
+  const log = logger;
+
+  const { resumeProcessingVideoGenerations, reconcileUnarchivedCompletedVideos, resumeCompletedPostprocessVideoGenerations, resumePendingVideoArchives, resumeMissingVideoPosters, startPendingVideoArchiveRetry } = require('./services/videoService');
+  // A resolved/waived reconciliation case may have completed its stage output
+  // while the process was down. Queue the durable finalizer on startup.
+  try {
+    const result = billingService.recoverResolvedVideoReconciliations(db, log);
+    if (result.queued) log.info('queued resolved video reconciliation recovery', result);
+  } catch (error) { log.warn('resolved video reconciliation recovery failed', { error: error.message }); }
+  reconcileUnarchivedCompletedVideos(db, log);
+  resumeProcessingVideoGenerations(db, log);
+  const postprocessRecovery = resumeCompletedPostprocessVideoGenerations(db, log);
+  if (postprocessRecovery?.queued) log.info('queued completed video post-process recovery', postprocessRecovery);
+  resumePendingVideoArchives(db, log);
+  resumeMissingVideoPosters(db, log);
+  const videoStoragePath = path.isAbsolute(config.storage?.local_path)
+    ? config.storage.local_path
+    : path.join(process.cwd(), config.storage?.local_path || './data/storage');
+  require('./services/videoUpscaleService').resumePending(db, log, videoStoragePath);
+  require('./services/videoInterpolationService').resumePending(db, log, videoStoragePath);
+  // 流式上传的临时文件在进程被杀时不会有任何请求线程回收它，启动时清扫超时残留。
+  try { require('./services/mediaAssetService').sweepUploadTemp(videoStoragePath, log); }
+  catch (error) { log.warn('上传临时目录清扫失败', { error: error.message }); }
+  startPendingVideoArchiveRetry(db, log);
+  require('./services/operationsReportService').startDailyReporting(db, log);
+  require('./services/providerPriceService').startHourlySync(db, log);
+  if (require('./config').getActiveProfile() !== 'dev') require('./services/supplierCostSnapshotService').startDailySync(db, log);
+  require('./services/assetSd2Service').resumePendingCertifications(db, log, config);
+  require('./services/richbestAssetRebindService').startRecovery(db, log, config);
+  require('./services/omniVideoService').startSd2WaitingGenerationRecovery(db, log);
+  require('./services/imageService').resumePendingCreativeBoardImages(db, log);
+  try { require('./services/creativeBoardDeliveryService').resume(db, log); }
+  catch (error) { log.warn('画布交付恢复失败', { error: error.message }); }
+  try { require('./services/lasMediaJobService').resume(db, log, config); }
+  catch (error) { log.warn('LAS 媒体任务恢复失败', { error: error.message }); }
+  try { require('./services/viralEditJobService').resume(db, log, config); }
+  catch (error) { log.warn('投流剪辑任务恢复失败', { error: error.message }); }
+  const paymentRecovery = require('./services/paymentService').createPaymentService(db, config, log);
+  const reconcilePayments = () => paymentRecovery.recover(50).catch((error) => log.warn('payment recovery sweep failed', { error: error.message }));
+  reconcilePayments();
+  const paymentTimer = setInterval(reconcilePayments, 60 * 1000);
+  if (typeof paymentTimer.unref === 'function') paymentTimer.unref();
+  const taskService = require('./services/taskService');
+  taskService.failOrphanedAsyncTasksOnStartup(db, log);
+
+  const app = express();
+  app.set('query parser', 'extended');
+  // Only explicitly trusted proxy addresses may supply the recovery rate-limit IP.
+  if (process.env.AUTH_TRUST_PROXY) app.set('trust proxy', process.env.AUTH_TRUST_PROXY.split(',').map((value) => value.trim()).filter(Boolean));
+  const webDist = process.env.WEB_DIST_PATH || path.join(process.cwd(), '..', 'frontweb', 'dist');
+  // WeChat Pay signs the exact JSON bytes. Preserve them before parsing.
+  app.use(express.json({
+    limit: '10mb',
+    verify(req, _res, buffer) {
+      if (req.originalUrl?.includes('/payments/callbacks/wechat')) req.rawBody = Buffer.from(buffer);
+    },
+  }));
+  app.use(express.urlencoded({ extended: true }));
+
+  const allowedOrigins = Array.isArray(config.server.cors_origins) ? config.server.cors_origins.filter(Boolean) : [];
+  app.use(cors({
+    origin(origin, callback) {
+      // Same-origin production traffic has no Origin header. Cross-origin traffic
+      // must be explicitly allow-listed so HttpOnly media-session cookies are safe.
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(null, process.env.NODE_ENV !== 'production' && allowedOrigins.length === 0);
+    },
+    credentials: true,
+  }));
+
+  app.use((req, res, next) => {
+    const requestId = String(req.get('x-request-id') || randomUUID()).slice(0, 128);
+    const startedAt = process.hrtime.bigint();
+    req.requestId = requestId;
+    res.setHeader('X-Request-ID', requestId);
+    res.on('finish', () => {
+      const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+      log.info('HTTP request completed', {
+        request_id: requestId,
+        method: req.method,
+        path: req.path,
+        status_code: res.statusCode,
+        duration_ms: Math.round(durationMs * 100) / 100,
+        ...(req.auth?.id ? { user_id: Number(req.auth.id) } : {}),
+        ...(res.locals.authErrorCode ? { auth_error_code: res.locals.authErrorCode } : {}),
+      });
+    });
+    next();
+  });
+
+  // 静态资源目录统一转为绝对路径，避免工作目录变化导致路径解析异常。
+  const storageRoot = config.storage?.local_path
+    ? (path.isAbsolute(config.storage.local_path)
+        ? config.storage.local_path
+        : path.join(process.cwd(), config.storage.local_path))
+    : path.join(process.cwd(), 'data', 'storage');
+  try {
+    if (!fs.existsSync(storageRoot)) fs.mkdirSync(storageRoot, { recursive: true });
+    const mediaStorage = require('./services/mediaStorageService');
+    const { requireAuth } = require('./middleware/auth');
+    // Media authorization is database-backed, so authentication remains in
+    // the route even when an old config explicitly disabled `protect_static`.
+    // The handler then checks the requested key against the current user's
+    // project, asset, generation, or explicitly global library record.
+    app.use('/static', requireAuth(db), mediaStorage.staticHandler(config, storageRoot, {
+      db,
+      privateCache: true,
+      storageRoot,
+      sharedPrefixes: config.security?.static_shared_prefixes,
+    }));
+    mediaStorage.startArchiveScheduler(config, storageRoot, log, { db });
+  } catch (e) {
+    console.warn('Static storage mount skipped:', e.message);
+  }
+
+  app.get('/health', (req, res) => {
+    res.json({
+      status: 'ok',
+      app: config.app.name,
+      version: config.app.version,
+      ...revisionInfo(),
+    });
+  });
+
+  app.get('/ready', (req, res) => {
+    const result = readinessStatus(db, webDist);
+    res.status(result.status === 'ready' ? 200 : 503).json(result);
+  });
+
+  app.use('/api/v1', setupRouter(config, db, log));
+
+  // 前端静态资源；测试或自定义部署可用 WEB_DIST_PATH 覆盖默认目录。
+  console.log('webDist', webDist);
+  if (fs.existsSync(webDist)) {
+    app.use('/assets', express.static(path.join(webDist, 'assets')));
+    app.use('/assets', (req, res) => res.set('Cache-Control', 'no-store').status(404).end());
+    // 服务 dist 根目录的静态文件（如 wx.jpg、favicon.ico 等）
+    app.use(express.static(webDist, { index: false }));
+    app.get('/favicon.ico', (req, res) => {
+      const fav = path.join(webDist, 'favicon.ico');
+      if (fs.existsSync(fav)) res.sendFile(fav);
+      else res.status(404).end();
+    });
+    app.get('/{*splat}', (req, res, next) => {
+      if (req.path.startsWith('/api')) return next();
+      const indexHtml = path.join(webDist, 'index.html');
+      if (fs.existsSync(indexHtml)) res.sendFile(indexHtml);
+      else next();
+    });
+  } else {
+    app.get('/', (req, res) => {
+      res.send(
+        '<!DOCTYPE html><html><head><meta charset="utf-8"><title>瑞池传媒短剧平台</title></head><body>' +
+          '<h1>瑞池传媒短剧平台 API</h1><p>后端已启动。请先构建前端：</p>' +
+          '<pre>cd web &amp;&amp; pnpm install &amp;&amp; pnpm build</pre>' +
+          '<p>然后将 <code>web/dist</code> 放到与 backend-node 同级的 <code>web/dist</code>，或访问 <a href="/health">/health</a> 检查接口。</p></body></html>'
+      );
+    });
+  }
+
+  app.use((req, res) => {
+    if (req.path.startsWith('/api')) {
+      return res.status(404).json({ error: 'API endpoint not found' });
+    }
+    res.status(404).send('Not Found');
+  });
+
+  app.use((err, req, res, next) => {
+    log.errorw('Unhandled error', { error: err.message, path: req.path });
+    if (!res.headersSent) {
+      const isFileTooLarge = err.code === 'LIMIT_FILE_SIZE' || (err.message && err.message.includes('File too large'));
+      const status = resolveHttpErrorStatus(err);
+      // express.sendFile reports an invalid or stale media Range as 416. This
+      // is a normal media protocol response, not an application failure.
+      if (status === 416) return res.status(416).set('Content-Range', 'bytes */*').end();
+      const message = isFileTooLarge ? '文件超过此上传接口的大小限制，请压缩后重试' : err;
+      response.error(res, status, isFileTooLarge ? 'FILE_TOO_LARGE' : (status === 500 ? 'INTERNAL_ERROR' : 'REQUEST_ERROR'),
+        status === 500 ? response.INTERNAL_ERROR_MESSAGE : message);
+    }
+  });
+
+  return { app, config, db };
+}
+
+module.exports = { createApp, resolveHttpErrorStatus, readinessStatus, revisionInfo };

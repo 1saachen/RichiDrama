@@ -1,0 +1,126 @@
+import { createRouter, createWebHistory } from 'vue-router'
+import { safeRedirectPath } from '@/utils/routeRecovery'
+import { readAuthUser } from '@/utils/authUser'
+import { confirmProjectNavigation } from '@/utils/projectNavigation'
+import { ElMessage } from 'element-plus'
+import { clearRouteChunkRetry, isRouteChunkError, recoverRouteChunk } from '@/utils/routeChunkRecovery'
+
+// Preview builds bake a " (preview)" suffix in (Dockerfile.preview's
+// PREVIEW_TITLE_BADGE); production builds leave it empty.
+const TITLE_BADGE = import.meta.env.VITE_TITLE_BADGE || ''
+
+const router = createRouter({
+  history: createWebHistory(import.meta.env.BASE_URL),
+  routes: [
+    { path: '/forgot-password', component: () => import('@/views/PasswordRecovery.vue'), meta: { public: true, title: '找回密码' } },
+    { path: '/change-password', component: () => import('@/views/PasswordRecovery.vue'), meta: { title: '设置新密码' } },
+    { path: '/login', name: 'login', component: () => import('@/views/Login.vue'), meta: { public: true, title: '登录' } },
+    { path: '/account', name: 'account', component: () => import('@/views/AccountCenter.vue'), meta: { title: '账户中心' } },
+    { path: '/admin/costs', name: 'admin-costs', component: () => import('@/views/CostAccounting.vue'), meta: { title: '消耗与成本', admin: true } },
+    { path: '/admin/operations', name: 'admin-operations', component: () => import('@/views/OperationsScale.vue'), meta: { title: '运营告警与报表', admin: true } },
+    { path: '/admin', name: 'admin', component: () => import('@/views/AdminConsole.vue'), meta: { title: '后台管理', admin: true } },
+    {
+      path: '/',
+      name: 'list',
+      component: () => import('@/views/FilmList.vue'),
+      meta: { title: '项目列表' }
+    },
+    {
+      path: '/drama/:id',
+      name: 'drama-detail',
+      component: () => import('@/views/DramaDetail.vue'),
+      meta: { title: '剧集管理' }
+    },
+    {
+      path: '/film/:id',
+      name: 'film',
+      component: () => import('@/views/FilmCreate.vue'),
+      meta: { title: 'AI 视频生成' }
+    },
+    {
+      path: '/film/:id/canvas',
+      name: 'film-canvas',
+      component: () => import('@/views/DramaCanvas.vue'),
+      meta: { title: '画布模式' }
+    },
+    { path: '/creative-boards', name: 'creative-board-list', component: () => import('@/views/CreativeBoardList.vue'), meta: { title: '我的画布' } },
+    { path: '/creative-boards/:id', name: 'creative-board', component: () => import('@/views/CreativeBoard.vue'), meta: { title: '纯画布' } },
+    {
+      path: '/ai-config',
+      name: 'ai-config',
+      component: () => import('@/views/AiConfig.vue'),
+      meta: { title: 'AI 配置', admin: true }
+    },
+    {
+      path: '/free-create',
+      name: 'free-create',
+      component: () => import('@/views/FreeCreate.vue'),
+      meta: { title: '全能视频' }
+    },
+    {
+      path: '/generation-history/:id',
+      name: 'generation-history-detail',
+      component: () => import('@/views/GenerationHistoryDetail.vue'),
+      meta: { title: '生成记录详情' }
+    },
+    {
+      path: '/media-library',
+      name: 'media-library',
+      component: () => import('@/views/MediaLibrary.vue'),
+      meta: { title: '媒体素材库' }
+    },
+    {
+      path: '/ai-tools',
+      name: 'ai-tools',
+      component: () => import('@/views/AITools.vue'),
+      meta: { title: 'AI 工具箱' }
+    },
+    {
+      path: '/ai-tools/:kind(script-analysis|script-analysis-stream|script-writing|reverse-prompt)',
+      name: 'tool-workbench',
+      component: () => import('@/views/ToolWorkbench.vue'),
+      props: (route) => ({ kind: ({ 'script-analysis': 'script_analysis', 'script-analysis-stream': 'script_analysis_stream', 'script-writing': 'script_writing', 'reverse-prompt': 'reverse_prompt' })[route.params.kind] }),
+      meta: { title: 'AI 工具工作台' }
+    },
+    {
+      path: '/ai-tools/image-generation',
+      name: 'tool-image-generation',
+      component: () => import('@/views/ToolMediaGeneration.vue'),
+      props: { media: 'image' },
+      meta: { title: '图片生成工作台' }
+    },
+    {
+      path: '/ai-tools/video-generation',
+      name: 'tool-video-generation',
+      component: () => import('@/views/ToolMediaGeneration.vue'),
+      props: { media: 'video' },
+      meta: { title: '视频生成工作台' }
+    },
+    { path: '/ai-tools/video-localization', name: 'video-localization', component: () => import('@/views/VideoLocalization.vue'), meta: { title: '视频本地化' } }
+  ]
+})
+
+router.beforeEach(confirmProjectNavigation)
+router.onError((error, to) => {
+  if (!isRouteChunkError(error)) return
+  if (!recoverRouteChunk(to.fullPath)) ElMessage.error('页面资源加载失败，请检查网络后刷新重试')
+})
+router.afterEach((to, from, failure) => {
+  if (!failure) clearRouteChunkRetry()
+})
+router.beforeEach((to) => {
+  if (to.meta.title) {
+    document.title = `${to.meta.title} - 瑞池传媒短剧平台${TITLE_BADGE}`
+  }
+  const user = readAuthUser()
+  if (!to.meta.public && !localStorage.getItem('lmd_auth_token')) return { path: '/login', query: { redirect: to.fullPath } }
+  if (user?.must_change_password && localStorage.getItem('lmd_auth_token') && to.path !== '/change-password') return '/change-password'
+  if (to.path === '/change-password' && !user?.must_change_password) return '/account'
+  if (to.meta.admin && user?.console_access !== true) return '/'
+  if (to.path === '/login' && localStorage.getItem('lmd_auth_token')) {
+    return safeRedirectPath(to.query.redirect, '/')
+  }
+  return true
+})
+
+export default router

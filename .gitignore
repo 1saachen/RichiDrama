@@ -1,0 +1,45 @@
+参考前端/
+.trae
+backend-node/scripts
+backend-node/configs/ai-configs-stary.json
+backend-node/configs/ai-configs-qudao.json
+backend-node/configs/ai-configs-2026-03-12 (5).json
+data/drama_generator.db
+data/drama_generator.db-shm
+data/drama_generator.db-wal
+.opencode
+.cursor
+server
+desktop/
+.DS_Store
+backend-node/deploy-pack
+build
+frontweb-edu
+.superpowers
+build_edu
+
+# ---- Docker 部署相关（按部署规范） ----
+# 运行时数据卷：SQLite 库 + 上传/生成素材（绝不提交）
+volumes/
+# 本地环境变量（含密钥/端口覆盖，不提交）
+.env
+.env.*
+.*.env
+minidrama.oss.env
+
+# 运行时临时日志/垃圾文件
+nul
+*.restart-current.*.log
+backend-node/backend-restart-current.*.log
+frontweb/frontweb-restart-current.*.log
+
+# 本地依赖、运行日志、数据库及 Windows 媒体工具不提交
+node_modules/
+*.log
+*.out
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+backend-node/tools/ffmpeg/*.exe

@@ -1,0 +1,69 @@
+name: Production Deploy
+
+on:
+  workflow_run:
+    workflows: [Validation]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      vars.ENABLE_SERVER_DEPLOY == 'true' &&
+      (
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    environment: production
+    steps:
+      - name: Resolve release revision
+        id: revision
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [[ "$EVENT_NAME" == workflow_run ]]; then sha="$WORKFLOW_SHA"; else sha="${GITHUB_SHA}"; fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Deploy approved release from a server-side fetch
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: root
+          key: ${{ secrets.SERVER_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          command_timeout: 45m
+          script: |
+            set -euo pipefail
+            sha='${{ steps.revision.outputs.sha }}'
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+            repo='/data/apps/LocalMiniDrama'
+            test -d "$repo/.git"
+            # The runner only sends the commit SHA: every byte crosses from
+            # GitHub over this server's own SSH connection, not an SCP push.
+            if ! timeout 300s git -C "$repo" fetch origin main --no-tags; then
+              echo 'fetch failed; switching origin to SSH port 22 and retrying once'
+              git -C "$repo" remote set-url origin git@github.com:${{ github.repository }}.git
+              timeout 300s git -C "$repo" fetch origin main --no-tags
+            fi
+            # Only the exact commit that Validation approved may be released;
+            # a newer merge aborts here and its own queued deploy takes over.
+            test "$(git -C "$repo" rev-parse FETCH_HEAD)" = "$sha"
+            incoming="/data/minidrama-incoming/${sha}.tar.gz"
+            bootstrap="/data/minidrama-bootstrap/${sha}"
+            rm -rf -- "$bootstrap"
+            mkdir -p /data/minidrama-incoming "$bootstrap"
+            git -C "$repo" archive --format=tar.gz --output="$incoming" "$sha"
+            tar -xzf "$incoming" -C "$bootstrap"
+            bash "$bootstrap/deploy/release-deploy" "$sha"
+            rm -f -- "$incoming"
+            rm -rf -- "$bootstrap"

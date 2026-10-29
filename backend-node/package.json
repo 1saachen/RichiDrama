@@ -1,0 +1,37 @@
+{
+  "name": "richidrama-backend",
+  "version": "1.2.8",
+  "description": "Node.js backend for the RichiDrama production platform",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "migrate": "node src/db/migrate.js",
+    "migrate:verify": "node tools/verify-migrations.js",
+    "migrate:07": "node scripts/run-migration-07.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "adm-zip": "^0.6.0",
+    "alipay-sdk": "^4.14.0",
+    "better-sqlite3": "^13.0.3",
+    "buffer": "^6.0.3",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "js-yaml": "^4.3.2",
+    "jsonrepair": "^3.15.0",
+    "jsonwebtoken": "^9.0.3",
+    "multer": "^2.3.0",
+    "sharp": "^0.35.4",
+    "nodemailer": "^9.1.1",
+    "yjs": "^13.6.32",
+    "ws": "^8.21.3"
+  },
+  "overrides": {
+    "alipay-sdk": {
+      "urllib": "^4.9.1"
+    }
+  }
+}

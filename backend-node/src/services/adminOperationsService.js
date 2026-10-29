@@ -1,0 +1,421 @@
+// Read-only operational projections.  These queries deliberately do not mutate
+// historical jobs: the existing user-facing retry and billing routes remain the
+// only writers for those workflows.
+function page(query = {}) {
+  const page = Math.max(1, Number.parseInt(query.page, 10) || 1);
+  const page_size = Math.min(100, Math.max(1, Number.parseInt(query.page_size, 10) || 20));
+  return { page, page_size, offset: (page - 1) * page_size };
+}
+
+const ALERT_DEFAULTS = {
+  stale_minutes: 30,
+  failed_count: 3,
+  failed_window_hours: 24,
+  pending_reconciliation_count: 1,
+  archive_failed_count: 1,
+};
+
+function alertSettings(db) {
+  const rows = db.prepare('SELECT key, value, updated_at FROM operations_alert_settings').all();
+  const values = { ...ALERT_DEFAULTS };
+  for (const row of rows) if (Object.hasOwn(values, row.key)) values[row.key] = Number(row.value) || ALERT_DEFAULTS[row.key];
+  return { ...values, updated_at: rows.map((row) => row.updated_at).sort().at(-1) || null };
+}
+
+function saveAlertSettings(db, input = {}) {
+  const current = alertSettings(db); const at = new Date().toISOString();
+  const next = {};
+  for (const key of Object.keys(ALERT_DEFAULTS)) {
+    const raw = input[key] === undefined ? current[key] : Number(input[key]);
+    if (!Number.isFinite(raw) || raw < 1 || raw > 100000) throw new Error(`invalid alert threshold: ${key}`);
+    next[key] = Math.floor(raw);
+  }
+  const stmt = db.prepare(`INSERT INTO operations_alert_settings (key, value, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`);
+  db.transaction(() => Object.entries(next).forEach(([key, value]) => stmt.run(key, String(value), at)))();
+  return alertSettings(db);
+}
+
+function productionWhere(query = {}) {
+  const clauses = ['v.deleted_at IS NULL']; const args = [];
+  if (query.status) { clauses.push('v.status = ?'); args.push(String(query.status)); }
+  if (query.stage) {
+    const stage = String(query.stage);
+    if (stage === 'generation') clauses.push("v.status NOT IN ('upscale_pending','upscaling','interpolation_pending','interpolating')");
+    if (stage === 'upscale') clauses.push('v.upscale_status IS NOT NULL');
+    if (stage === 'interpolation') clauses.push('v.interpolation_status IS NOT NULL');
+    if (stage === 'archive') clauses.push('v.archive_status IS NOT NULL');
+  }
+  if (query.user_id) { clauses.push('v.owner_user_id = ?'); args.push(Number(query.user_id)); }
+  if (query.project_id) { clauses.push('v.drama_id = ?'); args.push(Number(query.project_id)); }
+  if (query.model) { clauses.push('v.model = ?'); args.push(String(query.model)); }
+  if (query.from) { clauses.push('v.created_at >= ?'); args.push(String(query.from)); }
+  if (query.to) { clauses.push('v.created_at <= ?'); args.push(String(query.to)); }
+  return { sql: clauses.join(' AND '), args };
+}
+
+function elapsedMs(startedAt, updatedAt) {
+  const start = Date.parse(startedAt || ''); const end = Date.parse(updatedAt || '');
+  return Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : null;
+}
+
+function stageMessage(key, status) {
+  const messages = {
+    generation: { processing: '供应商正在生成视频', persisting: '正在保存并规范最终成片', completed: '视频已完成', failed: '视频生成失败', retryable: '提交中断，可显式重试' },
+    upscale: { awaiting_source: '等待原片归档完成', pending: '等待超分队列', processing: '供应商正在进行 AI 超分', completed: '超分完成', failed: '超分失败，原片仍可用', skipped: '未选择超分' },
+    interpolation: { awaiting_source: '等待可用输入视频', pending: '等待插帧队列', processing: '供应商正在进行智能插帧', completed: '插帧完成', failed: '插帧失败，上一阶段视频仍可用', skipped: '未选择插帧' },
+    archive: { pending: '正在归档媒体', oss_synced: '媒体已归档', local: '本地媒体已就绪', local_ready: '本地媒体已就绪', failed: '归档失败，但本地媒体仍可播放' },
+  };
+  return messages[key]?.[status] || null;
+}
+
+// 供应商任务 ID 内嵌提交时间戳（北京时间）：cgt-20260818150006-xx 或
+// 2026081815015169FA09C11AE1E41E807C（前 14 位 yyyyMMddHHmmss）。
+// 阶段真实起点必须用它，而不是 job 登记时刻——三个 job 在任务提交时同毫秒
+// 预创建（登记+预授权），串行执行时后置阶段的登记时刻含大量排队等待，
+// 用它算"阶段耗时"会把前序阶段时长计入（曾出现插帧显示4分25秒、实际仅1分18秒）。
+function providerSubmitTime(id) {
+  const s = String(id || '');
+  const m = s.match(/^(?:cgt-)?(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+  if (!m) return null;
+  const utc = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]) - 8, Number(m[5]), Number(m[6]));
+  return Number.isFinite(utc) ? new Date(utc).toISOString() : null;
+}
+
+function stages(row) {
+  const stageStatus = (key) => row[`${key}_job_status`] || row[`${key}_status`] || 'not_selected';
+  // 优先用供应商任务 ID 解析提交时刻；amk 工具类任务 ID（amk-tool-…）不含时间戳，
+  // 回退到 provider_request_id（火山请求 ID 前 14 位即 yyyyMMddHHmmss 北京时间）。
+  const upSubmit = providerSubmitTime(row.upscale_provider_task_id) || providerSubmitTime(row.upscale_provider_request_id);
+  const ipSubmit = providerSubmitTime(row.interpolation_provider_task_id) || providerSubmitTime(row.interpolation_provider_request_id);
+  const raw = [
+    { key: 'generation', status: row.status, provider_task_id: row.provider_task_id || row.task_id || null, started_at: row.created_at, updated_at: row.updated_at },
+    { key: 'upscale', selected: stageStatus('upscale') !== 'not_selected', status: stageStatus('upscale'), provider_task_id: row.upscale_provider_task_id || null, started_at: row.upscale_created_at || null, updated_at: row.upscale_updated_at || null },
+    { key: 'interpolation', selected: stageStatus('interpolation') !== 'not_selected', status: stageStatus('interpolation'), provider_task_id: row.interpolation_provider_task_id || null, started_at: row.interpolation_created_at || null, updated_at: row.interpolation_updated_at || null },
+    { key: 'archive', selected: !!(row.archive_record_status || row.archive_status), status: row.archive_record_status || row.archive_status || 'not_selected', started_at: row.archive_created_at || null, updated_at: row.archive_updated_at || null },
+  ];
+  return raw.map((stage) => {
+    let { started_at: start, updated_at: end } = stage;
+    if (stage.key === 'generation') {
+      // 生成阶段止于首个后处理真实提交（无后处理则到任务完成），
+      // 避免把超分/插帧耗时计入"生成"。
+      const genEnd = upSubmit || ipSubmit || null;
+      if (genEnd) end = genEnd;
+    }
+    if (stage.key === 'upscale' && upSubmit) start = upSubmit;
+    if (stage.key === 'interpolation' && ipSubmit) start = ipSubmit;
+    return { ...stage, started_at: start, updated_at: end, elapsed_ms: elapsedMs(start, end), message: stage.status === 'cancelled' ? '阶段已取消，不再等待或处理' : stageMessage(stage.key, stage.status) };
+  });
+}
+
+function listProduction(db, query) {
+  const where = productionWhere(query); const meta = page(query);
+  const total = Number(db.prepare(`SELECT COUNT(*) total FROM video_generations v WHERE ${where.sql}`).get(...where.args).total || 0);
+  const rows = db.prepare(`SELECT v.*, u.username, d.title AS project_title,
+      up.status AS upscale_job_status, up.provider_task_id AS upscale_provider_task_id, up.provider_request_id AS upscale_provider_request_id, up.created_at AS upscale_created_at, up.updated_at AS upscale_updated_at, up.attempts AS upscale_attempts, up.error_msg AS upscale_error_msg,
+      ip.status AS interpolation_job_status, ip.provider_task_id AS interpolation_provider_task_id, ip.provider_request_id AS interpolation_provider_request_id, ip.created_at AS interpolation_created_at, ip.updated_at AS interpolation_updated_at, ip.attempts AS interpolation_attempts, ip.error_msg AS interpolation_error_msg,
+      ar.archive_status AS archive_record_status, ar.oss_key, ar.oss_etag, ar.verified_at, ar.local_delete_after, ar.archive_error AS archive_record_error, ar.archive_attempts AS archive_record_attempts, ar.created_at AS archive_created_at, ar.updated_at AS archive_updated_at, oj.id AS omni_job_id
+    FROM video_generations v
+    LEFT JOIN users u ON u.id=v.owner_user_id LEFT JOIN dramas d ON d.id=v.drama_id
+    LEFT JOIN video_upscale_jobs up ON up.video_generation_id=v.id
+    LEFT JOIN video_interpolation_jobs ip ON ip.video_generation_id=v.id
+    LEFT JOIN media_archive_records ar ON ar.source_type='video_generation' AND ar.source_id=v.id
+    LEFT JOIN omni_video_jobs oj ON oj.video_generation_id=v.id
+    WHERE ${where.sql} ORDER BY v.updated_at DESC, v.id DESC LIMIT ? OFFSET ?`).all(...where.args, meta.page_size, meta.offset);
+  return { items: rows.map((row) => ({ ...row, stages: stages(row), error_summary: row.error_msg || row.interpolation_error_msg || row.upscale_error_msg || row.archive_record_error || row.archive_error || null })), total, page: meta.page, page_size: meta.page_size };
+}
+
+function parseJson(value, fallback = null) {
+  if (value == null || value === '') return fallback;
+  if (typeof value === 'object') return value;
+  try { return JSON.parse(value); } catch (_) { return fallback; }
+}
+
+function safeLocalPath(value) {
+  const raw = String(value || '').trim();
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw) || raw.startsWith('//')) return null;
+  const normalized = raw.replace(/\\/g, '/').replace(/^\/+/, '').replace(/^static\//, '');
+  if (!normalized || normalized.split('/').includes('..')) return null;
+  return normalized;
+}
+
+function productionReproduction(db, row) {
+  const job = db.prepare(`SELECT * FROM omni_video_jobs
+    WHERE video_generation_id = ? ORDER BY id DESC LIMIT 1`).get(Number(row.id));
+  const snapshot = parseJson(job?.request_snapshot_json, {}) || {};
+  const storyboard = row.storyboard_id
+    ? db.prepare(`SELECT s.id, s.episode_id, s.title, s.deleted_at, e.deleted_at AS episode_deleted_at
+        FROM storyboards s LEFT JOIN episodes e ON e.id=s.episode_id WHERE s.id=?`).get(Number(row.storyboard_id))
+    : null;
+  const storedAssets = job ? db.prepare(`SELECT ja.*, a.name AS current_name, a.type AS current_type,
+      a.local_path AS current_local_path, a.thumbnail_local_path AS current_thumbnail_local_path,
+      a.deleted_at AS asset_deleted_at
+    FROM omni_video_job_assets ja LEFT JOIN assets a ON a.id=ja.asset_id
+    WHERE ja.omni_job_id=? ORDER BY ja.ordinal ASC, ja.id ASC`).all(Number(job.id)) : [];
+  const materials = storedAssets.map((item, index) => {
+    const stored = parseJson(item.snapshot_json, {}) || {};
+    const localPath = safeLocalPath(stored.local_path || item.current_local_path);
+    const thumbnailPath = safeLocalPath(stored.thumbnail_local_path || item.current_thumbnail_local_path);
+    return {
+      asset_id: item.asset_id == null ? null : Number(item.asset_id),
+      alias: item.alias || stored.alias || item.current_name || `素材 ${index + 1}`,
+      type: item.media_type || stored.type || item.current_type || 'image',
+      role: item.role || stored.role || 'reference',
+      usage: item.usage || stored.usage || 'reference',
+      ordinal: Number(item.ordinal) || index + 1,
+      send_to_model: !!item.send_to_model,
+      strategy: stored.strategy || null,
+      source: localPath ? 'local' : (stored.url || stored.model_url ? 'remote_snapshot' : 'asset_library'),
+      local_path: localPath,
+      thumbnail_local_path: thumbnailPath,
+      available: !!localPath || (!!item.asset_id && !item.asset_deleted_at),
+    };
+  });
+  if (!materials.length) {
+    const legacy = parseJson(row.reference_image_urls, []);
+    const urls = Array.isArray(legacy) ? legacy : [];
+    if (row.first_frame_url) urls.unshift(row.first_frame_url);
+    if (row.last_frame_url) urls.push(row.last_frame_url);
+    [...new Set(urls.filter(Boolean))].forEach((value, index) => materials.push({
+      asset_id: null, alias: `历史参考素材 ${index + 1}`, type: 'image', role: 'reference',
+      usage: index === 0 && row.first_frame_url ? 'first_frame' : 'reference', ordinal: index + 1,
+      send_to_model: true, strategy: null, source: safeLocalPath(value) ? 'local' : 'remote_snapshot',
+      local_path: safeLocalPath(value), thumbnail_local_path: null, available: !!safeLocalPath(value),
+    }));
+  }
+  const originalPrompt = require('./omniVideoService').originalPromptFromSnapshot(snapshot, row.prompt || '');
+  return {
+    video_generation_id: Number(row.id),
+    omni_job_id: job ? Number(job.id) : null,
+    drama_id: Number(row.drama_id) || null,
+    storyboard_id: Number(row.storyboard_id) || null,
+    episode_id: storyboard ? Number(storyboard.episode_id) || null : null,
+    storyboard_title: storyboard?.title || null,
+    prompt: originalPrompt,
+    provider_prompt: String(row.prompt || snapshot.prompt || ''),
+    prompt_document: snapshot.prompt_document && typeof snapshot.prompt_document === 'object' ? snapshot.prompt_document : { text: originalPrompt, refs: [] },
+    settings: {
+      model: snapshot.model || row.model || null,
+      creation_mode: snapshot.creation_mode || 'multi_reference',
+      aspect_ratio: snapshot.aspect_ratio || row.aspect_ratio || '16:9',
+      duration: Number(snapshot.duration || row.duration) || null,
+      resolution: snapshot.resolution || row.resolution || null,
+      upscale_resolution: snapshot.upscale_resolution || row.upscale_resolution || null,
+      target_fps: snapshot.target_fps || row.target_fps || null,
+      audio_strategy: snapshot.audio_strategy || job?.audio_strategy || 'reference_only',
+      keep_original_audio: !!snapshot.post_process?.keep_original_audio,
+      audio_volume: snapshot.post_process?.audio_volume ?? 1,
+      audio_fade_seconds: snapshot.post_process?.audio_fade_seconds ?? 0,
+    },
+    materials,
+    // The admin workbench reads this immutable snapshot. It does not open the
+    // owner's project and does not require the original storyboard to exist.
+    can_open_workbench: !!job,
+    unavailable_material_count: materials.filter((item) => !item.available).length,
+  };
+}
+
+function productionDetail(db, id) {
+  // Query explicitly so an ID cannot be confused with a list position.
+  const row = db.prepare(`SELECT v.*, u.username, d.title AS project_title,
+    up.status AS upscale_job_status, up.provider_task_id AS upscale_provider_task_id, up.provider_request_id AS upscale_provider_request_id, up.created_at AS upscale_created_at, up.updated_at AS upscale_updated_at, up.attempts AS upscale_attempts, up.error_msg AS upscale_error_msg,
+    ip.status AS interpolation_job_status, ip.provider_task_id AS interpolation_provider_task_id, ip.provider_request_id AS interpolation_provider_request_id, ip.created_at AS interpolation_created_at, ip.updated_at AS interpolation_updated_at, ip.attempts AS interpolation_attempts, ip.error_msg AS interpolation_error_msg,
+    ar.archive_status AS archive_record_status, ar.oss_key, ar.oss_etag, ar.verified_at, ar.local_delete_after, ar.archive_error AS archive_record_error, ar.archive_attempts AS archive_record_attempts, ar.created_at AS archive_created_at, ar.updated_at AS archive_updated_at, oj.id AS omni_job_id
+    FROM video_generations v LEFT JOIN users u ON u.id=v.owner_user_id LEFT JOIN dramas d ON d.id=v.drama_id
+    LEFT JOIN video_upscale_jobs up ON up.video_generation_id=v.id LEFT JOIN video_interpolation_jobs ip ON ip.video_generation_id=v.id
+    LEFT JOIN media_archive_records ar ON ar.source_type='video_generation' AND ar.source_id=v.id
+    LEFT JOIN omni_video_jobs oj ON oj.video_generation_id=v.id WHERE v.id=? AND v.deleted_at IS NULL`).get(Number(id));
+  if (!row) return null;
+  const authorizations = db.prepare(`SELECT id, type, amount_micro, reason, created_at FROM billing_transactions WHERE authorization_id IN (?, ?, ?) OR id IN (?, ?, ?)`)
+    .all(row.billing_authorization_id, row.upscale_billing_authorization_id, row.interpolation_billing_authorization_id, row.billing_authorization_id, row.upscale_billing_authorization_id, row.interpolation_billing_authorization_id);
+  return { ...row, stages: stages(row), authorizations, reproduction: productionReproduction(db, row), error_summary: row.error_msg || row.interpolation_error_msg || row.upscale_error_msg || row.archive_record_error || row.archive_error || null };
+}
+
+// —— 视频本地化（LAS）运营视图：耗时、失败阶段与 TOS 中转占用 ——
+function hasLasTable(db) {
+  return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='las_media_jobs'").get();
+}
+
+function lasFailurePhase(row) {
+  if (row.status === 'reconciliation') return 'reconcile';
+  if (row.status !== 'failed') return null;
+  const message = String(row.error_msg || '');
+  if (!row.submitted_at) return /TOS|上传/.test(message) ? 'transit_upload' : 'submit';
+  if (!row.completed_at) return /归档|结算|报价|输出/.test(message) ? 'archive' : 'provider';
+  return 'archive';
+}
+
+function lasTransitBytes(row) {
+  const objects = parseJson(row.tos_objects_json, {}) || {};
+  return Number(objects.input?.bytes || 0) + Number(objects.output_bytes || 0) + Number(objects.caption_bytes || 0);
+}
+
+function lasProjection(row) {
+  const input = parseJson(row.input_json, {}) || {};
+  const finished = ['completed', 'failed', 'reconciliation'].includes(row.status);
+  return {
+    id: row.id, owner_user_id: row.owner_user_id, username: row.username || null,
+    drama_id: row.drama_id, project_title: row.project_title || null,
+    stage: row.stage, status: row.status, model_level: input.model_level || null,
+    output_language: input.output_language || null, provider_task_id: row.provider_task_id || null,
+    error_msg: row.error_msg || null, failure_phase: lasFailurePhase(row),
+    created_at: row.created_at, submitted_at: row.submitted_at || null,
+    completed_at: row.completed_at || null, updated_at: row.updated_at,
+    provider_elapsed_ms: row.submitted_at ? elapsedMs(row.submitted_at, row.completed_at || (finished ? row.updated_at : null)) : null,
+    total_elapsed_ms: elapsedMs(row.created_at, finished ? row.updated_at : null),
+    transit_bytes: lasTransitBytes(row),
+    tos_cleanup_at: row.tos_cleanup_at || null,
+    tos_cleanup_attempts: Number(row.tos_cleanup_attempts || 0),
+    tos_policy: row.tos_policy || null,
+  };
+}
+
+function listLas(db, query = {}) {
+  if (!hasLasTable(db)) return { items: [], total: 0, page: 1, page_size: 20 };
+  const meta = page(query); const clauses = ['1=1']; const args = [];
+  if (query.status) { clauses.push('j.status = ?'); args.push(String(query.status)); }
+  if (query.stage) { clauses.push('j.stage = ?'); args.push(String(query.stage)); }
+  if (query.user_id) { clauses.push('j.owner_user_id = ?'); args.push(Number(query.user_id)); }
+  if (query.project_id) { clauses.push('j.drama_id = ?'); args.push(Number(query.project_id)); }
+  if (query.from) { clauses.push('j.created_at >= ?'); args.push(String(query.from)); }
+  if (query.to) { clauses.push('j.created_at <= ?'); args.push(String(query.to)); }
+  const where = clauses.join(' AND ');
+  const total = Number(db.prepare(`SELECT COUNT(*) total FROM las_media_jobs j WHERE ${where}`).get(...args).total || 0);
+  const rows = db.prepare(`SELECT j.*, u.username, d.title AS project_title FROM las_media_jobs j
+    LEFT JOIN users u ON u.id = j.owner_user_id LEFT JOIN dramas d ON d.id = j.drama_id
+    WHERE ${where} ORDER BY j.updated_at DESC, j.created_at DESC LIMIT ? OFFSET ?`).all(...args, meta.page_size, meta.offset);
+  return { items: rows.map(lasProjection), total, page: meta.page, page_size: meta.page_size };
+}
+
+function lasSummary(db) {
+  if (!hasLasTable(db)) return null;
+  const counts = db.prepare(`SELECT COUNT(*) total, SUM(status='completed') completed, SUM(status='failed') failed,
+    SUM(status='reconciliation') reconciling, SUM(status IN ('queued','submitting','processing','finalizing')) active
+    FROM las_media_jobs`).get();
+  const rows = db.prepare('SELECT status, tos_objects_json, tos_cleanup_at, tos_policy, submitted_at, completed_at, created_at, updated_at FROM las_media_jobs').all();
+  let pendingBytes = 0; let totalBytes = 0; let historyBytes = 0; let cleanupFailed = 0;
+  const durations = [];
+  for (const row of rows) {
+    const bytes = lasTransitBytes(row);
+    totalBytes += bytes;
+    if (!row.tos_cleanup_at) {
+      // 清理策略只覆盖新任务；历史对象计入「历史保留」而不是「待清理」。
+      if (row.tos_policy === 'cleanup') pendingBytes += bytes; else historyBytes += bytes;
+    }
+    if (row.status === 'completed' && row.tos_policy === 'cleanup' && !row.tos_cleanup_at && Number(row.tos_cleanup_attempts || 0) >= 5) cleanupFailed += 1;
+    if (row.submitted_at && row.completed_at) {
+      const ms = Date.parse(row.completed_at) - Date.parse(row.submitted_at);
+      if (Number.isFinite(ms) && ms >= 0) durations.push(ms);
+    }
+  }
+  const phaseCounts = db.prepare("SELECT error_msg, submitted_at, completed_at, status FROM las_media_jobs WHERE status IN ('failed','reconciliation')").all()
+    .reduce((acc, row) => { const phase = lasFailurePhase(row); acc[phase] = (acc[phase] || 0) + 1; return acc; }, {});
+  const viral = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='viral_edit_jobs'").get()
+    ? db.prepare(`SELECT COUNT(*) total, SUM(status='completed') completed, SUM(status='failed') failed,
+        SUM(status='reconciliation') reconciling, SUM(status IN ('queued','submitting','processing','finalizing')) active,
+        SUM(status='completed' AND tos_policy='cleanup' AND tos_cleanup_at IS NULL) pending_cleanup
+      FROM viral_edit_jobs`).get()
+    : null;
+  return {
+    ...counts, pending_transit_bytes: pendingBytes, total_transit_bytes: totalBytes, history_transit_bytes: historyBytes,
+    cleanup_failed: cleanupFailed, average_provider_ms: durations.length ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : null,
+    failure_phases: phaseCounts, viral,
+  };
+}
+
+function listArchives(db, query = {}) {
+  const meta = page(query); const clauses = ['1=1']; const args=[];
+  if (query.status) { clauses.push('archive_status=?'); args.push(String(query.status)); }
+  if (query.from) { clauses.push('updated_at>=?'); args.push(String(query.from)); }
+  if (query.to) { clauses.push('updated_at<=?'); args.push(String(query.to)); }
+  const where=clauses.join(' AND '); const total=Number(db.prepare(`SELECT COUNT(*) total FROM media_archive_records WHERE ${where}`).get(...args).total || 0);
+  return { items: db.prepare(`SELECT * FROM media_archive_records WHERE ${where} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`).all(...args,meta.page_size,meta.offset), total, page:meta.page,page_size:meta.page_size };
+}
+
+function overview(db, query = {}) {
+  const { sql, args } = productionWhere(query);
+  const production = db.prepare(`SELECT COUNT(*) total, SUM(status='completed') completed, SUM(status='failed') failed,
+    SUM(status IN ('processing','persisting','upscale_pending','upscaling','interpolation_pending','interpolating')) processing,
+    SUM(status IN ('retryable','invalid')) retryable FROM video_generations v WHERE ${sql}`).get(...args);
+  const postprocess = db.prepare("SELECT SUM(status='completed') completed, SUM(status IN ('failed','cancelled')) failed FROM video_upscale_jobs").get();
+  const interpolation = db.prepare("SELECT SUM(status='completed') completed, SUM(status IN ('failed','cancelled')) failed FROM video_interpolation_jobs").get();
+  const storage = db.prepare("SELECT archive_status status, COUNT(*) count FROM media_archive_records GROUP BY archive_status").all();
+  const billing = db.prepare("SELECT COALESCE(SUM(charged_micro),0) charged_micro FROM billing_usage_logs WHERE (? IS NULL OR created_at>=?) AND (? IS NULL OR created_at<=?)").get(query.from || null, query.from || null, query.to || null, query.to || null);
+  const frozen = db.prepare('SELECT COALESCE(SUM(frozen_micro),0) frozen_micro FROM billing_accounts').get();
+  const reconciliation = db.prepare("SELECT COUNT(*) count FROM billing_reconciliation_cases WHERE status='pending'").get();
+  const settings = alertSettings(db); const now = new Date();
+  const staleBefore = new Date(now.getTime() - settings.stale_minutes * 60 * 1000).toISOString();
+  const failedSince = new Date(now.getTime() - settings.failed_window_hours * 60 * 60 * 1000).toISOString();
+  const stale = db.prepare(`SELECT COUNT(*) count FROM video_generations
+    WHERE deleted_at IS NULL AND status IN ('processing','persisting','upscale_pending','upscaling','interpolation_pending','interpolating') AND updated_at < ?`).get(staleBefore).count;
+  // Legacy projectless jobs have no sequence/shot link. Their retry fingerprint
+  // is owner + model + prompt, with a short window for prompts edited on retry.
+  const supersededFailure = `NOT EXISTS (
+    SELECT 1 FROM video_generations newer
+    LEFT JOIN omni_video_jobs newer_job ON newer_job.video_generation_id = newer.id
+    WHERE newer.deleted_at IS NULL AND newer.status = 'completed' AND newer.id > v.id
+      AND ((v.storyboard_id IS NOT NULL AND newer.storyboard_id = v.storyboard_id)
+        OR (failed_job.shot_id IS NOT NULL AND newer_job.sequence_id = failed_job.sequence_id AND newer_job.shot_id = failed_job.shot_id)
+        OR (v.storyboard_id IS NULL AND failed_job.shot_id IS NULL AND newer.storyboard_id IS NULL AND newer_job.shot_id IS NULL
+          AND newer.owner_user_id = v.owner_user_id AND COALESCE(newer.model, '') = COALESCE(v.model, '')
+          AND (COALESCE(newer.prompt, '') = COALESCE(v.prompt, '')
+            OR julianday(newer.created_at) <= julianday(v.created_at, '+30 minutes'))))
+  )`;
+  const failed = db.prepare(`SELECT v.model, COUNT(*) count FROM video_generations v
+    LEFT JOIN omni_video_jobs failed_job ON failed_job.video_generation_id = v.id
+    WHERE v.deleted_at IS NULL AND v.status='failed' AND v.updated_at >= ? AND ${supersededFailure}
+    GROUP BY v.model HAVING COUNT(*) >= ? ORDER BY count DESC`).all(failedSince, settings.failed_count);
+  const archiveFailed = db.prepare("SELECT COUNT(*) count FROM media_archive_records WHERE archive_status='failed'").get().count;
+  const stageSummary = {
+    generation: db.prepare(`SELECT
+      SUM(status='completed') completed,
+      SUM(status='failed') failed,
+      SUM(status IN ('processing','persisting','retryable','invalid')) active
+      FROM video_generations WHERE deleted_at IS NULL`).get(),
+    upscale: db.prepare("SELECT SUM(status='completed') completed, SUM(status IN ('failed','cancelled')) failed, SUM(status IN ('pending','processing','awaiting_source')) active FROM video_upscale_jobs").get(),
+    interpolation: db.prepare("SELECT SUM(status='completed') completed, SUM(status IN ('failed','cancelled')) failed, SUM(status IN ('pending','processing','awaiting_source')) active FROM video_interpolation_jobs").get(),
+    archive: db.prepare("SELECT SUM(archive_status='oss_synced') completed, SUM(archive_status='failed') failed, SUM(archive_status IN ('pending','local_ready')) active FROM media_archive_records").get(),
+  };
+  const trendRows = db.prepare(`SELECT date(datetime(created_at, '+8 hours')) day,
+      COUNT(*) total, SUM(status='completed') completed, SUM(status='failed') failed
+      FROM video_generations WHERE deleted_at IS NULL AND created_at >= ? GROUP BY day ORDER BY day ASC`)
+    .all(new Date(now.getTime() - 6 * 24 * 60 * 60 * 1000).toISOString());
+  const trendByDay = new Map(trendRows.map((row) => [row.day, row]));
+  const trend = Array.from({ length: 7 }, (_, index) => {
+    const day = new Date(now.getTime() - (6 - index) * 24 * 60 * 60 * 1000).toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
+    return trendByDay.get(day) || { day, total: 0, completed: 0, failed: 0 };
+  });
+  const alerts = [];
+  if (stale) alerts.push({ key: 'stale_production', severity: 'warning', count: stale, threshold: settings.stale_minutes, target: { tab: 'production', status: 'processing' } });
+  for (const row of failed) alerts.push({ key: 'continuous_failures', severity: 'warning', count: row.count, model: row.model || null, threshold: settings.failed_count, target: { tab: 'production', status: 'failed', model: row.model || undefined } });
+  if (reconciliation.count >= settings.pending_reconciliation_count) alerts.push({ key: 'pending_reconciliation', severity: 'warning', count: reconciliation.count, threshold: settings.pending_reconciliation_count, target: { tab: 'reconciliations', status: 'pending' } });
+  if (archiveFailed >= settings.archive_failed_count) alerts.push({ key: 'archive_failed', severity: 'warning', count: archiveFailed, threshold: settings.archive_failed_count, target: { tab: 'archives', status: 'failed' } });
+  const actionQueue = [
+    ...db.prepare(`SELECT v.id, v.status, v.updated_at, v.model, v.error_msg, d.title AS project_title
+      FROM video_generations v LEFT JOIN dramas d ON d.id=v.drama_id
+      WHERE v.deleted_at IS NULL AND v.status IN ('processing','persisting','upscale_pending','upscaling','interpolation_pending','interpolating') AND v.updated_at < ?
+      ORDER BY v.updated_at ASC LIMIT 6`).all(staleBefore).map((row) => ({ ...row, kind: 'stalled', target: { tab: 'production', status: 'processing' } })),
+    ...db.prepare(`SELECT v.id, v.status, v.updated_at, v.model, v.error_msg, d.title AS project_title
+      FROM video_generations v LEFT JOIN dramas d ON d.id=v.drama_id
+      LEFT JOIN omni_video_jobs failed_job ON failed_job.video_generation_id = v.id
+      WHERE v.deleted_at IS NULL AND v.status IN ('failed','retryable','invalid') AND ${supersededFailure}
+      ORDER BY v.updated_at DESC LIMIT 6`).all().map((row) => ({ ...row, kind: 'failed', target: { tab: 'production', status: 'failed' } })),
+  ].sort((a, b) => String(a.updated_at).localeCompare(String(b.updated_at))).slice(0, 8);
+  return { generated_at:now.toISOString(), production, postprocess:{ upscale:postprocess, interpolation }, storage, billing:{...billing,...frozen,pending_reconciliations:reconciliation.count}, las:lasSummary(db), stage_summary:stageSummary, trend, alerts, action_queue:actionQueue, alert_settings:settings };
+}
+
+function csvCell(value) {
+  const raw = value === null || value === undefined ? '' : String(value);
+  return /[",\r\n]/.test(raw) ? `"${raw.replaceAll('"', '""')}"` : raw;
+}
+
+function productionCsv(db, query = {}) {
+  const where = productionWhere(query);
+  const rows = db.prepare(`SELECT v.id, u.username, d.title project_title, v.model, v.status, v.upscale_status, v.interpolation_status, v.archive_status, v.local_path, v.updated_at, v.error_msg
+    FROM video_generations v LEFT JOIN users u ON u.id=v.owner_user_id LEFT JOIN dramas d ON d.id=v.drama_id
+    WHERE ${where.sql} ORDER BY v.updated_at DESC, v.id DESC LIMIT 10000`).all(...where.args);
+  const headers = ['task_id','username','project_title','model','generation_status','upscale_status','interpolation_status','archive_status','local_path','updated_at','error_summary'];
+  return `\uFEFF${[headers, ...rows.map((row) => headers.map((key) => csvCell(row[key])).join(','))].map((row) => Array.isArray(row) ? row.join(',') : row).join('\r\n')}\r\n`;
+}
+
+module.exports = { overview, listProduction, productionDetail, listArchives, listLas, lasSummary, alertSettings, saveAlertSettings, productionCsv };

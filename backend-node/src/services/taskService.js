@@ -1,0 +1,197 @@
+const { randomUUID: uuidv4 } = require('node:crypto');
+const billingRequestContext = require('./billingRequestContext');
+
+function createTask(db, log, taskType, resourceId, ownerUserId = null, tenantId = null) {
+  const id = uuidv4();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO async_tasks (id, type, status, progress, message, resource_id, owner_user_id, tenant_id, created_at, updated_at)
+     VALUES (?, ?, 'pending', 0, '', ?, ?, ?, ?, ?)`
+  ).run(id, taskType, resourceId || '', ownerUserId, tenantId || null, now, now);
+  const projectId = billingRequestContext.current()?.drama_id;
+  if (projectId && require('./projectAccessService').installed(db)) {
+    db.prepare('INSERT OR IGNORE INTO project_task_links (task_id,drama_id) VALUES (?,?)').run(id, Number(projectId));
+  }
+  log.info('Task created', { task_id: id, type: taskType, resource_id: resourceId });
+  const task = getTask(db, id);
+  return task || { id, type: taskType, status: 'pending', progress: 0, message: '', resource_id: resourceId || '', created_at: now, updated_at: now, completed_at: null };
+}
+
+// 在 HTTP 请求作用域内创建任务:自动继承计费上下文中的归属用户与租户。
+// ownershipGuard 会拒绝 owner_user_id 为 NULL 的任务(GET /tasks/:id 直接 404),
+// 因此请求内创建的异步任务必须带归属人;后台链路(无请求上下文)可用 fallback 显式传入。
+function createTaskFromContext(db, log, taskType, resourceId, fallbackOwnerUserId = null, fallbackTenantId = null) {
+  const ctx = billingRequestContext.current();
+  return createTask(
+    db, log, taskType, resourceId,
+    fallbackOwnerUserId != null ? fallbackOwnerUserId : (ctx?.actor?.id ?? null),
+    fallbackTenantId != null ? fallbackTenantId : (ctx?.tenant_id ?? null)
+  );
+}
+
+function getTask(db, taskId) {
+  const row = db.prepare('SELECT * FROM async_tasks WHERE id = ? AND deleted_at IS NULL').get(taskId);
+  if (!row) return null;
+  return rowToTask(row);
+}
+
+function getTasksByResource(db, resourceId, ownerUserId) {
+  if (ownerUserId && require('./projectAccessService').installed(db)) {
+    return db.prepare(`SELECT t.* FROM async_tasks t WHERE t.resource_id=? AND t.deleted_at IS NULL
+      AND ((t.owner_user_id=? AND NOT EXISTS (SELECT 1 FROM project_task_links p JOIN project_collaboration c ON c.drama_id=p.drama_id JOIN dramas d ON d.id=p.drama_id AND d.deleted_at IS NULL WHERE p.task_id=t.id)) OR t.id IN (SELECT task_id FROM project_task_links WHERE drama_id IN (${require('./projectAccessService').projectIdsSql(db, ownerUserId)}))) ORDER BY t.created_at DESC`)
+      .all(resourceId, ownerUserId).map(rowToTask);
+  }
+  const ownerSql = ownerUserId ? ' AND owner_user_id = ?' : '';
+  const rows = db.prepare(
+    'SELECT * FROM async_tasks WHERE resource_id = ? AND deleted_at IS NULL' + ownerSql + ' ORDER BY created_at DESC'
+  ).all(...(ownerUserId ? [resourceId, ownerUserId] : [resourceId]));
+  return rows.map(rowToTask);
+}
+
+function updateTaskStatus(db, taskId, status, progress, message) {
+  const now = new Date().toISOString();
+  let completedAt = null;
+  if (status === 'completed' || status === 'failed') completedAt = now;
+  db.prepare(
+    `UPDATE async_tasks SET status = ?, progress = ?, message = ?, updated_at = ?, completed_at = ?
+     WHERE id = ?`
+  ).run(status, progress ?? 0, message || '', now, completedAt, taskId);
+}
+
+function releaseTaskAuthorization(db, taskId, reason) {
+  const billing = require('./billingService');
+  const candidates = [
+    ['image_generations', 'task_id'],
+    ['video_generations', 'task_id'],
+  ];
+  for (const [table, taskColumn] of candidates) {
+    const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table);
+    if (!exists) continue;
+    const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
+    if (!columns.has(taskColumn) || !columns.has('owner_user_id') || !columns.has('billing_authorization_id')) continue;
+    const row = db.prepare(`SELECT id, owner_user_id, billing_authorization_id FROM ${table} WHERE ${taskColumn}=?`).get(taskId);
+    if (!row?.owner_user_id) continue;
+    const tryVoid = (authorizationId, why) => {
+      if (!authorizationId) return;
+      try {
+        const release = table === 'image_generations' ? billing.voidImageAuthorization : billing.voidAuthorization;
+        release(db, { id: row.owner_user_id, role: 'admin' }, authorizationId, why);
+      } catch (_) {
+        // The original failure must remain terminal even if a historical billing
+        // record is malformed; reconciliation tooling can repair that record.
+      }
+    };
+    tryVoid(row.billing_authorization_id, reason || '异步任务失败，释放预授权');
+    // 视频任务还挂有独立的插帧/超分预授权，必须一并释放，否则会形成永久冻结
+    if (table === 'video_generations' && row.id != null) {
+      for (const stageTable of ['video_interpolation_jobs', 'video_upscale_jobs']) {
+        const stageExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(stageTable);
+        if (!stageExists) continue;
+        const stage = db.prepare(`SELECT billing_authorization_id FROM ${stageTable} WHERE video_generation_id=?`).get(row.id);
+        if (stage?.billing_authorization_id) {
+          tryVoid(stage.billing_authorization_id, (reason || '异步任务失败') + '，释放后处理阶段预授权');
+        }
+      }
+    }
+  }
+}
+
+function updateTaskError(db, taskId, errMsg) {
+  const now = new Date().toISOString();
+  try {
+    db.prepare(
+      `UPDATE async_tasks SET status = 'failed', error = ?, progress = 0, completed_at = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(errMsg || '', now, now, taskId);
+  } catch (e) {
+    if ((e.message || '').includes('error')) {
+      updateTaskStatus(db, taskId, 'failed', 0, errMsg || '任务失败');
+    } else throw e;
+  }
+  // Image/video workers share async_tasks.  Terminal task failure must always
+  // release unused reservations; dispatched images with unknown outcomes stay frozen.
+  releaseTaskAuthorization(db, taskId, errMsg || '异步任务失败，释放预授权');
+}
+
+function updateTaskResult(db, taskId, result, message = null) {
+  const now = new Date().toISOString();
+  const resultStr = typeof result === 'string' ? result : JSON.stringify(result || {});
+  db.prepare(
+    `UPDATE async_tasks SET status = 'completed', progress = 100, result = ?, message = COALESCE(?, message), completed_at = ?, updated_at = ?
+     WHERE id = ?`
+  ).run(resultStr, message, now, now, taskId);
+}
+
+function rowToTask(r) {
+  return {
+    id: r.id,
+    type: r.type,
+    status: r.status,
+    progress: r.progress ?? 0,
+    message: r.message,
+    error: r.error,
+    result: r.result,
+    resource_id: r.resource_id,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    completed_at: r.completed_at,
+  };
+}
+
+const ORPHAN_ASYNC_TASK_MSG = '服务重启后任务中断，请重新操作';
+const USER_CANCEL_TASK_MSG = '用户已取消';
+
+/**
+ * 用户主动取消进行中的异步任务（无法中断已在执行的 AI 调用，但会停止前端轮询并防止恢复）。
+ */
+function cancelTask(db, log, taskId, reason) {
+  const task = getTask(db, taskId);
+  if (!task) return { ok: false, reason: 'not_found' };
+  if (task.status === 'completed' || task.status === 'failed') {
+    return { ok: true, already_done: true, task };
+  }
+  const msg = (reason || USER_CANCEL_TASK_MSG).toString().trim() || USER_CANCEL_TASK_MSG;
+  updateTaskError(db, taskId, msg);
+  log.info('Task cancelled by user', { task_id: taskId, type: task.type });
+  return { ok: true, task: getTask(db, taskId) };
+}
+
+/**
+ * 进程内 setImmediate 任务在重启后会丢失；启动时将遗留的 pending/processing 标为失败，避免前端无限轮询。
+ */
+function failOrphanedAsyncTasksOnStartup(db, log) {
+  const hasVideoGenerations = !!db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'video_generations'").get();
+  const rows = db.prepare(
+    `SELECT id, type, status, resource_id FROM async_tasks
+     WHERE status IN ('pending', 'processing') AND deleted_at IS NULL${hasVideoGenerations
+       ? " AND id NOT IN (SELECT task_id FROM video_generations WHERE status IN ('processing', 'sd2_waiting', 'upscale_pending', 'upscaling', 'interpolation_pending', 'interpolating', 'persisting') AND task_id IS NOT NULL)"
+       : ''}`
+  ).all();
+  if (!rows.length) return 0;
+  log.warn('Failing orphaned async tasks after startup', { count: rows.length });
+  for (const row of rows) {
+    updateTaskError(db, row.id, ORPHAN_ASYNC_TASK_MSG);
+    log.info('Orphaned async task marked failed', {
+      task_id: row.id,
+      type: row.type,
+      resource_id: row.resource_id,
+      previous_status: row.status,
+    });
+  }
+  return rows.length;
+}
+
+module.exports = {
+  createTask,
+  createTaskFromContext,
+  getTask,
+  getTasksByResource,
+  updateTaskStatus,
+  updateTaskError,
+  updateTaskResult,
+  releaseTaskAuthorization,
+  failOrphanedAsyncTasksOnStartup,
+  cancelTask,
+  ORPHAN_ASYNC_TASK_MSG,
+  USER_CANCEL_TASK_MSG,
+};
