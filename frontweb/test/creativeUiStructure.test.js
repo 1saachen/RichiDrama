@@ -633,7 +633,7 @@ test('运营价目表展示条件费率，支持审计带视频和不带视频�
   assert.doesNotMatch(source, /默认命中：/)
   assert.match(source, /has_video_input: \{ true: '带视频', false: '不带视频' \}/)
   assert.match(source, /fps_tier: '帧率档'/)
-  assert.match(source, /pricing_note/)
+  assert.match(source, /priceRuleSummary\(priceConditions\(row\), row.meter\)/)
 })
 
 test('运营后台支持查看和调整用户项目分组', async () => {

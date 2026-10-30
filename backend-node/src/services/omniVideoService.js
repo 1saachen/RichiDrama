@@ -69,6 +69,8 @@ function reserveOutputTokens(billingSettings, options, duration) {
 }
 
 function buildAuthorizationUsage(meters, billingSettings, duration, options = {}) {
+  const relayUsage = require('./relayVideoBillingService').reservation(meters, options);
+  if (relayUsage) return relayUsage;
   const usage = {};
   if (meters.includes('second')) usage.second = Number(duration) || 15;
   if (meters.includes('request')) usage.request = 1;
@@ -101,7 +103,7 @@ function quote(db, body, payer) {
   let billingSettings = {};
   try { billingSettings = JSON.parse(config?.settings || '{}'); } catch (_) {}
   const meters = billing.activeMeters(db, payer, 'video', billingTarget.billing_key, billingTarget.provider);
-  const reserveOptions = { resolution: body.resolution || '480p', aspect_ratio: body.aspect_ratio || '16:9' };
+  const reserveOptions = { resolution: body.resolution || '480p', aspect_ratio: body.aspect_ratio || '16:9', model: billingTarget.provider_model, has_video_input: !!body.has_video_input, requested_duration: body.duration };
   // 与 create 的落库口径一致：缺省时长按 15s 估算，不再按 1s 报给用户。
   const reserveDuration = videoTokenEstimate.normalizeDurationSeconds(body.duration);
   const usage = buildAuthorizationUsage(meters, billingSettings, reserveDuration, reserveOptions);
@@ -179,7 +181,7 @@ function create(db, log, body, billingUser) {
   const upscaleResolution = body.upscale_resolution;
   const targetFps = body.target_fps;
   const meters = billing.activeMeters(db, payer, 'video', billingTarget.billing_key, billingTarget.provider);
-  const reserveOptions = { resolution: body.resolution || '480p', aspect_ratio: body.aspect_ratio || '16:9' };
+  const reserveOptions = { resolution: body.resolution || '480p', aspect_ratio: body.aspect_ratio || '16:9', model: billingTarget.provider_model, has_video_input: routed.some(asset => asset.type === 'video' && asset.send_to_model), requested_duration: body.duration };
   const usage = buildAuthorizationUsage(meters, billingSettings, body.duration, reserveOptions);
   if (!Object.keys(usage).length) throw new Error(`视频模型 ${billingTarget.billing_key} 未配置可用计费项，已拒绝调用`);
   const reserveBasis = usage.output_token ? videoTokenEstimate.describeReserve({ ...reserveOptions, duration: body.duration }) : null;

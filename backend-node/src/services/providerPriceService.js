@@ -11,7 +11,7 @@ const BILLING_VERSION = '2022-01-01';
 const POINTS_PER_CNY = 100;
 const MICRO_PER_POINT = 10000;
 const LOCK_MS = 10 * 60 * 1000;
-const MAPPING_RULE_VERSION = 'verified-platform-models-v7';
+const MAPPING_RULE_VERSION = 'verified-platform-models-v8';
 
 function now() { return new Date().toISOString(); }
 function parse(value, fallback = {}) { try { return value ? JSON.parse(value) : fallback; } catch (_) { return fallback; } }
@@ -695,7 +695,7 @@ async function sync(db, actorId, options = {}) {
     db.prepare('UPDATE provider_price_syncs SET source_config_id=? WHERE id=? AND source_config_id IS NULL').run(fetched.configId || null, id);
     const currentPrice = db.prepare('SELECT id,unit_price_micro,is_free,conditions_json FROM billing_price_book_items WHERE id=?');
     const baseline = rows.map(row => row.current_price_book_item_id ? currentPrice.get(row.current_price_book_item_id) : null);
-    const responseHash = sha256(`${JSON.stringify(stable(clean))}|${relay ? 'relay-pricing-v1' : MAPPING_RULE_VERSION}|${JSON.stringify(pricingConfigurations(db, provider))}|${JSON.stringify(stable(baseline))}`);
+    const responseHash = sha256(`${JSON.stringify(stable(clean))}|${relay ? 'relay-pricing-v2-vega' : MAPPING_RULE_VERSION}|${JSON.stringify(pricingConfigurations(db, provider))}|${JSON.stringify(stable(baseline))}`);
     const existing = db.prepare(`SELECT id FROM provider_price_syncs WHERE provider=? AND response_hash=? AND status='completed' AND id<>? LIMIT 1`).get(provider, responseHash, id);
     if (existing) {
       db.prepare(`UPDATE provider_price_syncs SET status='unchanged',response_hash=?,provider_request_ids_json=?,raw_response_json=?,fetched_at=?,updated_at=? WHERE id=?`)
@@ -732,6 +732,19 @@ function updateCandidate(db, actorId, syncId, candidateId, input = {}) {
     require('./billingService').audit(db, actorId, 'provider_price.candidate.review', 'provider_price_candidate', row.id, { sync_id: syncId, review_status: 'rejected' });
     return updated;
   }
+  // Official prices define their own units. Reviewers may approve the mapping,
+  // but must never reinterpret an unchanged supplier price as another meter.
+  if ([PROVIDER, RELAY_PROVIDER].includes(row.provider || PROVIDER)) {
+    for (const field of ['service_type', 'billing_key', 'meter', 'unit_size']) {
+      if (input[field] !== undefined && String(input[field]) !== String(row[field])) {
+        throw new Error('供应商计费规则由系统自动识别，不能修改服务、计费关联、计量单位或单位数量');
+      }
+    }
+    if (!reviewableOfficialCandidate(row)) throw new Error('此价格的计费规则尚未识别，不能接受或发布；请排除并等待规则适配');
+    db.prepare("UPDATE provider_price_candidates SET review_status='accepted',updated_at=? WHERE id=?").run(now(), row.id);
+    require('./billingService').audit(db, actorId, 'provider_price.candidate.review', 'provider_price_candidate', row.id, { sync_id: syncId, review_status: 'accepted' });
+    return db.prepare('SELECT * FROM provider_price_candidates WHERE id=?').get(row.id);
+  }
   const serviceType = String(input.service_type || row.service_type || '').trim();
   const billingKey = String(input.billing_key || row.billing_key || '').trim();
   const meter = String(input.meter || row.meter || '').trim();
@@ -746,6 +759,30 @@ function updateCandidate(db, actorId, syncId, candidateId, input = {}) {
   const updated = db.prepare('SELECT * FROM provider_price_candidates WHERE id=?').get(row.id);
   require('./billingService').audit(db, actorId, 'provider_price.candidate.review', 'provider_price_candidate', row.id, { sync_id: syncId, review_status: status, service_type: serviceType, billing_key: billingKey, meter, unit_size: unitSize });
   return updated;
+}
+
+function reviewableOfficialCandidate(row) {
+  return row.mapping_status === 'mapped' && !!row.service_type && !!row.billing_key
+    && ['request','image','input_image','second','millisecond','character','input_token','cache_token','output_token'].includes(row.meter)
+    && Number.isSafeInteger(row.unit_size) && row.unit_size > 0
+    && Number.isSafeInteger(row.new_unit_price_micro)
+    && !require('./supplierCostRates').fixedRate(row.provider_model)
+    && !require('./supplierCostRates').fixedRate(row.billing_key);
+}
+
+function acceptMappedCandidates(db, actorId, syncId) {
+  return db.transaction(() => {
+    const sync = db.prepare('SELECT * FROM provider_price_syncs WHERE id=?').get(syncId);
+    if (!sync || sync.status !== 'completed' || ![PROVIDER, RELAY_PROVIDER].includes(sync.provider)) throw new Error('请选择已完成的供应商价格同步批次');
+    if (db.prepare('SELECT id FROM billing_price_books WHERE source_sync_id=? LIMIT 1').get(syncId)) throw new Error('此批次已生成价目版本，不能批量审核；请重新同步');
+    const rows = db.prepare('SELECT * FROM provider_price_candidates WHERE sync_id=?').all(syncId);
+    const eligible = rows.filter(row => row.review_status === 'pending' && !candidateUnchanged(row) && reviewableOfficialCandidate(row));
+    const at = now();
+    const accept = db.prepare("UPDATE provider_price_candidates SET review_status='accepted',updated_at=? WHERE id=? AND review_status='pending'");
+    for (const row of eligible) accept.run(at, row.id);
+    if (eligible.length) require('./billingService').audit(db, actorId, 'provider_price.candidate.batch_accept', 'provider_price_sync', syncId, { candidate_ids: eligible.map(row => row.id), accepted_count: eligible.length });
+    return { accepted_count: eligible.length };
+  })();
 }
 
 function cloneItems(db, fromId, toId, at) {
@@ -826,6 +863,7 @@ function createDraft(db, actorId, syncId) {
       if (existing) db.prepare('UPDATE billing_price_book_items SET unit_price_micro=?,conditions_json=?,updated_at=? WHERE id=?').run(candidate.new_unit_price_micro, json(conditions), at, existing.id);
       else db.prepare(`INSERT INTO billing_price_book_items(price_book_id,service_type,model,meter,unit_price_micro,is_free,conditions_json,created_at,updated_at) VALUES (?,?,?,?,?,0,?,?,?)`).run(draftId, candidate.service_type, candidate.billing_key, candidate.meter, candidate.new_unit_price_micro, json(conditions), at, at);
     }
+    require('./priceBookRuleService').capture(db, draftId);
   })();
   require('./billingService').audit(db, actorId, 'provider_price.draft.create', 'price_book', draftId, { sync_id: syncId, parent_price_book_id: base?.id || null, provider });
   return require('./billingService').listPriceBooks(db).find((book) => book.id === draftId);
@@ -865,6 +903,7 @@ function publish(db, actorId, bookId, input = {}) {
   if (reused) return { reused: true, price_book: require('./billingService').listPriceBooks(db).find((book) => book.id === reused.id) };
   const draft = db.prepare("SELECT * FROM billing_price_books WHERE id=? AND status='draft'").get(bookId);
   if (!draft) throw new Error('只能发布草稿价目表');
+  require('./priceBookRuleService').assertEdit(db, draft, db.prepare('SELECT * FROM billing_price_book_items WHERE price_book_id=?').all(draft.id));
   const provider = String(draft.provider || '').trim();
   const sourceProvider = provider || PROVIDER;
   if (draft.source_sync_id && sourceMeta(sourceProvider).requiresSourceCheck) {
@@ -981,6 +1020,6 @@ function startHourlySync(db, log = console) {
 module.exports = {
   PROVIDER, RELAY_PROVIDER, sourceMeta, priceSources, currentSystemBook, signedHeaders, callOpenApi, fetchAllActivations, fetchBillDetails, chargeMeter, sourceUnitSize, normalizedPriceMicro, providerBillSummary, platformUsageSummary,
   contractPrice, verifiedMultiChargeSpecs, verifiedMultiChargeRows, buildCandidateRows,
-  probe, sourceCheck, sync, syncView, listSyncs, updateCandidate, createDraft, publish, rollback,
+  probe, sourceCheck, sync, syncView, listSyncs, updateCandidate, acceptMappedCandidates, createDraft, publish, rollback,
   activeNotices, listNotices, acknowledgeNotice, archiveNotice, startHourlySync, credentials,
 };

@@ -118,12 +118,15 @@ function routes(db, log) {
             resolution: resolution || body.resolution || '480p', aspectRatio: aspectRatio || '16:9', duration,
           });
         }
+        const hasVideoInput = !!body.video_url || !!body.reference_video_urls?.filter(Boolean).length;
+        const relayUsage = require('../services/relayVideoBillingService').reservation(meters, { model: billingTarget.provider_model, has_video_input: hasVideoInput, requested_duration: body.duration });
+        if (relayUsage) { for (const key of Object.keys(usage)) delete usage[key]; Object.assign(usage, relayUsage); }
         if (!Object.keys(usage).length) return response.badRequest(res, '该视频模型未配置可用计费项');
         if (!String(body.idempotency_key || '').trim()) return response.badRequest(res, '视频生成请求缺少幂等键，请刷新后重试');
         const authorization = billing.createAuthorization(db, req.auth, {
           idempotency_key: String(body.idempotency_key).trim(),
           service_type: body.service_type || 'video', model: billingTarget.billing_key, provider_model: billingTarget.provider_model, provider: billingTarget.provider,
-          usage, pricing_context: { has_video_input: !!body.video_url, resolution: body.resolution || '480p', has_audio: !!body.audio_url }, reference_type: 'video_generation', reference_id: body.drama_id || null, drama_id: body.drama_id || null, source_kind: 'video_generation', source_id: body.storyboard_id || null,
+          usage, pricing_context: { has_video_input: hasVideoInput, resolution: body.resolution || '480p', has_audio: !!body.audio_url }, reference_type: 'video_generation', reference_id: body.drama_id || null, drama_id: body.drama_id || null, source_kind: 'video_generation', source_id: body.storyboard_id || null,
         });
         const task = taskService.createTask(db, log, 'video_generation', String(body.drama_id || ''), req.auth.id, tenant?.id || null);
         const now = new Date().toISOString();

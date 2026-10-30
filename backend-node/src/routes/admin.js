@@ -193,6 +193,7 @@ module.exports = function adminRoutes(db, log = console, cfg = {}) {
       return item ? response.success(res, item) : response.notFound(res, '同步批次不存在');
     },
     updateProviderPriceCandidate: guarded((req, res) => response.success(res, providerPrices.updateCandidate(db, req.auth.id, req.params.id, Number(req.params.candidateId), req.body || {}))),
+    acceptProviderPriceCandidates: guarded((req, res) => response.success(res, providerPrices.acceptMappedCandidates(db, req.auth.id, req.params.id))),
     createProviderPriceDraft: guarded((req, res) => response.created(res, providerPrices.createDraft(db, req.auth.id, req.params.id))),
     publishPriceBook: guarded((req, res) => response.success(res, providerPrices.publish(db, req.auth.id, Number(req.params.id), confirmed(req)))),
     rollbackPriceBook: guarded((req, res) => response.success(res, providerPrices.rollback(db, req.auth.id, Number(req.params.id), confirmed(req)))),

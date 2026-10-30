@@ -533,7 +533,9 @@ function settleGenerationBeforePostProcess(db, log, row, videoGenId, providerUsa
   try {
     const billing = require('./billingService');
     const auth = billing.getAuthorization(db, row.billing_authorization_id);
-    const usage = require('./billingUsageService').textUsage(providerUsage);
+    const usage = require('./relayVideoBillingService').policy(auth?.snapshot)
+      ? require('./relayVideoBillingService').actualUsage(auth.snapshot, providerUsage)
+      : require('./billingUsageService').textUsage(providerUsage);
     if (require('./billingUsageService').hasTokenMeter(auth?.snapshot) && !usage) {
       billing.markPendingReconciliation(db, { id: row.owner_user_id, role: 'admin' }, row.billing_authorization_id, {
         provider_request_id: providerRequestId || `video-generation:${videoGenId}`,
@@ -546,6 +548,9 @@ function settleGenerationBeforePostProcess(db, log, row, videoGenId, providerUsa
     }
   } catch (error) {
     log.error('[billing] generation settlement before interpolation failed', { video_gen_id: videoGenId, error: error.message });
+    if (require('./relayVideoBillingService').policy(require('./billingService').getAuthorization(db, row.billing_authorization_id)?.snapshot)) {
+      require('./billingService').markPendingReconciliation(db, { id: row.owner_user_id, role: 'admin' }, row.billing_authorization_id, { provider_request_id: providerRequestId || row.provider_task_id, observed_usage: providerUsage || undefined, reason: error.message });
+    }
   }
 }
 
@@ -570,8 +575,12 @@ async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, v
     maybeNormalizeVideoAfterDownload(storagePath, localPath, rowForAspect, videoGenId, log);
     try {
       const sourceProbe = require('./videoMediaProbeService').probeVideoMedia(path.join(storagePath, localPath));
+      const costAuth = row.billing_authorization_id ? require('./billingService').getAuthorization(db, row.billing_authorization_id) : null;
+      const measuredUsage = require('./relayVideoBillingService').policy(costAuth?.snapshot)
+        ? require('./relayVideoBillingService').actualUsage(costAuth.snapshot, providerUsage)
+        : { millisecond: sourceProbe.duration_ms, ...(require('./costLedgerService').normalizeUsage(providerUsage) || {}) };
       require('./costLedgerService').forAuthorization(db, row.billing_authorization_id, {
-        status: 'completed', usage: { millisecond: sourceProbe.duration_ms, ...(require('./costLedgerService').normalizeUsage(providerUsage) || {}) },
+        status: 'completed', usage: measuredUsage,
         provider_request_id: providerRequestId, evidence_kind: 'provider_usage_and_local_source_media',
       });
     } catch (error) { log.warn('Cost source duration unavailable', { video_gen_id: videoGenId, error: error.message }); }
@@ -753,7 +762,9 @@ async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, v
     if (row?.owner_user_id && row?.billing_authorization_id) {
       const billing = require('./billingService');
       const auth = billing.getAuthorization(db, row.billing_authorization_id);
-      const usage = require('./billingUsageService').textUsage(providerUsage);
+      const usage = require('./relayVideoBillingService').policy(auth?.snapshot)
+        ? require('./relayVideoBillingService').actualUsage(auth.snapshot, providerUsage)
+        : require('./billingUsageService').textUsage(providerUsage);
       if (require('./billingUsageService').hasTokenMeter(auth?.snapshot) && !usage) {
         billing.markPendingReconciliation(db, { id: row.owner_user_id, role: 'admin' }, row.billing_authorization_id, {
           provider_request_id: providerRequestId || `video-generation:${videoGenId}`,
@@ -771,7 +782,7 @@ async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, v
     // price snapshot cannot settle it (for example, a meter migration).
     try {
       if (row?.owner_user_id && row?.billing_authorization_id) {
-        const observedUsage = require('./billingUsageService').textUsage(providerUsage);
+        const observedUsage = providerUsage?.vega ? providerUsage : require('./billingUsageService').textUsage(providerUsage);
         require('./billingService').markPendingReconciliation(db, { id: row.owner_user_id, role: 'admin' }, row.billing_authorization_id, {
           provider_request_id: providerRequestId || `video-generation:${videoGenId}`,
           observed_usage: observedUsage || undefined,

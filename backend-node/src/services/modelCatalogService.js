@@ -130,8 +130,11 @@ function createPriceDraft(db, actorId, input) {
     if (conditions?.unit_size != null && (!Number.isSafeInteger(conditions.unit_size) || conditions.unit_size <= 0)) throw new Error('计量数量必须为正整数');
   }
   return db.transaction(() => {
-    const draft = billing.savePriceBook(db, actorId, { name: `${base.name} · ${row.display_name} 调价`, items: [...base.items.filter((item) => item.service_type !== row.service_type || item.model !== key), ...items] });
+    const proposed = [...base.items.filter((item) => item.service_type !== row.service_type || item.model !== key), ...items];
+    require('./priceBookRuleService').assertEdit(db, base, proposed);
+    const draft = billing.savePriceBook(db, actorId, { name: `${base.name} · ${row.display_name} 调价`, provider: base.provider, items: proposed });
     db.prepare('UPDATE billing_price_books SET parent_price_book_id=?,version=?,system_managed=?,owner_user_id=? WHERE id=?').run(base.id, Number(base.version || 1) + 1, base.system_managed ? 1 : 0, base.owner_user_id, draft.id);
+    require('./priceBookRuleService').capture(db, draft.id);
     return billing.listPriceBooks(db).find((book) => book.id === draft.id);
   })();
 }
