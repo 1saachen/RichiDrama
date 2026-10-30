@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Dedicated SSH forced command. Never evaluate the caller's shell text.
+set -euo pipefail
+export PATH=/usr/bin:/bin
+unset BASH_ENV ENV CDPATH
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+command_text="${SSH_ORIGINAL_COMMAND:-}"
+args=(--repository 1saachen/RichiDrama)
+case "$command_text" in
+  'report-expired') args+=(--dry-run) ;;
+  'remove-expired') args+=(--apply) ;;
+  *)
+    if [[ "$command_text" =~ ^(report-closed|remove-closed)\ ([1-9][0-9]*)$ ]]; then
+      args+=(--pr "${BASH_REMATCH[2]}")
+      [[ "${BASH_REMATCH[1]}" == report-closed ]] && args+=(--dry-run) || args+=(--apply)
+    else
+      echo 'Only preview cleanup commands are allowed.' >&2
+      exit 2
+    fi
+    ;;
+esac
+exec bash "$SCRIPT_DIR/preview-cleanup-owned" "${args[@]}"

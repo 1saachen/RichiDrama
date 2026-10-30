@@ -41,7 +41,7 @@ jobs:
           shellcheck -e SC1091 \
             deploy/lib.sh deploy/preview-deploy deploy/preview-payment-smoke deploy/test-preview-ingress deploy/preview-remove deploy/preview-show deploy/preview-cleanup \
             deploy/release-deploy deploy/release-rollback deploy/install-operations deploy/prune-release-backlog \
-            deploy/backup-data.sh deploy/restore-data.sh
+            deploy/backup-data.sh deploy/restore-data.sh deploy/preview-cleanup-owned deploy/preview-cleanup-entrypoint
       - name: Install backend dependencies
         working-directory: backend-node
         run: npm ci --no-audit --no-fund

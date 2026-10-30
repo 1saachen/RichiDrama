@@ -47,7 +47,8 @@ test('preview deployment is production-identical except dataset and title', () =
   assert.match(source, /-v "\$DATA_DIR:\/app\/backend-node\/data"/);
   assert.doesNotMatch(source, /-v "\$PROD_DATA_DIR:\/app\/backend-node\/data"/);
   // Preview deploys only inspect production ingress; they never migrate it.
-  assert.match(source, /acquire_lock\nvalidate_production_ingress_readonly/);
+  assert.ok(source.indexOf('acquire_lock') < source.indexOf('\nvalidate_production_ingress_readonly'));
+  assert.ok(source.indexOf('\nvalidate_production_ingress_readonly') < source.indexOf('SOURCE_DIR="$(prepare_source'));
   assert.match(library, /validate_production_ingress\(\)/);
   assert.match(library, /active=.*nginx -T/);
   assert.doesNotMatch(library, /mv "\$stale" "\$disabled"/);
@@ -273,11 +274,13 @@ test('GitHub workflows gate preview and production', () => {
   assert.match(preview, /Remove server-side source/);
   assert.match(preview, /rm -f -- "\$incoming"/);
   assert.match(preview, /rm -rf -- "\$bootstrap"/);
-  // Cleanup must not depend on commands installed by a successful deploy.
-  assert.match(cleanup, /bash \/data\/apps\/LocalMiniDrama\/deploy\/preview-cleanup/);
-  assert.match(cleanup, /bash \/data\/apps\/LocalMiniDrama\/deploy\/preview-remove/);
-  assert.match(cleanup, /bash \/usr\/local\/lib\/richidrama-preview\/preview-remove/);
-  assert.match(cleanup, /bash \/usr\/local\/lib\/richidrama-preview\/preview-cleanup/);
+  // Cleanup has an independently installed, restricted SSH entry point;
+  // a mutable application checkout cannot substitute an arbitrary root script.
+  assert.match(cleanup, /ENABLE_PREVIEW_CLEANUP/);
+  assert.match(cleanup, /secrets\.PREVIEW_CLEANUP_KEY/);
+  assert.match(cleanup, /StrictHostKeyChecking=yes/);
+  assert.match(cleanup, /default: true/);
+  assert.doesNotMatch(cleanup, /LocalMiniDrama\/deploy\/preview-(?:cleanup|remove)|secrets\.SERVER_KEY/);
   // Closed PRs must deactivate exactly their own deployment records;
   // auto_inactive would also deactivate other open PRs' previews.
   assert.match(cleanup, /deployments: write/);

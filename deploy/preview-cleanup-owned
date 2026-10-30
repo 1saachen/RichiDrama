@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/lib.sh
+source "$SCRIPT_DIR/lib.sh"
+require_root
+repository=''
+pr_filter=''
+apply=0
+while (( $# )); do
+  case "$1" in
+    --repository) repository="${2:-}"; shift 2 ;;
+    --pr) pr_filter="${2:-}"; validate_pr "$pr_filter"; shift 2 ;;
+    --apply) apply=1; shift ;;
+    --dry-run) apply=0; shift ;;
+    *) fail 'Usage: preview-cleanup-owned --repository owner/repo [--pr N] [--dry-run|--apply]' ;;
+  esac
+done
+[[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail 'Repository must be explicit.'
+ttl="${MINIDRAMA_PREVIEW_TTL_SECONDS:-259200}"
+[[ "$ttl" =~ ^[1-9][0-9]*$ ]] || fail 'Invalid preview TTL.'
+now="$(date +%s)"
+acquire_lock
+count=0
+for metadata in "$PREVIEW_ROOT"/pr-*/metadata.env; do
+  [[ -f "$metadata" && ! -L "$metadata" && ! -L "$(dirname "$metadata")" ]] || continue
+  pr="$(awk -F= '$1=="PR_NUMBER"{print $2}' "$metadata")"
+  owner="$(awk -F= '$1=="SOURCE_REPOSITORY"{print $2}' "$metadata")"
+  policy="$(awk -F= '$1=="PREVIEW_CLEANUP_POLICY_VERSION"{print $2}' "$metadata")"
+  created="$(awk -F= '$1=="CREATED_AT"{print $2}' "$metadata")"
+  [[ "$pr" =~ ^[1-9][0-9]*$ && "$owner" == "$repository" && "$policy" == 1 ]] || continue
+  [[ "$(realpath -m "$(dirname "$metadata")")" == "$(realpath -m "$PREVIEW_ROOT")/pr-$pr" ]] || fail 'Preview metadata path mismatch.'
+  [[ -z "$pr_filter" || "$pr" == "$pr_filter" ]] || continue
+  if [[ -z "$pr_filter" ]]; then
+    [[ "$created" =~ ^[0-9]+$ ]] || continue
+    (( created <= now && now - created > ttl )) || continue
+  fi
+  # Refuse a shared PR label if any matching container belongs elsewhere.
+  container_ids="$(docker ps -aq --filter "label=com.richidrama.preview-pr=$pr")" || fail 'Cannot inspect preview containers.'
+  containers=()
+  if [[ -n "$container_ids" ]]; then mapfile -t containers <<< "$container_ids"; fi
+  for container in "${containers[@]}"; do
+    container_owner="$(docker inspect --format '{{ index .Config.Labels "com.richidrama.preview-repository" }}' "$container")"
+    [[ "$container_owner" == "$repository" ]] || fail 'Preview container ownership is missing or mismatched.'
+  done
+  count=$((count + 1))
+  if (( apply )); then
+    remove_preview_resources "$pr"
+    log "Removed owned preview for PR $pr."
+  else
+    log "Would remove owned preview for PR $pr (dry-run)."
+  fi
+done
+printf 'eligible=%s apply=%s repository=%s\n' "$count" "$apply" "$repository"
