@@ -19,7 +19,12 @@ try {
       const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(row => row.name));
       if (!columns.has('status')) throw new Error(`Status column missing: ${table}`);
       // Include deleted rows conservatively: a deleted UI row can still run upstream.
-      counts[table] = db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE status IN (${active.map(() => '?').join(',')})`).get(...active).n;
+      const dormant = ['video_upscale_jobs','video_interpolation_jobs'].includes(table)
+        ? ` AND NOT (status='awaiting_source' AND COALESCE(provider_task_id,'')='' AND EXISTS (
+            SELECT 1 FROM video_generations v WHERE v.id=${table}.video_generation_id
+            AND v.status IN ('retryable','invalid','failed','cancelled') AND COALESCE(v.source_local_path,'')=''))`
+        : '';
+      counts[table] = db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE status IN (${active.map(() => '?').join(',')})${dormant}`).get(...active).n;
     }
   })();
   console.log(JSON.stringify({ active: counts }));
