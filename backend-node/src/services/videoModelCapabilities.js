@@ -71,6 +71,12 @@ function configuredModelLimits(settings, model) {
 }
 
 function modelLimits(settings, declared, model, config = null) {
+  const relayProfile = String(config?.provider).toLowerCase() === 'richbest' ? require('./richbestProvider').videoProfile(model) : null;
+  if (relayProfile?.key === 'vega') return {
+    duration: { min: 4, max: relayProfile.durationMax, step: 1 },
+    resolutions: relayProfile.resolutions,
+    aspect_ratios: ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16'],
+  };
   const shared = declared.limits || settings.video_limits || {};
   const limits = {
     ...DEFAULT_LIMITS,
@@ -116,6 +122,10 @@ function normalizeSupports(config, declared = {}, selectedModel = '') {
   const protocol = String(config.api_protocol || '').toLowerCase();
   const provider = String(config.provider || '').toLowerCase();
   const model = String(selectedModel || config.default_model || config.model || '').toLowerCase();
+  if (provider === 'richbest' && require('./richbestProvider').videoProfile(model).key === 'vega') return {
+    text_to_video: true, image_reference: { max: 0 }, first_last_frame: false,
+    video_reference: false, video_extend: false, audio_reference: false, audio_driven: false, output_audio: true,
+  };
   const hasNativeAudioReference = protocol === 'volcengine_omni'
     || protocol === 'kling_omni'
     || ((!protocol || protocol === 'volcengine') && /seedance|doubao-seedance/.test(model));

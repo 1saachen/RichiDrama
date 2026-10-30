@@ -91,3 +91,22 @@ test('generation history detail supports a legacy generation without an omni sna
   assert.equal(detail.provider_prompt, '旧记录提示词');
   assert.equal(detail.billing.status, 'not_charged');
 });
+
+test('history and video reads use immutable actual call evidence without rewriting old rows or billing', () => {
+  const db = createDb();
+  db.exec('CREATE TABLE cost_calls (authorization_id TEXT, user_id INTEGER, service_type TEXT, provider TEXT)');
+  db.prepare('UPDATE video_generations SET provider=? WHERE id=41').run('chatfire');
+  const before = db.prepare('SELECT * FROM billing_usage_logs').all();
+  // Foreign owners and enhancement calls are not evidence for this generation.
+  db.prepare('INSERT INTO cost_calls VALUES (?,?,?,?)').run('auth-41', 8, 'video', 'other');
+  db.prepare('INSERT INTO cost_calls VALUES (?,?,?,?)').run('auth-41', 7, 'video_postprocess', 'enhancement');
+  assert.equal(omni.generationHistoryDetail(db, 41, { id: 7 }).request.provider, 'chatfire');
+  db.prepare('INSERT INTO cost_calls VALUES (?,?,?,?)').run('auth-41', 7, 'video', 'richbest');
+  assert.equal(omni.generationHistoryDetail(db, 41, { id: 7 }).request.provider, 'richbest');
+  assert.equal(require('../src/services/videoService').getById(db, 41).provider, 'richbest');
+  assert.equal(db.prepare('SELECT provider FROM video_generations WHERE id=41').get().provider, 'chatfire');
+  assert.deepEqual(db.prepare('SELECT * FROM billing_usage_logs').all(), before);
+  db.prepare('INSERT INTO cost_calls VALUES (?,?,?,?)').run('auth-41', 7, 'video', 'ambiguous');
+  assert.equal(omni.generationHistoryDetail(db, 41, { id: 7 }).request.provider, 'chatfire', 'ambiguous evidence must not be guessed');
+  db.close();
+});

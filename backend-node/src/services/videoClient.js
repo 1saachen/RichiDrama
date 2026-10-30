@@ -1304,6 +1304,7 @@ async function cancelRichbestVideoTask(config, log, taskId) {
   const queryRaw = await query.text();
   const queryPayload = (() => { try { return queryRaw ? JSON.parse(queryRaw) : {}; } catch (_) { return {}; } })();
   if (!query.ok) throw new Error(`查询中转站任务状态失败: ${query.status}${queryRaw ? ` - ${queryRaw.slice(0, 200)}` : ''}`);
+  if (queryPayload.model && richbest.videoProfile(queryPayload.model).key === 'vega') return { cancelled: false, reason: 'unsupported_provider', provider_status: queryPayload.status };
   const parsed = richbest.parseVideoTask(queryPayload, query.headers);
   if (parsed.failed) return { cancelled: false, reason: 'terminal', provider_status: parsed.status };
   if (parsed.video_url) return { cancelled: false, reason: 'terminal', provider_status: parsed.status };

@@ -30,6 +30,16 @@ export function normalizeJob(data) {
   }
 }
 
+export function syncPolledShotState(shots, job) {
+  if (job?.id == null) return
+  for (const shot of shots || []) {
+    if (shot.omni_job_id == null || String(shot.omni_job_id) !== String(job.id)) continue
+    shot.status = job.status
+    shot.video_url = job.videoUrl || ''
+    shot.generation_error = job.error_msg || null
+  }
+}
+
 export function resolveShotPreviewJob(history, selectedId, boundId, playbackId = null, projectMode = false) {
   if (!playbackId && !projectMode) return history.find(job => String(job.id) === String(selectedId))
     || history.find(job => pendingPreviewStatuses.has(job.status))

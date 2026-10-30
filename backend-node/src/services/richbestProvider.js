@@ -164,7 +164,33 @@ function idempotencyKey(kind, row) {
 
 function videoProfile(model) {
   const name = String(model || '').trim().toLowerCase();
+  const vega = /^(vega-1\.0-(?:lite|pro|pro-fast|pro-mini)|vega-1\.5-pro)$/.test(name);
+  if (vega) {
+    const lite = name === 'vega-1.0-lite';
+    return {
+      key: 'vega', label: 'Vega 基础文生视频',
+      fields: ['duration', 'resolution', 'ratio', 'generate_audio', ...(!lite ? ['seed'] : [])],
+      imageRoles: [], maxImages: 0, maxVideos: 0, maxAudios: 0,
+      schemes: ['https', 'asset'], supportsCancel: false,
+      // Higher resolutions and reference modes need separate media-path acceptance.
+      resolutions: lite ? ['480p', '1080p'] : ['720p', '1080p'],
+      durationMax: name === 'vega-1.5-pro' ? 30 : 15,
+      defaults: { resolution: lite ? '480p' : '720p', ratio: '16:9', duration: 4 },
+    };
+  }
   return VIDEO_PROFILES[name] || SEEDANCE_PROFILE;
+}
+
+function validateVideoParams(profile, params = {}) {
+  if (profile.key !== 'vega') return;
+  if (params.duration != null && (!Number.isInteger(Number(params.duration)) || Number(params.duration) < 4 || Number(params.duration) > profile.durationMax)) {
+    throw new RichbestError(`Vega 基础文生视频时长须为 4–${profile.durationMax} 整数秒，智能时长暂未开放`);
+  }
+  if (params.resolution != null && !profile.resolutions.includes(params.resolution)) throw new RichbestError(`Vega 基础文生视频分辨率可选 ${profile.resolutions.join('、')}`);
+  const ratio = params.ratio || params.aspect_ratio;
+  if (ratio && !['21:9', '16:9', '4:3', '1:1', '3:4', '9:16'].includes(ratio)) throw new RichbestError('Vega 基础文生视频需要明确的画幅比例');
+  if (params.seed != null && (!profile.fields.includes('seed') || !Number.isInteger(Number(params.seed)) || Number(params.seed) < -1 || Number(params.seed) > 2147483647)) throw new RichbestError('此 Vega 模型不支持该 seed');
+  if (params.vega != null || params.draft || params.task_type != null) throw new RichbestError('Vega 高级任务参数暂未开放');
 }
 
 /**
@@ -220,6 +246,7 @@ function assertVideoRequestShape(input) {
   assertVideoModelAlias(input?.model);
   const profile = videoProfile(input?.model);
   assertReferenceShape(profile, Array.isArray(input?.references) ? input.references : []);
+  validateVideoParams(profile, input?.params);
   return profile;
 }
 
@@ -247,6 +274,7 @@ function buildVideoBody(input) {
   const profile = videoProfile(model);
   const dropped = [];
   assertReferencesAcceptable(profile, references);
+  validateVideoParams(profile, params);
 
   const body = { model: String(model || '').trim(), content: [{ type: 'text', text: String(prompt || '') }] };
   // 先剔除「未提供」的参数再合并画像默认值：调用方把 duration/resolution/seed 等显式写成

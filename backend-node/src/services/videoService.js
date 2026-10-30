@@ -144,7 +144,7 @@ function list(db, query) {
   const pageSize = Math.min(100, Math.max(1, parseInt(query.page_size, 10) || 20));
   const offset = (page - 1) * pageSize;
   const rows = db.prepare('SELECT * ' + sql + ' ORDER BY created_at DESC LIMIT ? OFFSET ?').all(...params, pageSize, offset);
-  return { items: rows.map((row) => rowToItem(withTaskProgress(db, row))), total, page, pageSize };
+  return { items: rows.map((row) => rowToItem(withTaskProgress(db, row), db)), total, page, pageSize };
 }
 
 /**
@@ -184,12 +184,12 @@ function withTaskProgress(db, row) {
   return task ? { ...row, task_progress: task.progress, task_message: task.message, task_updated_at: task.updated_at } : row;
 }
 
-function rowToItem(r) {
+function rowToItem(r, db) {
   return {
     id: r.id,
     storyboard_id: r.storyboard_id,
     drama_id: r.drama_id,
-    provider: r.provider,
+    provider: require('./videoProviderService').recordedProvider(db, r),
     prompt: r.prompt,
     model: r.model,
     duration: r.duration,
@@ -233,7 +233,7 @@ function rowToItem(r) {
 
 function getById(db, id) {
   const r = db.prepare('SELECT * FROM video_generations WHERE id = ? AND deleted_at IS NULL').get(Number(id));
-  return r ? rowToItem(withTaskProgress(db, r)) : null;
+  return r ? rowToItem(withTaskProgress(db, r), db) : null;
 }
 
 // A copy may reuse only a completed, locally readable final artifact. Never
@@ -1357,6 +1357,7 @@ async function processVideoGeneration(db, log, videoGenId) {
     db.prepare('UPDATE video_generations SET provider_submit_started_at = ?, updated_at = ? WHERE id = ?')
       .run(submitStartedAt, submitStartedAt, videoGenId);
     const result = await videoClient.callVideoApi(db, log, {
+      billing_authorization_id: row.billing_authorization_id,
       prompt: row.prompt,
       model: row.model,
       duration: effectiveDuration,
