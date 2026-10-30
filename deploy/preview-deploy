@@ -9,7 +9,20 @@ validate_pr "${1:-}"
 validate_sha "${2:-}"
 PR_NUMBER="$1"
 SHA="$2"
+SOURCE_REPOSITORY="${MINIDRAMA_PREVIEW_SOURCE_REPOSITORY:-}"
+if [[ -n "$SOURCE_REPOSITORY" ]]; then
+  [[ "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail 'Invalid preview repository.'
+fi
 acquire_lock
+if [[ -n "$SOURCE_REPOSITORY" ]]; then
+  if [[ -d "$PREVIEW_ROOT/pr-$PR_NUMBER" ]]; then
+    existing_owner="$(awk -F= '$1=="SOURCE_REPOSITORY"{print $2}' "$PREVIEW_ROOT/pr-$PR_NUMBER/metadata.env" 2>/dev/null || true)"
+    [[ "$existing_owner" == "$SOURCE_REPOSITORY" ]] || fail 'PR preview belongs to another or an unmarked repository; explicit migration required.'
+  else
+    orphan_containers="$(docker ps -aq --filter "label=com.richidrama.preview-pr=$PR_NUMBER")" || fail 'Cannot inspect existing previews.'
+    [[ -z "$orphan_containers" ]] || fail 'Unmarked preview containers exist for this PR; explicit migration required.'
+  fi
+fi
 validate_production_ingress_readonly
 
 SOURCE_DIR="$(prepare_source "$SHA")"
@@ -21,6 +34,10 @@ bash "$SOURCE_DIR/deploy/install-operations" preview
 
 # Remove only the previous environment for this PR.
 if [[ -d "$PREVIEW_ROOT/pr-$PR_NUMBER" ]]; then
+  if [[ -n "$SOURCE_REPOSITORY" ]]; then
+    existing_owner="$(awk -F= '$1=="SOURCE_REPOSITORY"{print $2}' "$PREVIEW_ROOT/pr-$PR_NUMBER/metadata.env" 2>/dev/null || true)"
+    [[ "$existing_owner" == "$SOURCE_REPOSITORY" ]] || fail 'PR preview belongs to another or an unmarked repository; explicit migration required.'
+  fi
   remove_preview_resources "$PR_NUMBER"
 fi
 
@@ -51,6 +68,9 @@ PASSWORD=$PASSWORD
 APP_CONTAINER=$APP_CONTAINER
 CREATED_AT=$(date +%s)
 EOF
+if [[ -n "$SOURCE_REPOSITORY" ]]; then
+  printf 'SOURCE_REPOSITORY=%s\nPREVIEW_CLEANUP_POLICY_VERSION=1\n' "$SOURCE_REPOSITORY" >> "$PR_DIR/metadata.env"
+fi
 chmod 600 "$PR_DIR/metadata.env"
 
 PREVIEW_SUCCESS=0
@@ -86,7 +106,9 @@ install_preview_ingress "$SOURCE_DIR/deploy/nginx-preview-vhost.conf"
 ENV_FILE="$(require_env_file preview)"
 ENV_ARGS=(--env-file "$ENV_FILE")
 
-docker run -d --name "$APP_CONTAINER" \
+OWNER_LABEL=()
+[[ -n "$SOURCE_REPOSITORY" ]] && OWNER_LABEL=(--label "com.richidrama.preview-repository=$SOURCE_REPOSITORY")
+docker run -d --name "$APP_CONTAINER" "${OWNER_LABEL[@]}" \
   --network "$PROD_PROXY_NETWORK" --network-alias "pr-$PR_NUMBER" \
   --label "com.richidrama.preview-pr=$PR_NUMBER" --label "com.richidrama.revision=$SHA" \
   --security-opt no-new-privileges --cap-drop ALL --pids-limit 256 \

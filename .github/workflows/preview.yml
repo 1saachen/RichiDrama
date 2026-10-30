@@ -107,7 +107,7 @@ jobs:
             rm -rf "$bootstrap"
             mkdir -p "$bootstrap"
             tar -xzf "$incoming" -C "$bootstrap"
-            bash "$bootstrap/deploy/preview-deploy" "$pr" "$sha"
+            MINIDRAMA_PREVIEW_SOURCE_REPOSITORY='${{ github.repository }}' bash "$bootstrap/deploy/preview-deploy" "$pr" "$sha"
       - name: Remove server-side source
         if: always() && steps.pr.outputs.sha != ''
         uses: appleboy/ssh-action@v1.2.0
