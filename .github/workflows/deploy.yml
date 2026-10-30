@@ -16,8 +16,11 @@ concurrency:
 jobs:
   deploy:
     if: >-
+      vars.ENABLE_SERVER_DEPLOY == 'true' &&
+      (
       (github.event_name == 'workflow_dispatch') ||
       (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 50
     environment: production
@@ -49,7 +52,7 @@ jobs:
             # GitHub over this server's own SSH connection, not an SCP push.
             if ! timeout 300s git -C "$repo" fetch origin main --no-tags; then
               echo 'fetch failed; switching origin to SSH port 22 and retrying once'
-              git -C "$repo" remote set-url origin git@github.com:ouyangokay/RichiDrama.git
+              git -C "$repo" remote set-url origin git@github.com:${{ github.repository }}.git
               timeout 300s git -C "$repo" fetch origin main --no-tags
             fi
             # Only the exact commit that Validation approved may be released;
