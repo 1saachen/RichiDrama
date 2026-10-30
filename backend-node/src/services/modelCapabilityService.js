@@ -2,8 +2,8 @@ const capabilities = ['text', 'image', 'video', 'tts'];
 
 function infer(model) {
   const name = String(model || '').trim().toLowerCase();
-  if (/^(doubao-seedream-|gpt-image-|dall-e-|flux[-.]|qwen-image)/.test(name)) return 'image';
-  if (/^(doubao-seedance-|sora-|veo[-.]|kling-)/.test(name)) return 'video';
+  if (/^(doubao-seedream-|dola-seedream-|vega-image-|gpt-image-|dall-e-|flux[-.]|qwen-image)/.test(name)) return 'image';
+  if (/^(doubao-seedance-|dreamina-seedance-|vega-(?:1\.0|1\.5)-|sora-|veo[-.]|kling-)/.test(name)) return 'video';
   if (/^(tts-|cosyvoice|qwen3-tts)/.test(name)) return 'tts';
   if (/^(doubao-seed-|doubao-pro-|doubao-lite-|gpt-[345]|o[134](?:-|$)|claude-|deepseek-(?:chat|reasoner|v\d|r1))/.test(name)) return 'text';
   return null;

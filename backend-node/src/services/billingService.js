@@ -141,12 +141,13 @@ function activeMeters(db, user, serviceType, model, provider) {
   return [...new Set(activePriceItems(db, user.id, serviceType, model, provider).map((item) => item.meter))];
 }
 
-function normalizeUsage(usage) {
+function normalizeUsage(usage, fractionalSeconds = false) {
   const allowed = ['request', 'image', 'input_image', 'second', 'millisecond', 'character', 'input_token', 'cache_token', 'output_token'];
   const clean = {};
   for (const meter of allowed) {
     const v = Number(usage?.[meter] || 0);
-    if (!Number.isSafeInteger(v) || v < 0) throw new Error(`非法用量：${meter} 必须为非负整数`);
+    const fractional = fractionalSeconds && meter === 'second' && /^\d+(?:\.\d{1,12})?$/.test(String(v)) && Number.isFinite(v) && v >= 0 && v <= Number.MAX_SAFE_INTEGER;
+    if ((!Number.isSafeInteger(v) && !fractional) || v < 0) throw new Error(`非法用量：${meter} 必须为非负整数`);
     if (v) clean[meter] = v;
   }
   if (!Object.keys(clean).length) clean.request = 1;
@@ -190,6 +191,7 @@ function rateFor(row, context = {}, usage = {}) {
     .sort((left, right) => Object.keys(right.when || {}).length - Object.keys(left.when || {}).length)[0]
     || rates.find((rate) => rate.id === conditions.default_rate_id)
     || null;
+  if (conditions.require_rate_match && (!selected || !Object.entries(selected.when || {}).every(([key, value]) => context[key] === value))) throw new Error('供应商价格未覆盖本次分辨率或素材条件，已拒绝调用');
   const tier = tierFor(conditions, usage);
   const unitPrice = tier
     ? creditsToMicro(tier.unit_price_points)
@@ -201,8 +203,9 @@ function rateFor(row, context = {}, usage = {}) {
   return { unit_price_micro: unitPrice, unit_size: unitSize, rate_id: tier?.id || selected?.id || null, conditions };
 }
 function proratedPoints(quantity, unitPrice, unitSize) {
-  const q = BigInt(quantity), price = BigInt(unitPrice), size = BigInt(unitSize);
-  // Round half up to the nearest whole point, entirely in integer arithmetic.
+  const [whole, fraction = ''] = String(quantity).split('.');
+  const q = BigInt(whole + fraction), price = BigInt(unitPrice), size = BigInt(unitSize) * 10n ** BigInt(fraction.length);
+  // Round half up to one micro-point, including opted-in fractional seconds.
   const result = (q * price + size / 2n) / size;
   if (result > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('计费金额超出安全范围');
   return Number(result);
@@ -243,6 +246,8 @@ function quote(db, user, input) {
     usage.cache_token = 0;
     rates.push({ meter: 'cache_token', quantity: 0, unit_price_micro: rate.unit_price_micro, unit_size: rate.unit_size, rate_id: rate.rate_id, conditions: rate.conditions, is_free: !!price.is_free, subtotal_micro: 0, price_book_id: price.price_book_id, price_book_name: price.price_book_name });
   }
+  if (serviceType === 'video' && require('./relayVideoBillingService').modelProfile(input.provider_model || model)
+      && !rates.some(rate => rate.conditions?.relay_video_billing_version === 1)) throw new Error('Vega 新调用需要已核实的视频秒计费规则，请先同步并发布中转站价格');
   return { user_id: user.id, service_type: serviceType, model, provider_model: input.provider_model || model, usage, pricing_context: input.pricing_context || {}, amount_micro: amountMicro, amount: microToCredits(amountMicro), rates, quoted_at: now() };
 }
 
@@ -344,7 +349,7 @@ function snapshotCalculation(snapshot, actualUsage) {
   if (snapshot.image_request_finalized && (actualUsage?.image !== 1 || !actualUsage?.image_size)) {
     throw new Error('图片结算需要本地校验后的单张图片尺寸');
   }
-  const usage = normalizeUsage(actualUsage || snapshot.usage); let amount = 0;
+  const usage = normalizeUsage(actualUsage || snapshot.usage, !!require('./relayVideoBillingService').policy(snapshot)); let amount = 0;
   const details = [];
   if ((snapshot.rates || []).some(rate => rate.meter === 'input_image' && seedreamPricing.enabled(rate.conditions))) {
     usage.input_image = snapshot.usage.input_image || 0;
@@ -625,10 +630,11 @@ function recoverCompletedVideoReconciliations(db) {
   let recovered = 0;
   for (const row of rows) {
     const auth = getAuthorization(db, row.billing_authorization_id);
-    if (!require('./billingUsageService').hasTokenMeter(auth?.snapshot)) continue;
+    const relayPolicy = require('./relayVideoBillingService').policy(auth?.snapshot);
+    if (!require('./billingUsageService').hasTokenMeter(auth?.snapshot) && !relayPolicy) continue;
     markPendingReconciliation(db, { id: row.owner_user_id, role: 'admin' }, row.billing_authorization_id, {
       provider_request_id: row.provider_task_id || `video-generation:${row.id}`,
-      reason: '视频已完成，但未取得供应商可核验 token 用量；已恢复为待对账',
+      reason: relayPolicy ? 'Vega 视频已完成但结算未落库；已恢复为待对账，需核验供应商真实秒数' : '视频已完成，但未取得供应商可核验 token 用量；已恢复为待对账',
     });
     recovered += 1;
   }
@@ -1088,6 +1094,7 @@ function listPriceBooks(db) {
   return books.map((b) => ({
     ...b,
     system_managed: !!b.system_managed,
+    rules_locked: require('./priceBookRuleService').locked(db, b),
     version: Number(b.version || 1),
     items: itemStmt.all(b.id).map((i) => ({ ...i, is_free: !!i.is_free, unit_price: microToCredits(i.unit_price_micro), conditions_json: parse(i.conditions_json, null) })),
   }));
@@ -1127,7 +1134,7 @@ function validatePriceBookWindow(db, bookId, status, effectiveFrom, effectiveTo,
       try { ratePrice = creditsToMicro(rate.unit_price_points); } catch (_) { throw new Error('条件价格必须使用非负积分（最多四位小数）和整数计量单位'); }
       if (ratePrice < 0 || !Number.isSafeInteger(Number(rate.unit_size || conditions.unit_size || 1)) || Number(rate.unit_size || conditions.unit_size || 1) <= 0) throw new Error('条件价格必须使用非负积分（最多四位小数）和整数计量单位');
       const keys = Object.keys(rate.when || {});
-      if (keys.some((key) => !['has_video_input', 'has_image_input', 'resolution', 'has_audio', 'pixel_band', 'image_scene'].includes(key))) throw new Error('条件价格只能使用请求明确传入的 has_video_input、has_image_input、resolution、has_audio、pixel_band、image_scene 字段');
+      if (keys.some((key) => !['has_video_input', 'has_image_input', 'resolution', 'has_audio', 'pixel_band', 'image_scene', 'resolution_tier', 'fps_tier', 'service_tier'].includes(key))) throw new Error('条件价格包含尚未支持的规格字段');
       rateWhen.push(rate.when || {});
     }
     for (let left = 0; left < rateWhen.length; left += 1) {
@@ -1195,10 +1202,11 @@ function savePriceBook(db, actorId, input, id) {
   const provider = normalizeBookProvider(input.provider);
   let status = ['draft','published','archived'].includes(input.status) ? input.status : 'draft';
   if (bookId) {
-    const current = db.prepare('SELECT status FROM billing_price_books WHERE id=?').get(bookId);
+    const current = db.prepare('SELECT * FROM billing_price_books WHERE id=?').get(bookId);
     if (!current) throw new Error('价目表不存在');
     if (current.status !== 'draft') throw new Error('已发布或已归档价目不可原地修改，请创建新版本');
     if (status !== 'draft') throw new Error('草稿必须通过发布接口生效');
+    require('./priceBookRuleService').assertEdit(db, current, items, Object.prototype.hasOwnProperty.call(input, 'provider') ? provider : current.provider);
     status = 'draft';
   }
   const effectiveFrom = input.effective_from || null;
@@ -1228,6 +1236,7 @@ function savePriceBook(db, actorId, input, id) {
       const serviceType = String(item.service_type || '').trim(); const model = String(item.model || '').trim(); if (!serviceType || !model) throw new Error('价目项需要 service_type 和 model');
       stmt.run(bookId, serviceType, model, meter, creditsToMicro(item.unit_price ?? microToCredits(item.unit_price_micro || 0)), item.is_free ? 1 : 0, item.conditions_json ? json(item.conditions_json) : null, at, at);
     }
+    require('./priceBookRuleService').capture(db, bookId);
   });
   write(); audit(db, actorId, id ? 'price_book.update' : 'price_book.create', 'price_book', bookId, id ? { name: input.name, status: input.status, item_count: items.length } : { name: input.name, status: input.status, item_count: items.length, provider: provider || null });
   return listPriceBooks(db).find((b) => b.id === bookId);
@@ -1249,6 +1258,7 @@ function clonePriceBook(db, actorId, bookId) {
       VALUES (?, NULL, 'draft', NULL, NULL, ?, ?, ?, ?, ?, ?, ?)`).run(`${source.name} 新版本`, actorId, at, at, Number(source.version || 1) + 1, source.id, Number(source.system_managed || 0), source.provider || null).lastInsertRowid);
     db.prepare(`INSERT INTO billing_price_book_items (price_book_id, service_type, model, meter, unit_price_micro, is_free, conditions_json, created_at, updated_at)
       SELECT ?, service_type, model, meter, unit_price_micro, is_free, conditions_json, ?, ? FROM billing_price_book_items WHERE price_book_id=?`).run(draftId, at, at, source.id);
+    require('./priceBookRuleService').capture(db, draftId);
   })();
   const cloned = db.prepare('SELECT COUNT(*) AS n FROM billing_price_book_items WHERE price_book_id=?').get(draftId).n;
   audit(db, actorId, 'price_book.clone', 'price_book', draftId, { source_price_book_id: source.id, provider: source.provider || null, item_count: Number(cloned) });

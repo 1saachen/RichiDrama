@@ -6,8 +6,8 @@
  * 的同一套 sync / 审核 / 草稿 / 发布链路，避免再造一条价目流水线。
  *
  * 契约以真实响应为准，不以文档为准：2026-09-20 通过鉴权 admin 路由做过一次只读拉取，
- * 响应快照存在 test/helpers/richbestPricingLive.json。真实上游只有四种 metric，且把
- * 分档与条件价放在 dimension 上；文档里的 video_duration / 折扣口径在这枚 key 上不存在。
+ * 旧响应快照存在 test/helpers/richbestPricingLive.json。旧模型将分档与条件价放在
+ * dimension 上；Vega 的 video_second 和 image 超额输入价另按星辰当前实现映射。
  *
  * 换算沿用仓库既有的固定比例，没有毛利：1 元 = 100 积分 = 1,000,000 微积分。
  * 中转单价是 ≤6 位小数的十进制字符串，其放大 1e6 的整数恰好等于微积分金额，
@@ -26,14 +26,15 @@ const YUAN_SCALE = POINTS_PER_CNY * MICRO_PER_POINT; // 1,000,000 微积分 / �
 /** 中转 metric → 内部 meter；不在表内的一律 unmapped，绝不猜。
  *
  * 2026-09-20 用真实 /v1/pricing 响应核对过（test/helpers/richbestPricingLive.json，23 模型 91 条价格）：
- * 上游只有 input_tokens / cached_input_tokens / output_tokens / image 四种指标，
- * 连按时长（video_duration / second）这种指标都不存在——视频同样是 output_tokens 每百万 token 计价，
- * 再按「分辨率 × 是否带视频输入」分条。所以这里不能凭文档想象指标名。
+ * 当时已开放模型使用 input_tokens / cached_input_tokens / output_tokens / image，
+ * 视频按 output_tokens 和分辨率、参考视频维度计价。2026-10-29 增加已核对的 Vega
+ * video_second；未知指标仍不映射，不把旧视频模型静默切换成按秒计费。
  */
 const METERS = {
   input_tokens: 'input_token',
   cached_input_tokens: 'cache_token',
   output_tokens: 'output_token',
+  video_second: 'second',
   image: 'image',
 };
 /**
@@ -46,7 +47,7 @@ const UNSUPPORTED_METERS = {
   embedding: '内部价目暂无向量计量，未生成条目',
 };
 
-const RESOLUTIONS = ['480p', '720p', '1080p'];
+const RESOLUTIONS = ['480p', '720p', '768p', '1080p', '2k', '4k'];
 const PIXEL_BAND_BY_OPERATOR = { le: 'small', gt: 'large' };
 
 /**
@@ -57,6 +58,13 @@ const PIXEL_BAND_BY_OPERATOR = { le: 'small', gt: 'large' };
 function parseDimension(meter, dimension) {
   const raw = String(dimension ?? '').trim();
   if (!raw || raw === 'null') return { kind: 'base' };
+  const vega = /^(domestic|international):(480p|720p|768p|1080p|2k|4k):(video|no_video)$/.exec(raw);
+  if (vega) {
+    if (meter !== 'second') return { kind: 'unknown', reason: 'Vega 视频档位必须按真实视频秒数计费' };
+    return { kind: 'rate', id: raw, site: vega[1], when: { resolution: vega[2], has_video_input: vega[3] === 'video' } };
+  }
+  const extraImage = /^(domestic|international):input:after_five$/.exec(raw);
+  if (extraImage && meter === 'input_image') return { kind: 'base', site: extraImage[1] };
   const tier = /^tokens:(\d+)-(\d+)$/.exec(raw);
   if (tier) {
     if (!['input_token', 'cache_token', 'output_token'].includes(meter)) return { kind: 'unknown', reason: `计量 ${meter} 不支持 token 分档：${raw}` };
@@ -64,7 +72,7 @@ function parseDimension(meter, dimension) {
     if (!Number.isSafeInteger(min) || !Number.isSafeInteger(max) || min < 0 || max < min) return { kind: 'unknown', reason: `token 分档边界不是有效整数：${raw}` };
     return { kind: 'tier', id: `tokens:${min}-${max}`, min_inclusive: min, max_inclusive: max };
   }
-  const video = /^(\d+p):(video|no_video)$/.exec(raw);
+  const video = /^(480p|720p|768p|1080p|2k|4k):(video|no_video)$/.exec(raw);
   if (video) {
     if (meter !== 'output_token') return { kind: 'unknown', reason: `计量 ${meter} 不支持视频条件价：${raw}` };
     if (!RESOLUTIONS.includes(video[1])) return { kind: 'unknown', reason: `未识别的分辨率档位 ${video[1]}（内部只支持 ${RESOLUTIONS.join('/')}）` };
@@ -173,7 +181,9 @@ function chargeTypeFor(metric, dimension) {
 
 /** 单条上游价格 → 片段。解析失败或语义不支持时只带 reason，由分组阶段落成 unmapped 行。 */
 function pricePiece(entry, price, context = {}) {
-  const { meter, metric, reason } = meterFor(price?.metric);
+  const resolved = meterFor(price?.metric);
+  const metric = resolved.metric; const reason = resolved.reason;
+  const meter = entry?.id === 'vega-1.0-lite' && metric === 'image' && /^(domestic|international):input:after_five$/.test(String(price?.dimension)) ? 'input_image' : resolved.meter;
   const model = String(entry?.id || '').trim();
   const base = {
     provider_model: model,
@@ -188,6 +198,8 @@ function pricePiece(entry, price, context = {}) {
   };
   if (!meter) return { ...base, reason: reason || `未知计价指标 ${metric || '(空)'}` };
   const unitSize = toNumber(price?.unit_size) || 1;
+  if (price?.unit_size != null && !toNumber(price.unit_size)) return { ...base, reason: '供应商计价单位数量必须为正整数' };
+  if (metric === 'video_second' && (!/^vega-(?:1\.0-(?:lite|pro|pro-fast|pro-mini)|1\.5-pro)$/.test(model) || unitSize !== 1)) return { ...base, reason: '视频秒计费仅适配已核实的 Vega 视频合约，单位数量必须为 1' };
   const source = price?.effective_price_yuan ?? price?.list_price_yuan;
   const micro = yuanToMicroPoints(source);
   if (micro === null) return { ...base, meter, reason: `单价不是 ≤6 位小数的十进制字符串：${source ?? '(空)'}` };
@@ -242,6 +254,12 @@ function compileGroup(entry, target, pieces, context) {
     if (current.micro < previous.micro) return pieces.map((piece) => unmappedRow(piece, `${label} 的更高用量档位价格低于前一档，与内部档位规则冲突，请人工定价`));
   }
   const conditions = conditionMeta(entry, target, syncId, discountBps);
+  const sites = [...new Set(pieces.map(piece => piece.selector.site).filter(Boolean))];
+  if (sites.length > 1) return pieces.map(piece => unmappedRow(piece, '同一业务 Key 返回多个站点价格，不能确定当前调用渠道；请核对中转项目绑定'));
+  if (/^vega-/.test(pieces[0].provider_model) && ['second', 'input_image'].includes(meter)) {
+    if (sites.length !== 1) return pieces.map(piece => unmappedRow(piece, 'Vega 价格缺少已核实的国内／国际站点维度'));
+    Object.assign(conditions, { relay_video_billing_version: 1, provider_site: sites[0], require_rate_match: meter === 'second' });
+  }
   const meta = { service_type: serviceType, billing_key: target.billing_key, meter, mapping_status: 'mapped', error_summary: null };
   const rawItem = { entry_id: pieces[0].provider_model, modality: entry?.modality || null, prices: pieces.map((piece) => piece.raw_item_json ? JSON.parse(piece.raw_item_json).price : null).filter(Boolean) };
   if (tiers.length) {
@@ -324,6 +342,10 @@ function buildCandidates(entries, { resolveTarget, discountBps, syncId = null } 
         continue;
       }
       const usable = pieces.filter((piece) => !piece.reason);
+      if (/^vega-/.test(model) && usable.length !== pieces.length) {
+        rows.push(...pieces.map(piece => unmappedRow(piece, piece.reason || '该 Vega 计费项包含未识别档位，不能只发布部分价格')));
+        continue;
+      }
       rows.push(...pieces.filter((piece) => piece.reason).map((piece) => unmappedRow(piece)));
       if (usable.length) rows.push(compileGroup(entry, target, usable, { syncId, discountBps }));
     }

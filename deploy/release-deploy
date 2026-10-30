@@ -24,6 +24,26 @@ validate_production_ingress
 
 ENV_ARGS=(--env-file "$ENV_FILE")
 
+# Wait on the server without stopping the existing application. Unknown state
+# is a hard failure. Do this BEFORE the rollback trap: a busy check must never
+# remove or restart the live container. No production rows are modified.
+if docker inspect "$PROD_CONTAINER" >/dev/null 2>&1; then
+  idle_checks=0
+  deadline=$((SECONDS + 1800))
+  while (( idle_checks < 2 )); do
+    if docker exec -i "$PROD_CONTAINER" node - /app/backend-node/data/drama_generator.db < "$SOURCE_DIR/backend-node/tools/check-release-idle.js"; then
+      idle_checks=$((idle_checks + 1))
+    else
+      idle_status=$?
+      [[ "$idle_status" == 75 ]] || fail 'Cannot confirm running task state; production left untouched.'
+      idle_checks=0
+      log 'Active generation tasks remain; waiting before release.'
+    fi
+    (( SECONDS < deadline )) || fail 'Tasks did not drain within 30 minutes; production left untouched.'
+    if (( idle_checks < 2 )); then sleep 30; fi
+  done
+fi
+
 PREVIOUS_IMAGE=''
 PREVIOUS_REVISION=''
 PREVIOUS_CONTAINER=''

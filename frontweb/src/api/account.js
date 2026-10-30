@@ -54,6 +54,7 @@ export const adminAPI = {
   providerPriceSyncs: (params) => request.get('/admin/provider-price-syncs', { params }),
   providerPriceSync: (id) => request.get(`/admin/provider-price-syncs/${id}`),
   updateProviderPriceCandidate: (syncId, candidateId, data) => request.patch(`/admin/provider-price-syncs/${syncId}/candidates/${candidateId}`, data),
+  acceptProviderPriceCandidates: (syncId) => request.post(`/admin/provider-price-syncs/${syncId}/accept-mapped`),
   createProviderPriceDraft: (id) => request.post(`/admin/provider-price-syncs/${id}/create-draft`),
   notices: (params) => request.get('/admin/notices', { params }),
   archiveNotice: (id) => request.post(`/admin/notices/${id}/archive`),

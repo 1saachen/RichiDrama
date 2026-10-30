@@ -4,12 +4,13 @@ import { readFile } from 'node:fs/promises'
 
 const source = () => readFile(new URL('../src/views/AdminConsole.vue', import.meta.url), 'utf8')
 
-test('价目草稿提供计价单位数量输入，并说明填法', async () => {
+test('价目草稿使用共享中文编辑器，供应商来源固定计费单位', async () => {
   const admin = await source()
-  assert.match(admin, /v-model="item\.unit_size"[^>]*aria-label="计价单位数量"/)
-  assert.match(admin, /每累计多少计量单位收一次单价/)
-  assert.match(admin, /毫秒计量按每分钟收费时填 <code>60000<\/code>/)
-  assert.match(admin, /<div class="price-item price-item-head">/, '缺少与网格对齐的列标题')
+  const editor = await readFile(new URL('../src/components/PriceBookItemsEditor.vue', import.meta.url), 'utf8')
+  assert.match(admin, /<PriceBookItemsEditor :items="price.items" :locked="price.rules_locked"/)
+  assert.match(editor, /v-model="item.unit_size"[^>]*aria-label="计价单位数量"/)
+  assert.match(editor, /v-if="!locked" class="price-editor-fields"/)
+  assert.match(editor, /只能调整积分金额/)
 })
 
 test('保存价目时只增删 unit_size，其它计价条件原样保留', async () => {

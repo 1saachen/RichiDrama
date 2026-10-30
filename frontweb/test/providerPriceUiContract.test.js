@@ -55,7 +55,7 @@ test('the price source switcher comes from the backend and gates Ark-only copy',
   assert.match(panel, /v-if="sources\.length > 1" v-model="provider"[^>]*@change="switchSource"/)
   // 方舟权限诊断只属于需要它的来源，中转来源没有 IAM 诊断
   assert.match(panel, /const supportsProbe = computed\(\(\) => currentSource\.value\?\.requires_source_check !== false\)/)
-  assert.match(panel, /v-if="supportsProbe" :loading="probing"/)
+  assert.match(panel, /v-if="supportsProbe"[^>]*:loading="probing"/)
   assert.match(panel, /v-if="supportsProbe && probeResult"/)
   assert.match(panel, /supportsProbe\.value \? adminAPI\.providerPriceProbeStatus\(provider\.value\) : Promise\.resolve\(null\)/)
   assert.match(panel, /审核并发布\$\{sourceLabel\.value\}价目同步批次/)

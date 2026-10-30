@@ -214,6 +214,7 @@ function setupRouter(cfg, db, log) {
   adminRouter.get('/provider-price-syncs', admin.providerPriceSyncs);
   adminRouter.get('/provider-price-syncs/:id', admin.providerPriceSyncDetail);
   adminRouter.patch('/provider-price-syncs/:id/candidates/:candidateId', admin.updateProviderPriceCandidate);
+  adminRouter.post('/provider-price-syncs/:id/accept-mapped', admin.acceptProviderPriceCandidates);
   adminRouter.post('/provider-price-syncs/:id/create-draft', admin.createProviderPriceDraft);
   adminRouter.get('/notices', admin.notices);
   adminRouter.post('/notices/:id/archive', admin.archiveNotice);
