@@ -1,6 +1,28 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { activeGenerationStatuses, normalizeJob, resolveShotPreviewJob, shotPreviewVideoUrl } from '../src/utils/shotPreview.js'
+import { activeGenerationStatuses, normalizeJob, resolveShotPreviewJob, shotPreviewVideoUrl, syncPolledShotState } from '../src/utils/shotPreview.js'
+
+test('polling a background shot updates its card without touching another or a newer task', () => {
+  const shots = [{ id: 1, omni_job_id: 10, status: 'completed', video_url: '/static/user.mp4', prompt: 'user' }, { id: 2, omni_job_id: '20', status: 'processing', prompt: 'background' }]
+  syncPolledShotState(shots, { id: 20, status: 'completed', videoUrl: '/static/new.mp4' })
+  assert.equal(shots[1].status, 'completed')
+  assert.equal(shots[1].video_url, '/static/new.mp4')
+  assert.equal(shots[1].prompt, 'background')
+  assert.equal(shots[0].video_url, '/static/user.mp4')
+  shots[1].omni_job_id = 21
+  syncPolledShotState(shots, { id: 20, status: 'failed', error_msg: 'old task' })
+  assert.equal(shots[1].status, 'completed', 'late responses cannot overwrite a newer binding')
+  assert.equal(shots[1].generation_error, null)
+})
+
+test('background failure and connection loss remain visible without rebinding the shot', () => {
+  const shots = [{ id: 2, omni_job_id: 20, status: 'processing' }]
+  syncPolledShotState(shots, { id: 20, status: 'unknown', error_msg: 'connection lost' })
+  assert.equal(shots[0].status, 'unknown')
+  syncPolledShotState(shots, { id: 20, status: 'failed', error_msg: 'rejected' })
+  assert.equal(shots[0].generation_error, 'rejected')
+  assert.equal(shots[0].omni_job_id, 20)
+})
 
 const adopted = { id: 1, status: 'completed', is_current: true, videoUrl: '/static/old.mp4' }
 const shot = { omni_job_id: 1, video_url: adopted.videoUrl }

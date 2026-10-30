@@ -96,6 +96,7 @@ function quote(db, body, payer) {
   const capability = capabilityService.resolve(db, model, [], tenantOptions);
   if (!capability.model || capability.model !== model) throw new Error('所选视频模型不可用');
   capabilityService.validateResolution(capability, body.resolution || '480p');
+  if (capability.provider === 'richbest') require('./richbestProvider').assertVideoRequestShape({ model, params: body });
   const aiConfigs = require('./aiConfigService');
   const billing = require('./billingService');
   const billingTarget = aiConfigs.resolveBillingTarget(db, 'video', capability.model, capability.config_id, tenantOptions);
@@ -155,7 +156,12 @@ function create(db, log, body, billingUser) {
   capabilityService.validateResolution(capability, body.resolution);
   capabilityService.validateAspectRatio(capability, body.aspect_ratio);
   validateShotAssetLimits(assets, capability);
-  body.duration = Math.min(maxDurationForModel(capability.model), Math.max(4, Math.round(Number(body.duration) || 15)));
+  const relayProfile = capability.provider === 'richbest' ? require('./richbestProvider').videoProfile(capability.model) : null;
+  if (relayProfile?.key === 'vega') {
+    if (assets.length) throw new Error('Vega 基础链路当前仅开放文生视频，请移除参考素材');
+    require('./richbestProvider').assertVideoRequestShape({ model: capability.model, references: [], params: body });
+    body.duration = Number(body.duration ?? 15);
+  } else body.duration = Math.min(maxDurationForModel(capability.model), Math.max(4, Math.round(Number(body.duration) || 15)));
   const creationMode = body.creation_mode || body.settings?.creation_mode || 'multi_reference';
   validateCreationMode(creationMode, assets, capability);
   const routed = routeAssets(db, expandVideoReferences(db, log, assets, capability.supports), capability.supports, body.audio_strategy);
@@ -218,11 +224,11 @@ function create(db, log, body, billingUser) {
   const last = routed.find((asset) => asset.usage === 'last_frame' && asset.send_to_model);
   if (existingWaitingId) {
     db.prepare(`UPDATE video_generations SET billing_authorization_id = ?, provider = ?, prompt = ?, model = ?, duration = ?, aspect_ratio = ?, resolution = ?, upscale_resolution = ?, target_fps = ?, seed = ?, camera_fixed = ?, watermark = ?, image_url = ?, first_frame_url = ?, last_frame_url = ?, reference_image_urls = ?, draft_node_id = ?, status = ?, error_msg = NULL, updated_at = ? WHERE id = ?`)
-      .run(authorization.authorization_id, body.provider || 'chatfire', modelPrompt, capability.model, Number(body.duration) || null, body.aspect_ratio || null, body.resolution || null, upscaleResolution, targetFps, body.seed != null ? Number(body.seed) : null, body.camera_fixed ? 1 : 0, body.watermark ? 1 : 0, imageUrls[0] || null, first?.model_url || first?.local_path || first?.url || null, last?.model_url || last?.local_path || last?.url || null, imageUrls.length ? JSON.stringify(imageUrls) : null, body.source_context === 'creative_board' && body.draft_node_id != null ? String(body.draft_node_id).slice(0, 200) : null, 'processing', now, videoGenerationId);
+      .run(authorization.authorization_id, billingTarget.provider, modelPrompt, capability.model, Number(body.duration) || null, body.aspect_ratio || null, body.resolution || null, upscaleResolution, targetFps, body.seed != null ? Number(body.seed) : null, body.camera_fixed ? 1 : 0, body.watermark ? 1 : 0, imageUrls[0] || null, first?.model_url || first?.local_path || first?.url || null, last?.model_url || last?.local_path || last?.url || null, imageUrls.length ? JSON.stringify(imageUrls) : null, body.source_context === 'creative_board' && body.draft_node_id != null ? String(body.draft_node_id).slice(0, 200) : null, 'processing', now, videoGenerationId);
   } else {
     const result = db.prepare(`INSERT INTO video_generations (drama_id, storyboard_id, board_id, board_request_id, owner_user_id, tenant_id, billing_authorization_id, provider, prompt, model, duration, aspect_ratio, resolution, upscale_resolution, target_fps, seed, camera_fixed, watermark, image_url, first_frame_url, last_frame_url, reference_image_urls, intermediate_cleanup_enabled, postprocess_recovery_version, draft_node_id, status, task_id, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?)`)
-      .run(Number(body.drama_id) || null, body.storyboard_id ? Number(body.storyboard_id) : null, body.board_id ? Number(body.board_id) : null, body.source_context === 'creative_board' ? idempotencyKey : null, body.owner_user_id || payer.id, tenantId, authorization?.authorization_id || null, body.provider || 'chatfire', modelPrompt, capability.model, Number(body.duration) || null, body.aspect_ratio || null, body.resolution || null, upscaleResolution,
+      .run(Number(body.drama_id) || null, body.storyboard_id ? Number(body.storyboard_id) : null, body.board_id ? Number(body.board_id) : null, body.source_context === 'creative_board' ? idempotencyKey : null, body.owner_user_id || payer.id, tenantId, authorization?.authorization_id || null, billingTarget.provider, modelPrompt, capability.model, Number(body.duration) || null, body.aspect_ratio || null, body.resolution || null, upscaleResolution,
         targetFps, body.seed != null ? Number(body.seed) : null, body.camera_fixed ? 1 : 0, body.watermark ? 1 : 0,
         imageUrls[0] || null, first?.model_url || first?.local_path || first?.url || null, last?.model_url || last?.local_path || last?.url || null,
         imageUrls.length ? JSON.stringify(imageUrls) : null, body.source_context === 'creative_board' && body.draft_node_id != null ? String(body.draft_node_id).slice(0, 200) : null, waitingForSd2 ? 'sd2_waiting' : 'processing', task.id, now, now);
@@ -724,7 +730,7 @@ function get(db, id) {
   const generation = db.prepare(`SELECT v.*, t.progress AS task_progress, t.message AS task_message, t.updated_at AS task_updated_at
     FROM video_generations v LEFT JOIN async_tasks t ON t.id=v.task_id AND t.deleted_at IS NULL WHERE v.id = ?`).get(job.video_generation_id);
   const assets = db.prepare('SELECT * FROM omni_video_job_assets WHERE omni_job_id = ? ORDER BY ordinal').all(job.id);
-  const safeGeneration = generation ? { ...generation, video_url: videoService.publicVideoUrl(generation.video_url, generation.local_path) } : null;
+  const safeGeneration = generation ? { ...generation, provider: require('./videoProviderService').recordedProvider(db, generation), video_url: videoService.publicVideoUrl(generation.video_url, generation.local_path) } : null;
   let actualPoints = null;
   try { actualPoints = db.prepare('SELECT charged_micro / 10000.0 AS amount FROM billing_usage_logs WHERE authorization_id = ? LIMIT 1').get(generation?.billing_authorization_id)?.amount ?? null; } catch (_) {}
   let isCurrent = false;
@@ -783,7 +789,7 @@ function generationHistoryDetail(db, videoGenerationId, actor) {
       source_context: snapshot?.source_context || null,
       model_requested: job?.model_requested || null,
       model_resolved: job?.model_resolved || generation.model || snapshot?.model || null,
-      provider: generation.provider || null,
+      provider: require('./videoProviderService').recordedProvider(db, generation),
       duration: snapshot?.duration ?? generation.duration ?? null,
       aspect_ratio: snapshot?.aspect_ratio || generation.aspect_ratio || null,
       resolution: snapshot?.resolution || generation.resolution || null,

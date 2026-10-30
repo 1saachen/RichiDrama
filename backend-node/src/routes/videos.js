@@ -95,7 +95,7 @@ function routes(db, log) {
             ...(Array.isArray(body.reference_video_urls) ? body.reference_video_urls.filter(Boolean).map(() => ({ kind: 'video', role: 'reference_video' })) : []),
             ...((Array.isArray(body.reference_audio_urls) && body.reference_audio_urls.length ? body.reference_audio_urls : [body.voice_reference_url]).filter(Boolean).map(() => ({ kind: 'audio', role: 'reference_audio' }))),
           ];
-          try { richbest.assertVideoRequestShape({ model: modelForBilling, references: shape }); }
+          try { richbest.assertVideoRequestShape({ model: modelForBilling, references: shape, params: body }); }
           catch (error) { return response.badRequest(res, error.message); }
         }
         const meters = billing.activeMeters(db, req.auth, body.service_type || 'video', billingTarget.billing_key, billingTarget.provider);
@@ -131,7 +131,7 @@ function routes(db, log) {
         const task = taskService.createTask(db, log, 'video_generation', String(body.drama_id || ''), req.auth.id, tenant?.id || null);
         const now = new Date().toISOString();
         const storyboardId = body.storyboard_id != null ? Number(body.storyboard_id) : null;
-        const provider = body.provider || 'chatfire';
+        const provider = billingTarget.provider;
         let prompt = body.prompt || '';
         const style = (body.style || '').toString().trim();
         if (style) {
