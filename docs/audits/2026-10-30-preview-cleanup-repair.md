@@ -2,6 +2,12 @@
 
 日期：2026-10-30，Asia/Shanghai。
 
+## 最新进展（用户明确同意后）
+
+用户已在了解 Actions Secrets 用途后再次明确同意原受限配置方案。已安装独立服务器入口，配置专用 forced-command 公钥，并将私钥加密写入四个专用 Secrets；私钥未保存到本地文件或日志。直接使用专用身份执行 report-expired 返回 `eligible=0 apply=0 repository=1saachen/RichiDrama`，任意 `uname -a` 命令返回拒绝。前后预览容器清单、预览元数据和生产容器启动时间的合并哈希一致，没有清理既有预览或重启生产。
+
+上述为 SSH 联通验证；GitHub 手动 dry-run、完整云端 CI 和重新启用工作流仍待执行。下文的自动审批拒绝是历史过程，已由用户明确授权解决。
+
 ## 问题与修改
 
 - 旧工作流使用未配置的通用 SERVER_HOST / SERVER_KEY，定时运行在 SSH 连接前失败；用户要求修复。
