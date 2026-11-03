@@ -26,6 +26,9 @@ try {
         : '';
       counts[table] = db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE status IN (${active.map(() => '?').join(',')})${dormant}`).get(...active).n;
     }
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='relay_model_jobs'").get()) {
+      counts.relay_model_jobs = db.prepare("SELECT COUNT(*) AS n FROM relay_model_jobs WHERE state IN ('queued','submitting','running','archiving')").get().n;
+    }
   })();
   console.log(JSON.stringify({ active: counts }));
   process.exitCode = Object.values(counts).some(n => n > 0) ? 75 : 0;

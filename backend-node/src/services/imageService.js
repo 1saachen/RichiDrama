@@ -1637,6 +1637,7 @@ async function processImageGeneration(db, log, imageGenId) {
 
 function deleteById(db, log, id) {
   const numId = Number(id);
+  if(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='relay_model_jobs'").get() && db.prepare("SELECT 1 FROM relay_model_jobs j,json_each(j.image_ids_json) item WHERE item.value=? AND j.state NOT IN ('completed','failed') LIMIT 1").get(numId))throw Error('中转图片任务仍在生成或待核对，暂不能删除生成记录');
   const now = new Date().toISOString();
   // 若该图当前绑定为某分镜的首/尾帧，解除绑定（避免悬空引用）
   try {

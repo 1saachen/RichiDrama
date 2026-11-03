@@ -32,6 +32,7 @@ function openMediaLibrary() {
 }
 
 const tools = [
+  { title: '中转图片与素材理解', icon: '◇', tone: 'blue', label: '中转模型', input: '提示词或图片、视频、音频、文件', output: 'GPT / Vega 图片与理解结果', description: '使用已开通的模型，按真实用量结算，结果持久保存。', to: '/ai-tools/relay-models', group: 'visual' },
   { title: '剧本分析', icon: '◎', tone: 'blue', label: '文本策划', input: '剧本与项目设定', output: '角色、场景、镜头建议', description: '把剧本拆解为可制作的结构化信息。', to: '/ai-tools/script-analysis', group: 'writing' },
   { title: '剧本分析（流式）', icon: '≋', tone: 'copper', label: '批量处理', input: '多个 TXT / 剧本', output: '可续写的分析记录', description: '适合长剧本与批量拆解，运行过程持续保存。', to: '/ai-tools/script-analysis-stream', group: 'writing' },
   { title: '剧本创作', icon: '✦', tone: 'green', label: '文本策划', input: '创意、题材、集数', output: '分集短剧正文', description: '从灵感扩写为分集短剧，可导入项目。', to: '/ai-tools/script-writing', group: 'writing' },

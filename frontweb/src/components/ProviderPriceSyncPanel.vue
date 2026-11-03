@@ -65,7 +65,7 @@ import { serviceLabel } from '@/utils/billingPresentation'
 import { billingUnitLabel, chargeItemLabel, priceRuleSummary, supplierPriceText } from '@/utils/providerPricePresentation'
 
 const emit = defineEmits(['published', 'draft-created'])
-const meters = ['request', 'image', 'input_image', 'second', 'millisecond', 'character', 'input_token', 'cache_token', 'output_token']
+const meters = ['request', 'image', 'input_image', 'second', 'millisecond', 'character', 'input_token', 'input_image_token', 'cache_token', 'output_token']
 const sources = ref([]); const provider = ref('volcengine')
 const detail = ref(null); const probeResult = ref(null); const draft = ref(null); const notices = ref([])
 const probing = ref(false); const syncing = ref(false); const creatingDraft = ref(false); const publishing = ref(false); const showPublish = ref(false)

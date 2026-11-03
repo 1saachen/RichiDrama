@@ -7,6 +7,7 @@ const parse = value => JSON.parse(value || '{}');
 function enabled(db) { return typeof db?.prepare === 'function' && db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='cost_calls'").get()?.name === 'cost_calls'; }
 function normalizeUsage(raw, type) {
   if (!raw || typeof raw !== 'object') return null;
+  if(raw.input_tokens_details?.text_tokens !== undefined && raw.output_tokens_details?.image_tokens !== undefined) return require('./relayModelPolicy').usage('gpt-image-2',{usage:raw},{});
   const usage = {};
   for (const meter of prices.METERS) if (raw[meter] != null && Number.isFinite(Number(raw[meter])) && Number(raw[meter]) >= 0) usage[meter] = Number(raw[meter]);
   const input = raw.prompt_tokens ?? raw.input_tokens ?? raw.input_token_count ?? raw.promptTokenCount;
@@ -30,6 +31,11 @@ function usageEvidence(raw) {
     if (raw[key] != null && Number.isFinite(Number(raw[key]))) result[key] = Number(raw[key]);
   }
   for (const key of ['prompt_tokens_details','input_tokens_details']) if (Number.isFinite(Number(raw[key]?.cached_tokens))) result[key] = { cached_tokens: Number(raw[key].cached_tokens) };
+  for(const key of ['input_tokens_details','output_tokens_details']) if(raw[key] && typeof raw[key]==='object') {
+    const source=raw[key];result[key]={...(result[key]||{})};
+    for(const field of ['text_tokens','image_tokens','cached_tokens'])if(Number.isSafeInteger(source[field])&&source[field]>=0)result[key][field]=source[field];
+    if(source.cached_tokens_details)result[key].cached_tokens_details=Object.fromEntries(['text_tokens','image_tokens'].filter(field=>Number.isSafeInteger(source.cached_tokens_details[field])&&source.cached_tokens_details[field]>=0).map(field=>[field,source.cached_tokens_details[field]]));
+  }
   return Object.keys(result).length ? result : null;
 }
 function begin(db, input) {

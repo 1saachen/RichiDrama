@@ -695,7 +695,7 @@ async function sync(db, actorId, options = {}) {
     db.prepare('UPDATE provider_price_syncs SET source_config_id=? WHERE id=? AND source_config_id IS NULL').run(fetched.configId || null, id);
     const currentPrice = db.prepare('SELECT id,unit_price_micro,is_free,conditions_json FROM billing_price_book_items WHERE id=?');
     const baseline = rows.map(row => row.current_price_book_item_id ? currentPrice.get(row.current_price_book_item_id) : null);
-    const responseHash = sha256(`${JSON.stringify(stable(clean))}|${relay ? 'relay-pricing-v2-vega' : MAPPING_RULE_VERSION}|${JSON.stringify(pricingConfigurations(db, provider))}|${JSON.stringify(stable(baseline))}`);
+    const responseHash = sha256(`${JSON.stringify(stable(clean))}|${relay ? 'relay-pricing-v4-live-modeltop' : MAPPING_RULE_VERSION}|${JSON.stringify(pricingConfigurations(db, provider))}|${JSON.stringify(stable(baseline))}`);
     const existing = db.prepare(`SELECT id FROM provider_price_syncs WHERE provider=? AND response_hash=? AND status='completed' AND id<>? LIMIT 1`).get(provider, responseHash, id);
     if (existing) {
       db.prepare(`UPDATE provider_price_syncs SET status='unchanged',response_hash=?,provider_request_ids_json=?,raw_response_json=?,fetched_at=?,updated_at=? WHERE id=?`)
@@ -749,7 +749,7 @@ function updateCandidate(db, actorId, syncId, candidateId, input = {}) {
   const billingKey = String(input.billing_key || row.billing_key || '').trim();
   const meter = String(input.meter || row.meter || '').trim();
   const unitSize = Number(input.unit_size || row.unit_size);
-  if (!serviceType || !billingKey || !['request','image','input_image','second','millisecond','character','input_token','cache_token','output_token'].includes(meter) || !Number.isSafeInteger(unitSize) || unitSize <= 0 || !Number.isSafeInteger(row.new_unit_price_micro)) throw new Error('请提供有效的服务、计费键、计量器和计量基数');
+  if (!serviceType || !billingKey || !['request','image','input_image','second','millisecond','character','input_token','input_image_token','cache_token','output_token'].includes(meter) || !Number.isSafeInteger(unitSize) || unitSize <= 0 || !Number.isSafeInteger(row.new_unit_price_micro)) throw new Error('请提供有效的服务、计费键、计量器和计量基数');
   const current = activeItem(db, serviceType, billingKey, meter);
   const conditions = { ...parse(row.new_conditions_json, parse(current?.conditions_json, {})), unit_size: unitSize };
   const conditionsChanged = !samePriceCore(current?.conditions_json, conditions);
@@ -763,7 +763,7 @@ function updateCandidate(db, actorId, syncId, candidateId, input = {}) {
 
 function reviewableOfficialCandidate(row) {
   return row.mapping_status === 'mapped' && !!row.service_type && !!row.billing_key
-    && ['request','image','input_image','second','millisecond','character','input_token','cache_token','output_token'].includes(row.meter)
+    && ['request','image','input_image','second','millisecond','character','input_token','input_image_token','cache_token','output_token'].includes(row.meter)
     && Number.isSafeInteger(row.unit_size) && row.unit_size > 0
     && Number.isSafeInteger(row.new_unit_price_micro)
     && !require('./supplierCostRates').fixedRate(row.provider_model)
@@ -859,6 +859,10 @@ function createDraft(db, actorId, syncId) {
     for (const candidate of candidates) {
       const existing = db.prepare('SELECT * FROM billing_price_book_items WHERE price_book_id=? AND service_type=? AND model=? AND meter=?').get(draftId, candidate.service_type, candidate.billing_key, candidate.meter);
       const conditions = candidate.new_conditions_json ? parse(candidate.new_conditions_json, {}) : parse(existing?.conditions_json, {});
+      if (provider === RELAY_PROVIDER && require('./relayModelPolicy').enabled(conditions)) {
+        const meters = {gpt_image_tokens:['input_token','input_image_token','cache_token','output_token'],gpt_image_count:['image'],vega_image:['image','input_image'],vega_vl:['input_token','cache_token','output_token']}[conditions.relay_model_kind];
+        if(meters)db.prepare(`DELETE FROM billing_price_book_items WHERE price_book_id=? AND service_type=? AND model=? AND meter NOT IN (${meters.map(()=>'?').join(',')})`).run(draftId,candidate.service_type,candidate.billing_key,...meters);
+      }
       Object.assign(conditions, { provider, currency: 'CNY', unit_size: candidate.unit_size, source: meta.source, source_sync_id: syncId, verified_on: at.slice(0, 10), provider_model: candidate.provider_model, provider_charge_type: candidate.charge_type, pricing_note: meta.note });
       if (existing) db.prepare('UPDATE billing_price_book_items SET unit_price_micro=?,conditions_json=?,updated_at=? WHERE id=?').run(candidate.new_unit_price_micro, json(conditions), at, existing.id);
       else db.prepare(`INSERT INTO billing_price_book_items(price_book_id,service_type,model,meter,unit_price_micro,is_free,conditions_json,created_at,updated_at) VALUES (?,?,?,?,?,0,?,?,?)`).run(draftId, candidate.service_type, candidate.billing_key, candidate.meter, candidate.new_unit_price_micro, json(conditions), at, at);

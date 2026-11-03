@@ -39,7 +39,7 @@ function decode(item, at) {
 
 function calculate(specs, usage, context = {}) {
   if (!specs.length) return { status: 'missing_price', reason: '供应商价格的计费规格尚未覆盖' };
-  if (['input_token', 'output_token', 'cache_token'].some(meter => usage[meter] > 0 && !specs.some(spec => spec.meter === meter))) return { status: 'missing_price', reason: '供应商价格未覆盖全部实际 Token 计费项' };
+  if (['input_token', 'input_image_token', 'output_token', 'cache_token'].some(meter => usage[meter] > 0 && !specs.some(spec => spec.meter === meter))) return { status: 'missing_price', reason: '供应商价格未覆盖全部实际 Token 计费项' };
   let amount = 0; const rates = [];
   for (const spec of specs) {
     const conditions = spec.conditions || {};

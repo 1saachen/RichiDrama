@@ -2,6 +2,7 @@ const capabilities = ['text', 'image', 'video', 'tts'];
 
 function infer(model) {
   const name = String(model || '').trim().toLowerCase();
+  if (/^wand-vega-vl-1\.0-(?:lite|flash|pro)$/.test(name)) return 'text';
   if (/^(doubao-seedream-|dola-seedream-|vega-image-|gpt-image-|dall-e-|flux[-.]|qwen-image)/.test(name)) return 'image';
   if (/^(doubao-seedance-|dreamina-seedance-|vega-(?:1\.0|1\.5)-|sora-|veo[-.]|kling-)/.test(name)) return 'video';
   if (/^(tts-|cosyvoice|qwen3-tts)/.test(name)) return 'tts';

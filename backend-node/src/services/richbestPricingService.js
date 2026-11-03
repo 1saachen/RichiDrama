@@ -183,8 +183,15 @@ function chargeTypeFor(metric, dimension) {
 function pricePiece(entry, price, context = {}) {
   const resolved = meterFor(price?.metric);
   const metric = resolved.metric; const reason = resolved.reason;
-  const meter = entry?.id === 'vega-1.0-lite' && metric === 'image' && /^(domestic|international):input:after_five$/.test(String(price?.dimension)) ? 'input_image' : resolved.meter;
+  let meter = entry?.id === 'vega-1.0-lite' && metric === 'image' && /^(domestic|international):input:after_five$/.test(String(price?.dimension)) ? 'input_image' : resolved.meter;
   const model = String(entry?.id || '').trim();
+  const family = require('./relayModelPolicy').family(model);
+  let dimension = String(price?.dimension ?? '');
+  // Live ModelTop exposes provider separately and returns text/image/null dimensions.
+  // Preserve the earlier namespaced contract; normalize only the confirmed provider.
+  if (family === 'gpt_image' && entry?.provider === 'modeltop' && ['text','image',''].includes(dimension)) dimension = `modeltop:${dimension}`;
+  if (family === 'gpt_image' && metric === 'input_tokens' && dimension === 'modeltop:image') meter = 'input_image_token';
+  if (family === 'vega_image' && metric === 'image' && /^(domestic|international):input:after_three$/.test(dimension) && model.endsWith('-pro')) meter = 'input_image';
   const base = {
     provider_model: model,
     display_name: String(entry?.display_name || model).trim(),
@@ -199,6 +206,8 @@ function pricePiece(entry, price, context = {}) {
   if (!meter) return { ...base, reason: reason || `未知计价指标 ${metric || '(空)'}` };
   const unitSize = toNumber(price?.unit_size) || 1;
   if (price?.unit_size != null && !toNumber(price.unit_size)) return { ...base, reason: '供应商计价单位数量必须为正整数' };
+  if (family && base.currency !== 'CNY') return { ...base, reason: '此中转模型必须返回人民币价格，不能套用其他币种' };
+  if (family && unitSize !== (['input_token','input_image_token','output_token','cache_token'].includes(meter) ? 1000000 : 1)) return { ...base, reason: '此模型计价单位数量与已核实的中转接口不符' };
   if (metric === 'video_second' && (!/^vega-(?:1\.0-(?:lite|pro|pro-fast|pro-mini)|1\.5-pro)$/.test(model) || unitSize !== 1)) return { ...base, reason: '视频秒计费仅适配已核实的 Vega 视频合约，单位数量必须为 1' };
   const source = price?.effective_price_yuan ?? price?.list_price_yuan;
   const micro = yuanToMicroPoints(source);
@@ -207,7 +216,12 @@ function pricePiece(entry, price, context = {}) {
   if (mismatch) return { ...base, meter, reason: mismatch };
   const points = yuanToPointsText(source);
   if (points === null) return { ...base, meter, reason: `单价无法换算成四位小数以内的积分：${source}` };
-  const selector = parseDimension(meter, price?.dimension);
+  let selector;
+  if (family === 'gpt_image' && ((metric === 'input_tokens' && ['modeltop:text','modeltop:image'].includes(dimension)) || (metric === 'output_tokens' && dimension === 'modeltop:image') || (metric === 'cached_input_tokens' && dimension === 'modeltop:'))) selector = { kind: 'base', relayKind: 'gpt_image_tokens' };
+  else if (family === 'gpt_image' && metric === 'image' && !dimension) selector = { kind: 'base', relayKind: 'gpt_image_count' };
+  else if (family === 'vega_image' && ((metric === 'image' && /^(domestic|international):output$/.test(dimension)) || meter === 'input_image')) selector = { kind: 'base', site: dimension.split(':')[0], relayKind: 'vega_image', freeUnits: meter === 'input_image' ? 3 : 0 };
+  else if (family === 'vega_vl' && ['input_tokens','output_tokens','cached_input_tokens'].includes(metric) && ['domestic','international'].includes(dimension)) selector = { kind: 'base', site: dimension, relayKind: 'vega_vl' };
+  else selector = parseDimension(meter, price?.dimension);
   if (selector.kind === 'unsupported' || selector.kind === 'unknown') return { ...base, meter, reason: selector.reason };
   return { ...base, unit_size: unitSize, micro, points, selector };
 }
@@ -256,6 +270,10 @@ function compileGroup(entry, target, pieces, context) {
   const conditions = conditionMeta(entry, target, syncId, discountBps);
   const sites = [...new Set(pieces.map(piece => piece.selector.site).filter(Boolean))];
   if (sites.length > 1) return pieces.map(piece => unmappedRow(piece, '同一业务 Key 返回多个站点价格，不能确定当前调用渠道；请核对中转项目绑定'));
+  if (pieces[0].selector.relayKind) {
+    if (pieces.some(p => p.selector.relayKind !== pieces[0].selector.relayKind)) return pieces.map(p => unmappedRow(p, '同一模型返回不同计价方式，不能合并发布'));
+    Object.assign(conditions, { relay_model_billing_version: 1, relay_model_kind: pieces[0].selector.relayKind, ...(sites.length ? { provider_site: sites[0] } : {}), ...(pieces[0].selector.freeUnits ? { free_units: pieces[0].selector.freeUnits } : {}) });
+  }
   if (/^vega-/.test(pieces[0].provider_model) && ['second', 'input_image'].includes(meter)) {
     if (sites.length !== 1) return pieces.map(piece => unmappedRow(piece, 'Vega 价格缺少已核实的国内／国际站点维度'));
     Object.assign(conditions, { relay_video_billing_version: 1, provider_site: sites[0], require_rate_match: meter === 'second' });
@@ -330,6 +348,9 @@ function buildCandidates(entries, { resolveTarget, discountBps, syncId = null } 
     }
     const groups = new Map();
     for (const price of prices) {
+      // Lite/Flash reference images are included. The relay publishes a zero
+      // after_three row for the shared catalogue; it is not a billable item.
+      if (/^vega-image-1\.0-(lite|flash)$/.test(model) && price.metric === 'image' && /^(domestic|international):input:after_three$/.test(String(price.dimension)) && yuanToMicroPoints(price.effective_price_yuan ?? price.list_price_yuan) === 0) continue;
       const piece = pricePiece(entry, price, { discountBps });
       const key = piece.meter || `metric:${piece.metric}`;
       if (!groups.has(key)) groups.set(key, []);
@@ -342,7 +363,7 @@ function buildCandidates(entries, { resolveTarget, discountBps, syncId = null } 
         continue;
       }
       const usable = pieces.filter((piece) => !piece.reason);
-      if (/^vega-/.test(model) && usable.length !== pieces.length) {
+      if ((/^vega-/.test(model) || require('./relayModelPolicy').family(model)) && usable.length !== pieces.length) {
         rows.push(...pieces.map(piece => unmappedRow(piece, piece.reason || '该 Vega 计费项包含未识别档位，不能只发布部分价格')));
         continue;
       }

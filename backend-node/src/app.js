@@ -111,6 +111,7 @@ function createApp() {
   require('./services/richbestAssetRebindService').startRecovery(db, log, config);
   require('./services/omniVideoService').startSd2WaitingGenerationRecovery(db, log);
   require('./services/imageService').resumePendingCreativeBoardImages(db, log);
+  require('./services/relayModelJobService').startRecovery(db, log, config);
   try { require('./services/creativeBoardDeliveryService').resume(db, log); }
   catch (error) { log.warn('画布交付恢复失败', { error: error.message }); }
   try { require('./services/lasMediaJobService').resume(db, log, config); }

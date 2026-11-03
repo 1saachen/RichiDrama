@@ -33,6 +33,7 @@ function createResourceImageBilling(db, { model, dramaId, sourceId, size, image_
   const providerModel = String(model || '').trim();
   const billingTarget = aiConfigService.resolveBillingTarget(db, 'image', providerModel, null, options);
   const billing = require('./billingService');
+  if (require('./relayModelPolicy').family(providerModel) && require('./relayModelPolicy').studioPrice(db,actor,'image',billingTarget.billing_key,billingTarget.provider)) throw Error('此模型请从 AI 工具箱的“中转图片与素材理解”生成');
   const authorization = billing.createAuthorization(db, actor, {
     idempotency_key: `resource-image:${randomUUID()}`,
     service_type: 'image',
