@@ -86,7 +86,7 @@ release-rollback
 新工作流合并到 `main` 后，在管理员工作站启用最终分支保护：
 
 ```bash
-bash deploy/configure-github-protection Moemu/RichiDrama 0
+bash deploy/configure-github-protection 1saachen/RichiDrama 0
 ```
 
 该命令会先确认 `validation.yml` 和 `preview.yml` 已存在于 `main`。确认失败时，它不会修改分支保护。
@@ -96,7 +96,7 @@ bash deploy/configure-github-protection Moemu/RichiDrama 0
 新增其他管理员后，将批准数改为 `1`：
 
 ```bash
-bash deploy/configure-github-protection Moemu/RichiDrama 1
+bash deploy/configure-github-protection 1saachen/RichiDrama 1
 ```
 
 `preview-show` 输出敏感地址和密码。只通过私密渠道发送这些信息。

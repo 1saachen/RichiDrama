@@ -50,7 +50,7 @@ RichiDrama 是可自行部署的 AI 短剧生产平台。
 要求：Node.js 18 或更高版本。
 
 ```bash
-git clone https://github.com/Moemu/RichiDrama.git
+git clone https://github.com/1saachen/RichiDrama.git
 cd RichiDrama
 ```
 
@@ -117,8 +117,8 @@ RichiDrama/
 
 ## 贡献与问题
 
-- [报告问题](https://github.com/Moemu/RichiDrama/issues/new)
-- [提交 Pull Request](https://github.com/Moemu/RichiDrama/pulls)
+- [报告问题](https://github.com/1saachen/RichiDrama/issues/new)
+- [提交 Pull Request](https://github.com/1saachen/RichiDrama/pulls)
 
 ## License
 
