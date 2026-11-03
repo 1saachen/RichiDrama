@@ -40,6 +40,13 @@ test('release fails closed when a required lifecycle table cannot be read', t =>
   const f = fixture(t); const db = new Database(f.file); db.exec('DROP TABLE async_tasks'); db.close();
   assert.throws(() => f.run(), /Required table missing/);
 });
+test('new relay image and understanding jobs block release until inactive without changing historical rows', t => {
+  const f=fixture(t),db=new Database(f.file);
+  db.exec("CREATE TABLE relay_model_jobs(state TEXT); INSERT INTO relay_model_jobs VALUES ('completed'),('reconciliation'),('submitting')");
+  assert.equal(f.run().code,75);
+  db.exec("UPDATE relay_model_jobs SET state='completed' WHERE state='submitting'");db.close();
+  const before=fs.readFileSync(f.file);assert.equal(f.run().code,0);assert.deepEqual(fs.readFileSync(f.file),before);
+});
 test('unsubmitted postprocess placeholders cannot block release after a source-less interrupted generation', t => {
   const f=fixture(t); const db=new Database(f.file);
   db.exec("CREATE TABLE video_upscale_jobs(status TEXT, provider_task_id TEXT, video_generation_id INTEGER); INSERT INTO video_generations(id,status) VALUES (1,'retryable'); INSERT INTO video_upscale_jobs VALUES ('awaiting_source',NULL,1)");

@@ -142,7 +142,7 @@ function activeMeters(db, user, serviceType, model, provider) {
 }
 
 function normalizeUsage(usage, fractionalSeconds = false) {
-  const allowed = ['request', 'image', 'input_image', 'second', 'millisecond', 'character', 'input_token', 'cache_token', 'output_token'];
+  const allowed = ['request', 'image', 'input_image', 'second', 'millisecond', 'character', 'input_token', 'input_image_token', 'cache_token', 'output_token'];
   const clean = {};
   for (const meter of allowed) {
     const v = Number(usage?.[meter] || 0);
@@ -302,6 +302,10 @@ function imageAuthorization(db, authorizationId) {
 function voidImageAuthorization(db, user, authorizationId, reason) {
   const auth = imageAuthorization(db, authorizationId);
   if (!auth || (auth.user_id !== user.id && user.role !== 'admin')) throw new Error('预授权不存在');
+  if (require('./relayModelPolicy').kind(auth.snapshot) && db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='relay_model_jobs'").get()) {
+    const job=db.prepare('SELECT state FROM relay_model_jobs WHERE authorization_id=?').get(auth.id);
+    if(job&&job.state!=='failed')return markPendingReconciliation(db,user,auth.id,{reason:'通用图片任务状态不能证明中转调用失败，保留原预授权待核对'});
+  }
   if (auth.snapshot.image_request_finalized && db.prepare("SELECT 1 FROM billing_reconciliation_cases WHERE authorization_id=? AND status='pending'").get(auth.id)) {
     return { authorization_id: auth.id, pending_reconciliation: true };
   }
@@ -1105,7 +1109,8 @@ function validatePriceBookWindow(db, bookId, status, effectiveFrom, effectiveTo,
     throw new Error('生效结束时间必须晚于生效开始时间');
   }
   seedreamPricing.validateItems(items);
-  const supportedMeters = new Set(['request','image','input_image','second','millisecond','character','input_token','cache_token','output_token']);
+  require('./relayModelPolicy').validateItems(items);
+  const supportedMeters = new Set(['request','image','input_image','second','millisecond','character','input_token','input_image_token','cache_token','output_token']);
   if (status === 'published' && !items.length) throw new Error('发布价目表至少需要一个价目');
   const seen = new Set();
   for (const item of items) {
@@ -1232,7 +1237,7 @@ function savePriceBook(db, actorId, input, id) {
     const stmt = db.prepare(`INSERT INTO billing_price_book_items (price_book_id, service_type, model, meter, unit_price_micro, is_free, conditions_json, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     for (const item of items) {
-      const meter = String(item.meter || '').trim(); if (!['request','image','input_image','second','millisecond','character','input_token','cache_token','output_token'].includes(meter)) throw new Error('不支持的计量器');
+      const meter = String(item.meter || '').trim(); if (!['request','image','input_image','second','millisecond','character','input_token','input_image_token','cache_token','output_token'].includes(meter)) throw new Error('不支持的计量器');
       const serviceType = String(item.service_type || '').trim(); const model = String(item.model || '').trim(); if (!serviceType || !model) throw new Error('价目项需要 service_type 和 model');
       stmt.run(bookId, serviceType, model, meter, creditsToMicro(item.unit_price ?? microToCredits(item.unit_price_micro || 0)), item.is_free ? 1 : 0, item.conditions_json ? json(item.conditions_json) : null, at, at);
     }

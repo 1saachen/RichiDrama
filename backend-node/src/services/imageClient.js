@@ -1435,6 +1435,7 @@ async function callImageApi(db, log, opts) {
  * 绝不能把供应商签名 URL 当完成结果入库。
  */
 async function callRichbestImageApi(db, config, log, opts) {
+  if (require('./relayModelPolicy').family(opts.model) && opts.billing_authorization_id && require('./relayModelPolicy').kind(require('./billingService').imageAuthorization(db,opts.billing_authorization_id)?.snapshot)) throw Error('此模型需要专属计费与恢复流程，请从中转模型工作台生成');
   const { model, size, image_gen_id, negative_prompt } = opts;
   const rawRefs = Array.isArray(opts.reference_image_urls) ? opts.reference_image_urls.filter(Boolean) : [];
   const refs = rawRefs.map((r) => resolveImageRef(r, opts.files_base_url, opts.storage_local_path)).filter(Boolean);

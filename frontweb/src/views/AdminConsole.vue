@@ -267,7 +267,7 @@ const organizationForm = reactive({ id: null, name: '', status: 'active', config
 const organizationBalance = reactive({ amount_credits: 0, reason: '' })
 const balance = reactive({ mode: 'adjust', amount_credits: 0, target_credits: 0, reason: '' })
 const balanceValue = computed({ get: () => balance.mode === 'adjust' ? balance.amount_credits : balance.target_credits, set: (value) => { if (balance.mode === 'adjust') balance.amount_credits = value; else balance.target_credits = value } })
-const price = reactive({ name: '', status: 'draft', provider: '', rules_locked: false, items: [] }); const meters = ['request', 'image', 'input_image', 'second', 'millisecond', 'character', 'input_token', 'cache_token', 'output_token']
+const price = reactive({ name: '', status: 'draft', provider: '', rules_locked: false, items: [] }); const meters = ['request', 'image', 'input_image', 'second', 'millisecond', 'character', 'input_token', 'input_image_token', 'cache_token', 'output_token']
 // 价目书的供应商归属：留空＝平台通用价目，报价解析对任何供应商都可能命中；
 // 指定后这本书只服务该供应商的调用（LAS 视频本地化就是 provider='las'）。
 const priceProviderLabels = { volcengine: '火山引擎（方舟）', richbest: '瑞池中转', las: '火山引擎 LAS 在线算子' }
@@ -334,7 +334,7 @@ function lasCleanupLabel(row) {
 function formatBytes(value) { const bytes = Number(value || 0); if (!bytes) return '0 B'; const units = ['B', 'KB', 'MB', 'GB']; let index = 0; let size = bytes; while (size >= 1024 && index < units.length - 1) { size /= 1024; index += 1 } return `${index === 0 ? size : size.toFixed(1)} ${units[index]}` }
 async function loadReconciliations() { applyPage(reconciliations, 'reconciliations', await adminAPI.reconciliations(pages.reconciliations)) }
 // Token-like meters are counted in whole units; durations can be fractional.
-const INTEGER_METERS = new Set(['input_token', 'cache_token', 'output_token', 'image', 'input_image', 'request', 'millisecond', 'character', 'second'])
+const INTEGER_METERS = new Set(['input_token', 'input_image_token', 'cache_token', 'output_token', 'image', 'input_image', 'request', 'millisecond', 'character', 'second'])
 const settleMeters = computed(() => Object.keys(settleCase.value?.reservation_usage || {}))
 function meterPrecision(meter) { return meter === 'second' && settleCase.value?.source_task?.kind !== 'viral_edit_job' ? 6 : INTEGER_METERS.has(meter) ? 0 : 2 }
 function meterStep(meter) { return INTEGER_METERS.has(meter) ? 1 : 0.1 }

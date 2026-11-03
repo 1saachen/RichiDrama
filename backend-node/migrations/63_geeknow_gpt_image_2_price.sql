@@ -6,6 +6,8 @@ SELECT b.id, 'image', 'gpt-image-2', 'image',
   0, '{}', datetime('now'), datetime('now')
 FROM billing_price_books b
 WHERE b.owner_user_id IS NULL AND b.status = 'published'
+  AND NOT EXISTS (SELECT 1 FROM billing_price_book_items r WHERE r.price_book_id=b.id
+    AND json_extract(CASE WHEN json_valid(r.conditions_json) THEN r.conditions_json ELSE '{}' END,'$.relay_model_billing_version')=1)
   AND NOT EXISTS (
     SELECT 1 FROM billing_price_book_items i
     WHERE i.price_book_id = b.id AND i.service_type = 'image' AND i.model = 'gpt-image-2' AND i.meter = 'image'
@@ -17,6 +19,8 @@ SELECT b.id, 'storyboard_image', 'gpt-image-2', 'image',
   0, '{}', datetime('now'), datetime('now')
 FROM billing_price_books b
 WHERE b.owner_user_id IS NULL AND b.status = 'published'
+  AND NOT EXISTS (SELECT 1 FROM billing_price_book_items r WHERE r.price_book_id=b.id
+    AND json_extract(CASE WHEN json_valid(r.conditions_json) THEN r.conditions_json ELSE '{}' END,'$.relay_model_billing_version')=1)
   AND NOT EXISTS (
     SELECT 1 FROM billing_price_book_items i
     WHERE i.price_book_id = b.id AND i.service_type = 'storyboard_image' AND i.model = 'gpt-image-2' AND i.meter = 'image'

@@ -72,6 +72,7 @@ function routes(db, cfg, log) {
         const model = String(body.model || imageConfig?.default_model || imageConfig?.model?.[0] || '').trim();
         if (!model) return response.badRequest(res, '请选择图片模型后再生成');
         const billingTarget = require('../services/aiConfigService').resolveBillingTarget(db, body.service_type || 'image', model, body.ai_config_id, aiOptions);
+        if (require('../services/relayModelPolicy').family(model) && require('../services/relayModelPolicy').studioPrice(db,req.auth,body.service_type||'image',billingTarget.billing_key,billingTarget.provider)) return response.badRequest(res, '请到 AI 工具箱的“中转图片与素材理解”使用此模型，支持专属参数、计费及任务恢复');
         if (!String(body.idempotency_key || '').trim()) return response.badRequest(res, '图片生成请求缺少幂等键，请刷新后重试');
         const authorization = billing.createAuthorization(db, req.auth, {
           idempotency_key: String(body.idempotency_key).trim(),

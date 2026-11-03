@@ -1,6 +1,6 @@
 export const meterLabels = {
   request: '次调用', image: '张图片', input_image: '张输入图', second: '秒', millisecond: '毫秒',
-  character: '个字符', input_token: '输入 Token', cache_token: '缓存输入 Token', output_token: '输出 Token',
+  character: '个字符', input_token: '输入 Token', input_image_token: '图片输入 Token', cache_token: '缓存输入 Token', output_token: '输出 Token',
 }
 const chargeLabels = {
   InferencePrompt: '文字输入费', InferenceCompletion: '文字输出费',
@@ -21,6 +21,8 @@ export function billingUnitLabel(meter, size = 1) {
   return `${count === 1000000 ? '100万' : count === 10000 ? '1万' : quantity(count)} ${meterLabels[meter] || '计量单位'}`
 }
 export function chargeItemLabel(row) {
+  if (row.meter === 'input_image_token') return '图片输入费'
+  if (row.meter === 'output_token' && ['image','storyboard_image'].includes(row.service_type)) return '图片输出费'
   if (row.mapping_status !== 'mapped') return row.charge_type === 'MissingFromProvider' ? '供应商未返回价格' : '计费规则待识别'
   if (row.meter === 'output_token' && row.service_type === 'video') return '视频生成费'
   if (chargeLabels[row.charge_type]) return chargeLabels[row.charge_type]
@@ -41,6 +43,7 @@ export function conditionLabel(when = {}) {
 }
 export function priceRuleSummary(value, meter) {
   if (!value) return '无附加条件'
+  if (value.relay_model_billing_version === 1) return `${value.provider_site === 'international' ? '国际站（人民币） · ' : value.provider_site === 'domestic' ? '国内站 · ' : ''}${meter === 'input_image' && value.free_units === 3 ? '每次任务前 3 张参考图免费，第 4 张起按张结算' : `每 ${billingUnitLabel(meter,value.unit_size)}`}`
   if (value.relay_video_billing_version === 1 && meter === 'input_image' && value.provider_model === 'vega-1.0-lite') return '每次任务前 5 张参考图免费，第 6 张起按张结算'
   if (value.image_pricing_version === 'seedream-pro-v1' && value.free_units === 1) return '每次请求首张输入图免费，第 2 张起按张计费'
   if (value.usage_tiers?.length) return value.usage_tiers.map(tier => `${quantity(tier.min_inclusive)}–${quantity(tier.max_inclusive)} Token：${tier.unit_price_points} 积分 / ${billingUnitLabel(meter, tier.unit_size || value.unit_size)}`).join('\n')

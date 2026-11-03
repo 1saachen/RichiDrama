@@ -14,6 +14,7 @@ function priceGroups(db, serviceType, keys, books = billing.listPriceBooks(db)) 
   return books.map((book) => ({ ...book, items: book.items.filter((item) => item.service_type === serviceType && keys.includes(item.model)) })).filter((book) => book.items.length);
 }
 function requiredMeters(type, items) {
+  if (['image', 'storyboard_image'].includes(type) && items.some(item => item.meter === 'input_image_token')) return ['input_token', 'input_image_token', 'output_token'];
   if (type === 'text') return items.some(item => item.meter === 'request') ? [] : ['input_token', 'output_token'];
   if (type === 'image' || type === 'storyboard_image') return ['image'];
   if (type === 'tts') return ['character'];

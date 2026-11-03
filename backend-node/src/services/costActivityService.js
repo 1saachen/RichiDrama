@@ -6,7 +6,7 @@ const supplierRates = require('./supplierCostRates');
 const DAILY_BASIS = 'supplier_daily_v1';
 const { boundary } = require('./costQueryService');
 const parse = value => { try { return JSON.parse(value || '{}'); } catch (_) { return {}; } };
-const METERS = ['input_token', 'cache_token', 'output_token', 'image', 'input_image', 'millisecond', 'second', 'character', 'request'];
+const METERS = ['input_token', 'input_image_token', 'cache_token', 'output_token', 'image', 'input_image', 'millisecond', 'second', 'character', 'request'];
 const OFFICIAL_PRODUCT_SOURCES = new Set(['https://www.volcengine.com/product/yunque', 'https://www.volcengine.com/product/doubao/']);
 
 // One business record per usage log or unsettled authorization. Attempt evidence
@@ -165,7 +165,7 @@ function add(total, row) {
   if (row.cost_status === 'missing_price') total.missing_price_calls++;
   if (row.cost_status === 'unverified') total.unverified_calls++;
   for (const key of METERS) total[key] += row.usage?.[key] || 0;
-  total.total_tokens = total.input_token + total.cache_token + total.output_token;
+  total.total_tokens = total.input_token + total.input_image_token + total.cache_token + total.output_token;
   if (row.service_type === 'video') total.video_output_token += row.usage?.output_token || 0;
 }
 function group(row, key) {

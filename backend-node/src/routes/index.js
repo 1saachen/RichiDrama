@@ -61,6 +61,13 @@ function setupRouter(cfg, db, log) {
   r.patch('/auth/display-name', auth.changeDisplayName);
   r.use(ownershipGuard(db));
   r.use(require('../middleware/projectOperations')(db));
+  const relayModels = require('./relayModels')(db,cfg,log);
+  r.get('/relay-models', relayModels.models);
+  r.get('/relay-generations', relayModels.list);
+  r.post('/relay-generations/quote', relayModels.quote);
+  r.post('/relay-generations', relayModels.create);
+  r.get('/relay-generations/:id', relayModels.get);
+  r.post('/relay-generations/:id/refresh', relayModels.refresh);
   r.use((req, res, next) => {
     if (!req.projectAccess?.collaboration_enabled || !['POST', 'PUT', 'PATCH'].includes(req.method) || req.path.includes('/collaboration/')) return next();
     try {

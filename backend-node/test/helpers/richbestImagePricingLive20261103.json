@@ -1,0 +1,193 @@
+[
+  {
+    "id": "gpt-image-2",
+    "object": "model_price",
+    "display_name": "GPT Image 2",
+    "provider": "modeltop",
+    "modality": "image",
+    "currency": "CNY",
+    "tax_inclusive": false,
+    "configured": true,
+    "prices": [
+      {
+        "metric": "input_tokens",
+        "dimension": "image",
+        "unit_size": 1000000,
+        "list_price_yuan": "53.651952",
+        "effective_price_yuan": "53.651952"
+      },
+      {
+        "metric": "input_tokens",
+        "dimension": "text",
+        "unit_size": 1000000,
+        "list_price_yuan": "33.532470",
+        "effective_price_yuan": "33.532470"
+      },
+      {
+        "metric": "output_tokens",
+        "dimension": "image",
+        "unit_size": 1000000,
+        "list_price_yuan": "201.194820",
+        "effective_price_yuan": "201.194820"
+      }
+    ]
+  },
+  {
+    "id": "gpt-image-2.5-flare",
+    "object": "model_price",
+    "display_name": "gpt-image-2.5-flare",
+    "provider": "modeltop",
+    "modality": "image",
+    "currency": "CNY",
+    "tax_inclusive": false,
+    "configured": true,
+    "prices": [
+      {
+        "metric": "cached_input_tokens",
+        "dimension": null,
+        "unit_size": 1000000,
+        "list_price_yuan": "8.383118",
+        "effective_price_yuan": "8.383118"
+      },
+      {
+        "metric": "input_tokens",
+        "dimension": "image",
+        "unit_size": 1000000,
+        "list_price_yuan": "53.651952",
+        "effective_price_yuan": "53.651952"
+      },
+      {
+        "metric": "input_tokens",
+        "dimension": "text",
+        "unit_size": 1000000,
+        "list_price_yuan": "33.532470",
+        "effective_price_yuan": "33.532470"
+      },
+      {
+        "metric": "output_tokens",
+        "dimension": "image",
+        "unit_size": 1000000,
+        "list_price_yuan": "201.194820",
+        "effective_price_yuan": "201.194820"
+      }
+    ]
+  },
+  {
+    "id": "gpt-image-2.5-sunburst",
+    "object": "model_price",
+    "display_name": "gpt-image-2.5-sunburst",
+    "provider": "modeltop",
+    "modality": "image",
+    "currency": "CNY",
+    "tax_inclusive": false,
+    "configured": true,
+    "prices": [
+      {
+        "metric": "cached_input_tokens",
+        "dimension": null,
+        "unit_size": 1000000,
+        "list_price_yuan": "8.383118",
+        "effective_price_yuan": "8.383118"
+      },
+      {
+        "metric": "input_tokens",
+        "dimension": "image",
+        "unit_size": 1000000,
+        "list_price_yuan": "53.651952",
+        "effective_price_yuan": "53.651952"
+      },
+      {
+        "metric": "input_tokens",
+        "dimension": "text",
+        "unit_size": 1000000,
+        "list_price_yuan": "33.532470",
+        "effective_price_yuan": "33.532470"
+      },
+      {
+        "metric": "output_tokens",
+        "dimension": "image",
+        "unit_size": 1000000,
+        "list_price_yuan": "201.194820",
+        "effective_price_yuan": "201.194820"
+      }
+    ]
+  },
+  {
+    "id": "vega-image-1.0-flash",
+    "object": "model_price",
+    "display_name": "Vega-Image 1.0 Flash",
+    "provider": "vega",
+    "modality": "image",
+    "currency": "CNY",
+    "tax_inclusive": false,
+    "configured": true,
+    "prices": [
+      {
+        "metric": "image",
+        "dimension": "domestic:input:after_three",
+        "unit_size": 1,
+        "list_price_yuan": "0.000000",
+        "effective_price_yuan": "0.000000"
+      },
+      {
+        "metric": "image",
+        "dimension": "domestic:output",
+        "unit_size": 1,
+        "list_price_yuan": "0.450000",
+        "effective_price_yuan": "0.450000"
+      }
+    ]
+  },
+  {
+    "id": "vega-image-1.0-lite",
+    "object": "model_price",
+    "display_name": "Vega-Image 1.0 Lite",
+    "provider": "vega",
+    "modality": "image",
+    "currency": "CNY",
+    "tax_inclusive": false,
+    "configured": true,
+    "prices": [
+      {
+        "metric": "image",
+        "dimension": "domestic:input:after_three",
+        "unit_size": 1,
+        "list_price_yuan": "0.000000",
+        "effective_price_yuan": "0.000000"
+      },
+      {
+        "metric": "image",
+        "dimension": "domestic:output",
+        "unit_size": 1,
+        "list_price_yuan": "0.162000",
+        "effective_price_yuan": "0.162000"
+      }
+    ]
+  },
+  {
+    "id": "vega-image-1.0-pro",
+    "object": "model_price",
+    "display_name": "Vega-Image 1.0 Pro",
+    "provider": "vega",
+    "modality": "image",
+    "currency": "CNY",
+    "tax_inclusive": false,
+    "configured": true,
+    "prices": [
+      {
+        "metric": "image",
+        "dimension": "domestic:input:after_three",
+        "unit_size": 1,
+        "list_price_yuan": "0.100000",
+        "effective_price_yuan": "0.100000"
+      },
+      {
+        "metric": "image",
+        "dimension": "domestic:output",
+        "unit_size": 1,
+        "list_price_yuan": "0.950000",
+        "effective_price_yuan": "0.950000"
+      }
+    ]
+  }
+]

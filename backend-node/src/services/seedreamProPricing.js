@@ -5,6 +5,7 @@ const PIXEL_THRESHOLD = 2610000;
 
 function enabled(conditions) { return conditions?.image_pricing_version === VERSION; }
 function billableQuantity(conditions, quantity) {
+  if (require('./relayModelPolicy').enabled(conditions)) return require('./relayModelPolicy').quantity(conditions, quantity);
   return Math.max(0, quantity - (enabled(conditions) ? conditions.free_units || 0 : 0));
 }
 

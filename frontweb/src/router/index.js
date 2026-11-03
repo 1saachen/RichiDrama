@@ -89,6 +89,7 @@ const router = createRouter({
       props: { media: 'image' },
       meta: { title: '图片生成工作台' }
     },
+    { path: '/ai-tools/relay-models', name: 'relay-model-studio', component: () => import('@/views/RelayModelStudio.vue'), meta: { title: '中转图片与素材理解' } },
     {
       path: '/ai-tools/video-generation',
       name: 'tool-video-generation',

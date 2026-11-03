@@ -1,0 +1,172 @@
+{
+  "base": "eeca7b5e13fcf87e610e0530fca522460ae3fd0d",
+  "workspace": "D:\\1Code\\cyl\\RichiDrama\\.tmp-repo-source",
+  "status": "local-only; not committed, pushed or deployed",
+  "files": [
+    {
+      "path": "backend-node/migrations/202611030001_relay_model_jobs.sql",
+      "sha256": "6ce86a1bdc9dc050335d2029b61ae66e6c4600fffe1bede3f70b438018404c16"
+    },
+    {
+      "path": "backend-node/migrations/63_geeknow_gpt_image_2_price.sql",
+      "sha256": "defcea77ce127df310a2aeb6664fdc749da14d746f4c4e80f2a24cf3e28d0a2c"
+    },
+    {
+      "path": "backend-node/src/app.js",
+      "sha256": "6cd7e6bfafbe60a12a4aafdec73a256a82718ec8e61e10352ee6b36db6f276fd"
+    },
+    {
+      "path": "backend-node/src/db/migrate.js",
+      "sha256": "410b5cd61ad23cb0e86d888ecebc31aca73c0d485da0d009f39c4e7af1c82a33"
+    },
+    {
+      "path": "backend-node/src/routes/images.js",
+      "sha256": "96ab2d44c3f2709049355127c1af33c31a4ab91acb44e806ba5afe558693d9f7"
+    },
+    {
+      "path": "backend-node/src/routes/index.js",
+      "sha256": "fda472e226546f69cb0f235edaadaef2d5cc82ba0ed3e0cbca839878655b2aa0"
+    },
+    {
+      "path": "backend-node/src/routes/relayModels.js",
+      "sha256": "fdfb040e51b09c22592ddf60a8ad025f27460da7c786d1bf003744b44c5dbb06"
+    },
+    {
+      "path": "backend-node/src/services/billingService.js",
+      "sha256": "3b34b5c27693bdac7912063ac3b1a094bec6c50940dee1d5d86a220fd477f65f"
+    },
+    {
+      "path": "backend-node/src/services/costActivityService.js",
+      "sha256": "fd5014e832ad2ed59d7976db76e5233eded8c024e2e1283ab9ba0b5c47ee2e40"
+    },
+    {
+      "path": "backend-node/src/services/costLedgerService.js",
+      "sha256": "7ba9359ff5c97b0465b7e799a00225d5e9a357442bb0065ae2a2f5165d2b040e"
+    },
+    {
+      "path": "backend-node/src/services/costPriceService.js",
+      "sha256": "b98753c8c5d84a562d19a1e5771f1c553bd32ad9e5fdfb145c89c34982380747"
+    },
+    {
+      "path": "backend-node/src/services/costQueryService.js",
+      "sha256": "5ad69e4709da0603f28ce7932733f6f90c93c3dd5abc0e10e6f9f73d5e854bd0"
+    },
+    {
+      "path": "backend-node/src/services/imageBillingService.js",
+      "sha256": "8bb75ce79798b6fb2d240e9daafbcbea549c01057a942c987b8fe3c6ff18ad82"
+    },
+    {
+      "path": "backend-node/src/services/imageClient.js",
+      "sha256": "bb623128c2351bf47693654b99566c69a64e8198637d75a9af2e839cc554cf28"
+    },
+    {
+      "path": "backend-node/src/services/imageService.js",
+      "sha256": "37835a6d056773fb87cfc725019bcd248b9f6932b040cb818388ff3924d008a6"
+    },
+    {
+      "path": "backend-node/src/services/modelCapabilityService.js",
+      "sha256": "8016f71013ab48c791fd96757bebc317085c99cacdf59a145af946dd105841d8"
+    },
+    {
+      "path": "backend-node/src/services/modelCatalogService.js",
+      "sha256": "5eda9520861cffb8f3939003494922e2e28cd5eb5964b4730d8f02f5ea747508"
+    },
+    {
+      "path": "backend-node/src/services/providerPriceService.js",
+      "sha256": "5f1d2dc087cbd26b166fd186e53cfb9fa79115c0ca2f6cef07f2992b6624e97d"
+    },
+    {
+      "path": "backend-node/src/services/relayModelContract.js",
+      "sha256": "436d6746185c316305c43cb80ed1bf2eea783b91bfb6e64ff8941077ed1d17aa"
+    },
+    {
+      "path": "backend-node/src/services/relayModelJobService.js",
+      "sha256": "c056f19be9cf7862e2680e14652b69caf710906acac762821d93dbb4fbfbc729"
+    },
+    {
+      "path": "backend-node/src/services/relayModelPolicy.js",
+      "sha256": "c7eb8ecac74bccf2e784b65e94f259cd03fe7a48c3e2727613fd61b87433ae1d"
+    },
+    {
+      "path": "backend-node/src/services/richbestPricingService.js",
+      "sha256": "804e8035a1fa630da92ce3bbe12e02a6e4ee69b5bb7ab8fd796773eb0058390d"
+    },
+    {
+      "path": "backend-node/src/services/seedreamProPricing.js",
+      "sha256": "508a27591e049290514d9f3c8ef0126d81f67f0441b694c4a792293a293e0f8c"
+    },
+    {
+      "path": "backend-node/src/services/supplierCostRates.js",
+      "sha256": "dad6a792a5b4dc5fc61af2ffb435eebc07d9d9e834723cf7e71bff348e03b843"
+    },
+    {
+      "path": "backend-node/test/helpers/richbestImagePricingLive20261103.json",
+      "sha256": "75d921b892972bacdeb469b1bb87ac198b40002d1f91bbdf64d5bc934529551c"
+    },
+    {
+      "path": "backend-node/test/relayModels.integration.test.js",
+      "sha256": "03c51fbd13e62142f31d05b01c93eb0eeef92ccece77c1d9eb8a6188f60025bf"
+    },
+    {
+      "path": "backend-node/test/relayModels.test.js",
+      "sha256": "e41440e56d54fc3d133b0084ea323759630cac305b02e4dd649937e974dbb97f"
+    },
+    {
+      "path": "frontweb/src/api/relayModels.js",
+      "sha256": "1e4cc2ac25b2eb59154a140c9b6604390cc256c200d26b9aa101d09359d3b997"
+    },
+    {
+      "path": "frontweb/src/components/ModelCatalog.vue",
+      "sha256": "92744e69bbfa8dd98bcf33827c7d32b90c5b67ba11704de7551463968ad27da8"
+    },
+    {
+      "path": "frontweb/src/components/ProviderPriceSyncPanel.vue",
+      "sha256": "03f84f367d7d91098993bf54023f03c7fe5310b726572be5e6a239e7b1916e40"
+    },
+    {
+      "path": "frontweb/src/router/index.js",
+      "sha256": "f7699780983ff6cef117e10fa2349bc295778d7bbabba868a71d197d945d3a85"
+    },
+    {
+      "path": "frontweb/src/utils/billingPresentation.js",
+      "sha256": "b9a23f4a8fbb77cbc4b69643221db7db4885a4f3801530bebbb430924f7fbc48"
+    },
+    {
+      "path": "frontweb/src/utils/costPresentation.js",
+      "sha256": "98cc50301cdbd6bd5d7ee1090a8d56edfbe3022a9a0327ecc49a9caabf6c8f93"
+    },
+    {
+      "path": "frontweb/src/utils/providerPricePresentation.js",
+      "sha256": "75711b3dfd19e51e3fd28bb36e6218bc17c37fea14fca5df6cc7afe770b2ba5a"
+    },
+    {
+      "path": "frontweb/src/views/AdminConsole.vue",
+      "sha256": "b192554d25a048424bedc311584fb84cd3ac25c4f505767a80718ca09fe38810"
+    },
+    {
+      "path": "frontweb/src/views/AITools.vue",
+      "sha256": "975ecea5612bb4fa61fe464bb386d7daf5cd984cbc751cbefd5f02213e2716a2"
+    },
+    {
+      "path": "frontweb/src/views/RelayModelStudio.vue",
+      "sha256": "56f8153a9458017a07f13d24a321ab80ab05a64e6a3f31db163a742c280b5cd5"
+    },
+    {
+      "path": "frontweb/test/relayPricePresentation.test.js",
+      "sha256": "0c20ae967e28a1b0852c182aff992f138f3cfb7c17eef81b0f45f0e36ab50aea"
+    },
+    {
+      "path": "backend-node/tools/check-release-idle.js",
+      "sha256": "55c58c215a42a23ad4b7e3eadfdaef14dd4fa5f29835fec14cc577a91e652023"
+    },
+    {
+      "path": "backend-node/test/releaseIdle.test.js",
+      "sha256": "99a7e43cdb5c2d4c49b4d14754d5effb8077d08c1be41302cef49a4253d52952"
+    },
+    {
+      "path": ".github/workflows/release-20261103-verify.yml",
+      "sha256": "9876a2def61850dc511ffef2f52fa477e4b101e79dee37f4ea77ee7aa75f2ae1"
+    }
+  ],
+  "note": "Updated after authenticated live pricing compatibility verification; related backend tests 46/46."
+}

@@ -38,7 +38,7 @@ const GROUPS = {
   user: "COALESCE(CAST(c.user_id AS TEXT),'unknown')", model: 'c.model', operation: 'c.source_kind',
   hour: "strftime('%Y-%m-%d %H:00',c.submitted_at,'+8 hours')", day: "strftime('%Y-%m-%d',c.submitted_at,'+8 hours')", month: "strftime('%Y-%m',c.submitted_at,'+8 hours')",
 };
-const METERS = ['input_token', 'cache_token', 'output_token', 'image', 'input_image', 'request', 'millisecond', 'character', 'second'];
+const METERS = ['input_token', 'input_image_token', 'cache_token', 'output_token', 'image', 'input_image', 'request', 'millisecond', 'character', 'second'];
 function metricsSql() {
   return `COUNT(*) calls,SUM(CASE WHEN r.cost_status='calculated' THEN 1 ELSE 0 END) calculated_calls,
     SUM(CASE WHEN c.status='processing' THEN 1 ELSE 0 END) processing_calls,
@@ -55,7 +55,7 @@ function summary(db, input = {}) {
   const { where, args } = filters(input);
   const totals = db.prepare(`SELECT ${metricsSql()} ${FROM} ${where}`).get(...args);
   totals.text_output_token = totals.output_token - totals.video_output_token;
-  totals.total_tokens = totals.input_token + totals.cache_token + totals.output_token;
+  totals.total_tokens = totals.input_token + totals.input_image_token + totals.cache_token + totals.output_token;
   totals.incomplete = totals.calls !== (totals.calculated_calls || 0);
   const currencies = db.prepare(`SELECT r.currency,SUM(r.amount_micro) amount_micro ${FROM} ${where} AND r.cost_status='calculated' GROUP BY r.currency`).all(...args);
   const coverage = db.prepare("SELECT value FROM cost_settings WHERE key='enabled_at'").get()?.value;

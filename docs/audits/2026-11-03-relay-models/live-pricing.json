@@ -1,0 +1,719 @@
+{
+  "at": "2026-11-03T05:43:37.193Z",
+  "origin": "https://api.richbest.cn",
+  "upstream_requests": [
+    {
+      "method": "GET",
+      "path": "/v1/models",
+      "status": 200,
+      "request_id": "req_0b32b8a0f6a61e3d9eaee3e03010b5cc"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/pricing",
+      "status": 200,
+      "request_id": "req_17d18153b00023db120045683dcdac13"
+    }
+  ],
+  "routes": [
+    {
+      "route": "/auth/login",
+      "status": 200
+    },
+    {
+      "route": "/admin/model-discovery/1/fetch",
+      "status": 200
+    },
+    {
+      "route": "/admin/provider-prices/richbest/sync",
+      "status": 200
+    }
+  ],
+  "models": [
+    {
+      "id": "gpt-image-2",
+      "modality": "image",
+      "capabilities": {
+        "generations": true,
+        "maxN": 10,
+        "billingMetric": "image_tokens",
+        "billingUnit": 1000000,
+        "imageTokenBilling": true,
+        "qualityLevels": [
+          "auto",
+          "low",
+          "medium",
+          "high"
+        ],
+        "customSizes": false,
+        "outputFormat": false
+      }
+    },
+    {
+      "id": "gpt-image-2.5-flare",
+      "modality": "image",
+      "capabilities": {
+        "generations": true,
+        "maxN": 10,
+        "billingMetric": "image_tokens",
+        "billingUnit": 1000000,
+        "imageTokenBilling": true,
+        "qualityLevels": [
+          "auto",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "customSizes": true,
+        "outputFormat": true
+      }
+    },
+    {
+      "id": "gpt-image-2.5-sunburst",
+      "modality": "image",
+      "capabilities": {
+        "generations": true,
+        "maxN": 10,
+        "billingMetric": "image_tokens",
+        "billingUnit": 1000000,
+        "imageTokenBilling": true,
+        "qualityLevels": [
+          "auto",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "customSizes": true,
+        "outputFormat": true
+      }
+    },
+    {
+      "id": "vega-image-1.0-flash",
+      "modality": "image",
+      "capabilities": {
+        "generations": true,
+        "imageInput": true,
+        "maxInputImages": 6,
+        "maxInputImageBytes": 10485760,
+        "maxInlineImageBytes": 7340032,
+        "maxN": 4,
+        "maxPromptCharacters": 2000,
+        "sizes": [
+          "1K",
+          "2K",
+          "4K"
+        ],
+        "asyncTasks": true,
+        "billingMetric": "image",
+        "billingUnit": 1,
+        "inputFreeCount": null,
+        "billingSite": "domestic"
+      }
+    },
+    {
+      "id": "vega-image-1.0-lite",
+      "modality": "image",
+      "capabilities": {
+        "generations": true,
+        "imageInput": true,
+        "maxInputImages": 3,
+        "maxInputImageBytes": 10485760,
+        "maxInlineImageBytes": 7340032,
+        "maxN": 1,
+        "maxPromptCharacters": 2000,
+        "sizes": [
+          "1K",
+          "2K",
+          "4K"
+        ],
+        "asyncTasks": true,
+        "billingMetric": "image",
+        "billingUnit": 1,
+        "inputFreeCount": null,
+        "billingSite": "domestic"
+      }
+    },
+    {
+      "id": "vega-image-1.0-pro",
+      "modality": "image",
+      "capabilities": {
+        "generations": true,
+        "imageInput": true,
+        "maxInputImages": 6,
+        "maxInputImageBytes": 10485760,
+        "maxInlineImageBytes": 7340032,
+        "maxN": 4,
+        "maxPromptCharacters": 2000,
+        "sizes": [
+          "1K",
+          "2K",
+          "4K"
+        ],
+        "asyncTasks": true,
+        "billingMetric": "image",
+        "billingUnit": 1,
+        "inputFreeCount": 3,
+        "billingSite": "domestic"
+      }
+    }
+  ],
+  "pricing": [
+    {
+      "id": "gpt-image-2",
+      "object": "model_price",
+      "display_name": "GPT Image 2",
+      "provider": "modeltop",
+      "modality": "image",
+      "currency": "CNY",
+      "tax_inclusive": false,
+      "configured": true,
+      "prices": [
+        {
+          "metric": "input_tokens",
+          "dimension": "image",
+          "unit_size": 1000000,
+          "list_price_yuan": "53.651952",
+          "effective_price_yuan": "53.651952"
+        },
+        {
+          "metric": "input_tokens",
+          "dimension": "text",
+          "unit_size": 1000000,
+          "list_price_yuan": "33.532470",
+          "effective_price_yuan": "33.532470"
+        },
+        {
+          "metric": "output_tokens",
+          "dimension": "image",
+          "unit_size": 1000000,
+          "list_price_yuan": "201.194820",
+          "effective_price_yuan": "201.194820"
+        }
+      ]
+    },
+    {
+      "id": "gpt-image-2.5-flare",
+      "object": "model_price",
+      "display_name": "gpt-image-2.5-flare",
+      "provider": "modeltop",
+      "modality": "image",
+      "currency": "CNY",
+      "tax_inclusive": false,
+      "configured": true,
+      "prices": [
+        {
+          "metric": "cached_input_tokens",
+          "dimension": null,
+          "unit_size": 1000000,
+          "list_price_yuan": "8.383118",
+          "effective_price_yuan": "8.383118"
+        },
+        {
+          "metric": "input_tokens",
+          "dimension": "image",
+          "unit_size": 1000000,
+          "list_price_yuan": "53.651952",
+          "effective_price_yuan": "53.651952"
+        },
+        {
+          "metric": "input_tokens",
+          "dimension": "text",
+          "unit_size": 1000000,
+          "list_price_yuan": "33.532470",
+          "effective_price_yuan": "33.532470"
+        },
+        {
+          "metric": "output_tokens",
+          "dimension": "image",
+          "unit_size": 1000000,
+          "list_price_yuan": "201.194820",
+          "effective_price_yuan": "201.194820"
+        }
+      ]
+    },
+    {
+      "id": "gpt-image-2.5-sunburst",
+      "object": "model_price",
+      "display_name": "gpt-image-2.5-sunburst",
+      "provider": "modeltop",
+      "modality": "image",
+      "currency": "CNY",
+      "tax_inclusive": false,
+      "configured": true,
+      "prices": [
+        {
+          "metric": "cached_input_tokens",
+          "dimension": null,
+          "unit_size": 1000000,
+          "list_price_yuan": "8.383118",
+          "effective_price_yuan": "8.383118"
+        },
+        {
+          "metric": "input_tokens",
+          "dimension": "image",
+          "unit_size": 1000000,
+          "list_price_yuan": "53.651952",
+          "effective_price_yuan": "53.651952"
+        },
+        {
+          "metric": "input_tokens",
+          "dimension": "text",
+          "unit_size": 1000000,
+          "list_price_yuan": "33.532470",
+          "effective_price_yuan": "33.532470"
+        },
+        {
+          "metric": "output_tokens",
+          "dimension": "image",
+          "unit_size": 1000000,
+          "list_price_yuan": "201.194820",
+          "effective_price_yuan": "201.194820"
+        }
+      ]
+    },
+    {
+      "id": "vega-image-1.0-flash",
+      "object": "model_price",
+      "display_name": "Vega-Image 1.0 Flash",
+      "provider": "vega",
+      "modality": "image",
+      "currency": "CNY",
+      "tax_inclusive": false,
+      "configured": true,
+      "prices": [
+        {
+          "metric": "image",
+          "dimension": "domestic:input:after_three",
+          "unit_size": 1,
+          "list_price_yuan": "0.000000",
+          "effective_price_yuan": "0.000000"
+        },
+        {
+          "metric": "image",
+          "dimension": "domestic:output",
+          "unit_size": 1,
+          "list_price_yuan": "0.450000",
+          "effective_price_yuan": "0.450000"
+        }
+      ]
+    },
+    {
+      "id": "vega-image-1.0-lite",
+      "object": "model_price",
+      "display_name": "Vega-Image 1.0 Lite",
+      "provider": "vega",
+      "modality": "image",
+      "currency": "CNY",
+      "tax_inclusive": false,
+      "configured": true,
+      "prices": [
+        {
+          "metric": "image",
+          "dimension": "domestic:input:after_three",
+          "unit_size": 1,
+          "list_price_yuan": "0.000000",
+          "effective_price_yuan": "0.000000"
+        },
+        {
+          "metric": "image",
+          "dimension": "domestic:output",
+          "unit_size": 1,
+          "list_price_yuan": "0.162000",
+          "effective_price_yuan": "0.162000"
+        }
+      ]
+    },
+    {
+      "id": "vega-image-1.0-pro",
+      "object": "model_price",
+      "display_name": "Vega-Image 1.0 Pro",
+      "provider": "vega",
+      "modality": "image",
+      "currency": "CNY",
+      "tax_inclusive": false,
+      "configured": true,
+      "prices": [
+        {
+          "metric": "image",
+          "dimension": "domestic:input:after_three",
+          "unit_size": 1,
+          "list_price_yuan": "0.100000",
+          "effective_price_yuan": "0.100000"
+        },
+        {
+          "metric": "image",
+          "dimension": "domestic:output",
+          "unit_size": 1,
+          "list_price_yuan": "0.950000",
+          "effective_price_yuan": "0.950000"
+        }
+      ]
+    }
+  ],
+  "candidates": [
+    {
+      "provider_model": "gpt-image-2",
+      "meter": "input_image_token",
+      "unit_size": 1000000,
+      "provider_unit_price": "53.651952",
+      "new_unit_price_micro": 53651952,
+      "new_conditions_json": "{\"unit_size\":1000000,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"gpt-image-2\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"gpt_image_tokens\",\"provider_metric\":\"input_tokens\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "gpt-image-2",
+      "meter": "input_token",
+      "unit_size": 1000000,
+      "provider_unit_price": "33.532470",
+      "new_unit_price_micro": 33532470,
+      "new_conditions_json": "{\"unit_size\":1000000,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"gpt-image-2\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"gpt_image_tokens\",\"provider_metric\":\"input_tokens\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "gpt-image-2",
+      "meter": "output_token",
+      "unit_size": 1000000,
+      "provider_unit_price": "201.194820",
+      "new_unit_price_micro": 201194820,
+      "new_conditions_json": "{\"unit_size\":1000000,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"gpt-image-2\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"gpt_image_tokens\",\"provider_metric\":\"output_tokens\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "gpt-image-2.5-flare",
+      "meter": "cache_token",
+      "unit_size": 1000000,
+      "provider_unit_price": "8.383118",
+      "new_unit_price_micro": 8383118,
+      "new_conditions_json": "{\"unit_size\":1000000,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"gpt-image-2.5-flare\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"gpt_image_tokens\",\"provider_metric\":\"cached_input_tokens\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "gpt-image-2.5-flare",
+      "meter": "input_image_token",
+      "unit_size": 1000000,
+      "provider_unit_price": "53.651952",
+      "new_unit_price_micro": 53651952,
+      "new_conditions_json": "{\"unit_size\":1000000,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"gpt-image-2.5-flare\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"gpt_image_tokens\",\"provider_metric\":\"input_tokens\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "gpt-image-2.5-flare",
+      "meter": "input_token",
+      "unit_size": 1000000,
+      "provider_unit_price": "33.532470",
+      "new_unit_price_micro": 33532470,
+      "new_conditions_json": "{\"unit_size\":1000000,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"gpt-image-2.5-flare\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"gpt_image_tokens\",\"provider_metric\":\"input_tokens\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "gpt-image-2.5-flare",
+      "meter": "output_token",
+      "unit_size": 1000000,
+      "provider_unit_price": "201.194820",
+      "new_unit_price_micro": 201194820,
+      "new_conditions_json": "{\"unit_size\":1000000,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"gpt-image-2.5-flare\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"gpt_image_tokens\",\"provider_metric\":\"output_tokens\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "gpt-image-2.5-sunburst",
+      "meter": "cache_token",
+      "unit_size": 1000000,
+      "provider_unit_price": "8.383118",
+      "new_unit_price_micro": 8383118,
+      "new_conditions_json": "{\"unit_size\":1000000,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"gpt-image-2.5-sunburst\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"gpt_image_tokens\",\"provider_metric\":\"cached_input_tokens\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "gpt-image-2.5-sunburst",
+      "meter": "input_image_token",
+      "unit_size": 1000000,
+      "provider_unit_price": "53.651952",
+      "new_unit_price_micro": 53651952,
+      "new_conditions_json": "{\"unit_size\":1000000,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"gpt-image-2.5-sunburst\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"gpt_image_tokens\",\"provider_metric\":\"input_tokens\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "gpt-image-2.5-sunburst",
+      "meter": "input_token",
+      "unit_size": 1000000,
+      "provider_unit_price": "33.532470",
+      "new_unit_price_micro": 33532470,
+      "new_conditions_json": "{\"unit_size\":1000000,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"gpt-image-2.5-sunburst\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"gpt_image_tokens\",\"provider_metric\":\"input_tokens\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "gpt-image-2.5-sunburst",
+      "meter": "output_token",
+      "unit_size": 1000000,
+      "provider_unit_price": "201.194820",
+      "new_unit_price_micro": 201194820,
+      "new_conditions_json": "{\"unit_size\":1000000,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"gpt-image-2.5-sunburst\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"gpt_image_tokens\",\"provider_metric\":\"output_tokens\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "vega-image-1.0-flash",
+      "meter": "image",
+      "unit_size": 1,
+      "provider_unit_price": "0.450000",
+      "new_unit_price_micro": 450000,
+      "new_conditions_json": "{\"unit_size\":1,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"vega-image-1.0-flash\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"vega_image\",\"provider_site\":\"domestic\",\"provider_metric\":\"image\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "vega-image-1.0-lite",
+      "meter": "image",
+      "unit_size": 1,
+      "provider_unit_price": "0.162000",
+      "new_unit_price_micro": 162000,
+      "new_conditions_json": "{\"unit_size\":1,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"vega-image-1.0-lite\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"vega_image\",\"provider_site\":\"domestic\",\"provider_metric\":\"image\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "vega-image-1.0-pro",
+      "meter": "image",
+      "unit_size": 1,
+      "provider_unit_price": "0.950000",
+      "new_unit_price_micro": 950000,
+      "new_conditions_json": "{\"unit_size\":1,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"vega-image-1.0-pro\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"vega_image\",\"provider_site\":\"domestic\",\"provider_metric\":\"image\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "vega-image-1.0-pro",
+      "meter": "input_image",
+      "unit_size": 1,
+      "provider_unit_price": "0.100000",
+      "new_unit_price_micro": 100000,
+      "new_conditions_json": "{\"unit_size\":1,\"provider\":\"richbest\",\"currency\":\"CNY\",\"tax_inclusive\":false,\"source\":\"relay_pricing\",\"source_sync_id\":\"44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e\",\"provider_model\":\"vega-image-1.0-pro\",\"provider_charge_type\":\"relay_pricing\",\"discount_bps\":10000,\"pricing_note\":\"瑞池中转站税前价（1 元 = 100 积分）；实际结算以服务端记录的成功用量与对应账期价格为准\",\"relay_model_billing_version\":1,\"relay_model_kind\":\"vega_image\",\"provider_site\":\"domestic\",\"free_units\":3,\"relay_video_billing_version\":1,\"require_rate_match\":false,\"provider_metric\":\"image\"}",
+      "mapping_status": "mapped",
+      "error_summary": null
+    },
+    {
+      "provider_model": "wand-vega-vl-1.0-flash",
+      "meter": null,
+      "unit_size": null,
+      "provider_unit_price": null,
+      "new_unit_price_micro": null,
+      "new_conditions_json": null,
+      "mapping_status": "unmapped",
+      "error_summary": "中转站价目未返回此已导入模型。系统不会删除或停用当前价格"
+    },
+    {
+      "provider_model": "wand-vega-vl-1.0-lite",
+      "meter": null,
+      "unit_size": null,
+      "provider_unit_price": null,
+      "new_unit_price_micro": null,
+      "new_conditions_json": null,
+      "mapping_status": "unmapped",
+      "error_summary": "中转站价目未返回此已导入模型。系统不会删除或停用当前价格"
+    },
+    {
+      "provider_model": "wand-vega-vl-1.0-pro",
+      "meter": null,
+      "unit_size": null,
+      "provider_unit_price": null,
+      "new_unit_price_micro": null,
+      "new_conditions_json": null,
+      "mapping_status": "unmapped",
+      "error_summary": "中转站价目未返回此已导入模型。系统不会删除或停用当前价格"
+    }
+  ],
+  "discovery": {
+    "count": 42,
+    "matching": [
+      {
+        "id": "gpt-image-2",
+        "capability": "image",
+        "display_name": "GPT Image 2",
+        "modality": "image",
+        "capabilities": {
+          "generations": true,
+          "maxN": 10,
+          "billingMetric": "image_tokens",
+          "billingUnit": 1000000,
+          "imageTokenBilling": true,
+          "qualityLevels": [
+            "auto",
+            "low",
+            "medium",
+            "high"
+          ],
+          "customSizes": false,
+          "outputFormat": false
+        },
+        "provider_status": null,
+        "configured": true
+      },
+      {
+        "id": "gpt-image-2.5-flare",
+        "capability": "image",
+        "display_name": "gpt-image-2.5-flare",
+        "modality": "image",
+        "capabilities": {
+          "generations": true,
+          "maxN": 10,
+          "billingMetric": "image_tokens",
+          "billingUnit": 1000000,
+          "imageTokenBilling": true,
+          "qualityLevels": [
+            "auto",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "customSizes": true,
+          "outputFormat": true
+        },
+        "provider_status": null,
+        "configured": true
+      },
+      {
+        "id": "gpt-image-2.5-sunburst",
+        "capability": "image",
+        "display_name": "gpt-image-2.5-sunburst",
+        "modality": "image",
+        "capabilities": {
+          "generations": true,
+          "maxN": 10,
+          "billingMetric": "image_tokens",
+          "billingUnit": 1000000,
+          "imageTokenBilling": true,
+          "qualityLevels": [
+            "auto",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "customSizes": true,
+          "outputFormat": true
+        },
+        "provider_status": null,
+        "configured": true
+      },
+      {
+        "id": "vega-image-1.0-flash",
+        "capability": "image",
+        "display_name": "Vega-Image 1.0 Flash",
+        "modality": "image",
+        "capabilities": {
+          "generations": true,
+          "imageInput": true,
+          "maxInputImages": 6,
+          "maxInputImageBytes": 10485760,
+          "maxInlineImageBytes": 7340032,
+          "maxN": 4,
+          "maxPromptCharacters": 2000,
+          "sizes": [
+            "1K",
+            "2K",
+            "4K"
+          ],
+          "asyncTasks": true,
+          "billingMetric": "image",
+          "billingUnit": 1,
+          "inputFreeCount": null,
+          "billingSite": "domestic"
+        },
+        "provider_status": null,
+        "configured": true
+      },
+      {
+        "id": "vega-image-1.0-lite",
+        "capability": "image",
+        "display_name": "Vega-Image 1.0 Lite",
+        "modality": "image",
+        "capabilities": {
+          "generations": true,
+          "imageInput": true,
+          "maxInputImages": 3,
+          "maxInputImageBytes": 10485760,
+          "maxInlineImageBytes": 7340032,
+          "maxN": 1,
+          "maxPromptCharacters": 2000,
+          "sizes": [
+            "1K",
+            "2K",
+            "4K"
+          ],
+          "asyncTasks": true,
+          "billingMetric": "image",
+          "billingUnit": 1,
+          "inputFreeCount": null,
+          "billingSite": "domestic"
+        },
+        "provider_status": null,
+        "configured": true
+      },
+      {
+        "id": "vega-image-1.0-pro",
+        "capability": "image",
+        "display_name": "Vega-Image 1.0 Pro",
+        "modality": "image",
+        "capabilities": {
+          "generations": true,
+          "imageInput": true,
+          "maxInputImages": 6,
+          "maxInputImageBytes": 10485760,
+          "maxInlineImageBytes": 7340032,
+          "maxN": 4,
+          "maxPromptCharacters": 2000,
+          "sizes": [
+            "1K",
+            "2K",
+            "4K"
+          ],
+          "asyncTasks": true,
+          "billingMetric": "image",
+          "billingUnit": 1,
+          "inputFreeCount": 3,
+          "billingSite": "domestic"
+        },
+        "provider_status": null,
+        "configured": true
+      }
+    ]
+  },
+  "pricing_meta": {
+    "currency": "CNY",
+    "discount_bps": 10000,
+    "billing_enabled": false
+  },
+  "sync": {
+    "id": "44d3bbc4-60cf-493a-aaf2-d7d3f933fb9e",
+    "status": "completed",
+    "candidate_count": 18,
+    "mapped_count": 15
+  },
+  "missing_models": [
+    "wand-vega-vl-1.0-lite",
+    "wand-vega-vl-1.0-flash",
+    "wand-vega-vl-1.0-pro"
+  ],
+  "missing_prices": [
+    "wand-vega-vl-1.0-lite",
+    "wand-vega-vl-1.0-flash",
+    "wand-vega-vl-1.0-pro"
+  ]
+}

@@ -1,6 +1,6 @@
 'use strict';
 const { createHash } = require('node:crypto');
-const METERS = ['input_token', 'cache_token', 'output_token', 'image', 'input_image', 'request', 'millisecond', 'character', 'second'];
+const METERS = ['input_token', 'input_image_token', 'cache_token', 'output_token', 'image', 'input_image', 'request', 'millisecond', 'character', 'second'];
 const now = () => new Date().toISOString();
 const parse = value => JSON.parse(value || '{}');
 function decimal(value) {
