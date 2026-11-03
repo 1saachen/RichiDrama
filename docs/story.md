@@ -58,13 +58,13 @@
 
 - 其它如 **AIGC 剧本工厂**、**画冰 AI 剧本**、**追更短剧 AI** 等平台/工具，部分主打面向短视频自媒体/创作者群体，或提供 API 作为 SaaS 接口。
 
-如果你有更好的同类工具推荐，欢迎通过 [Issue](https://github.com/Moemu/RichiDrama/issues) 补充交流。
+如果你有更好的同类工具推荐，欢迎通过 [Issue](https://github.com/1saachen/RichiDrama/issues) 补充交流。
 
 ---
 
 ## 联系方式
 
-请通过 [GitHub Issues](https://github.com/Moemu/RichiDrama/issues) 提交建议和问题。
+请通过 [GitHub Issues](https://github.com/1saachen/RichiDrama/issues) 提交建议和问题。
 
 
 ---

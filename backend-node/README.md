@@ -5,9 +5,9 @@
 → [项目主页](../README.md) | [快速开始](../docs/guides/quickstart.md) | [AI 配置](../docs/guides/configuration.md) | [版本历史](../docs/changelog.md) | [作者故事](../docs/story.md) | [English](../docs/en.md)
 
 **官方仓库：**
-[![GitHub](https://img.shields.io/badge/GitHub-Moemu%2FRichiDrama-181717?logo=github)](https://github.com/Moemu/RichiDrama)
+[![GitHub](https://img.shields.io/badge/GitHub-1saachen%2FRichiDrama-181717?logo=github)](https://github.com/1saachen/RichiDrama)
 
-> 遇到问题或有功能建议，请在 [GitHub Issues](https://github.com/Moemu/RichiDrama/issues) 提交反馈。
+> 遇到问题或有功能建议，请在 [GitHub Issues](https://github.com/1saachen/RichiDrama/issues) 提交反馈。
 
 > **本包版本：** `1.2.8`（与仓库根目录 [CHANGELOG](../CHANGELOG.md)、前端与桌面 `package.json` 对齐）
 

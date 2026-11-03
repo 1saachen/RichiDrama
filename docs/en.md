@@ -23,7 +23,7 @@ The repository keeps the MIT license and upstream attribution.
 Use Node.js 18 or a newer version.
 
 ```bash
-git clone https://github.com/Moemu/RichiDrama.git
+git clone https://github.com/1saachen/RichiDrama.git
 cd RichiDrama
 ```
 
@@ -68,8 +68,8 @@ This prevents data loss and deployment interruption.
 ## Links
 
 - [Production service](http://drama.richbest.cn/)
-- [GitHub repository](https://github.com/Moemu/RichiDrama)
-- [Issues](https://github.com/Moemu/RichiDrama/issues)
+- [GitHub repository](https://github.com/1saachen/RichiDrama)
+- [Issues](https://github.com/1saachen/RichiDrama/issues)
 
 ## License
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-REPOSITORY="${1:-Moemu/RichiDrama}"
+REPOSITORY="${1:-1saachen/RichiDrama}"
 REQUIRED_APPROVALS="${2:-0}"
 command -v gh >/dev/null 2>&1 || { echo 'gh CLI is required.' >&2; exit 1; }
 gh auth status >/dev/null
