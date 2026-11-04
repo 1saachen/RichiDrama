@@ -731,7 +731,7 @@ function get(db, id) {
   const generation = db.prepare(`SELECT v.*, t.progress AS task_progress, t.message AS task_message, t.updated_at AS task_updated_at
     FROM video_generations v LEFT JOIN async_tasks t ON t.id=v.task_id AND t.deleted_at IS NULL WHERE v.id = ?`).get(job.video_generation_id);
   const assets = db.prepare('SELECT * FROM omni_video_job_assets WHERE omni_job_id = ? ORDER BY ordinal').all(job.id);
-  const safeGeneration = generation ? { ...generation, provider: require('./videoProviderService').recordedProvider(db, generation), video_url: videoService.publicVideoUrl(generation.video_url, generation.local_path) } : null;
+  const safeGeneration = generation ? { ...generation, provider_request_id: require('./videoRequestIdentityService').requestId(db, generation), provider: require('./videoProviderService').recordedProvider(db, generation), video_url: videoService.publicVideoUrl(generation.video_url, generation.local_path) } : null;
   let actualPoints = null;
   try { actualPoints = db.prepare('SELECT charged_micro / 10000.0 AS amount FROM billing_usage_logs WHERE authorization_id = ? LIMIT 1').get(generation?.billing_authorization_id)?.amount ?? null; } catch (_) {}
   let isCurrent = false;
@@ -820,12 +820,13 @@ function generationHistoryDetail(db, videoGenerationId, actor) {
       actual_points: actualPoints,
       usage: parse(usage?.usage_json),
       price_snapshot: parse(usage?.snapshot_json),
-      provider_request_id: usage?.provider_request_id || generation.provider_task_id || null,
+      provider_request_id: usage?.provider_request_id || require('./videoRequestIdentityService').requestId(db, generation) || generation.provider_task_id || null,
       settled_at: usage?.created_at || null,
     },
     task: {
       id: generation.task_id || null,
       provider_task_id: generation.provider_task_id || null,
+      provider_request_id: require('./videoRequestIdentityService').requestId(db, generation),
       status: generation.task_status || null,
       progress: generation.task_progress ?? null,
       message: generation.task_message || null,
@@ -845,7 +846,7 @@ function list(db, query = {}) {
   const shotId = Number(query.shot_id);
   let sql = `SELECT j.*, v.status, v.video_url, v.local_path, v.poster_local_path, v.source_local_path, v.upscale_local_path,
     v.resolution, v.aspect_ratio, v.upscale_resolution, v.target_fps, v.upscale_status, v.interpolation_status,
-    v.output_width, v.output_height, v.output_resolution, v.output_fps, v.output_duration_ms, v.error_msg, v.task_id, v.provider_task_id, (SELECT charged_micro / 10000.0 FROM billing_usage_logs u WHERE u.authorization_id=v.billing_authorization_id LIMIT 1) AS actual_points, t.progress AS task_progress, t.message AS task_message, t.updated_at AS task_updated_at,
+    v.output_width, v.output_height, v.output_resolution, v.output_fps, v.output_duration_ms, v.error_msg, v.task_id, v.provider_task_id, v.billing_authorization_id, (SELECT charged_micro / 10000.0 FROM billing_usage_logs u WHERE u.authorization_id=v.billing_authorization_id LIMIT 1) AS actual_points, t.progress AS task_progress, t.message AS task_message, t.updated_at AS task_updated_at,
     s.active_video_generation_id, s.local_path AS storyboard_local_path
     FROM omni_video_jobs j JOIN video_generations v ON v.id = j.video_generation_id
     LEFT JOIN async_tasks t ON t.id=v.task_id AND t.deleted_at IS NULL
@@ -878,6 +879,7 @@ function list(db, query = {}) {
   sql += ' ORDER BY j.id DESC LIMIT 100';
   return db.prepare(sql).all(...params).map((item) => ({
     ...item,
+    provider_request_id: require('./videoRequestIdentityService').requestId(db, item),
     is_current: currentStoryboard
       ? (currentStoryboard.active_video_generation_id != null
         ? Number(currentStoryboard.active_video_generation_id) === Number(item.video_generation_id)
@@ -890,7 +892,8 @@ function list(db, query = {}) {
     video_url: videoService.publicVideoUrl(item.video_url, item.local_path),
     postprocess_chain: `${require('./videoPostprocessPolicy').describe(item)} → 本地规范 ${item.aspect_ratio || '原画幅'}`,
     request_snapshot: safeSnapshot(parse(item.request_snapshot_json)),
-  })).map(item => !query.owner_user_id || Number(item.owner_user_id) === Number(query.owner_user_id) ? item : sharedProjectJob(item));
+  })).map(({ billing_authorization_id, ...item }) => item)
+    .map(item => !query.owner_user_id || Number(item.owner_user_id) === Number(query.owner_user_id) ? item : sharedProjectJob(item));
 }
 
 function sharedProjectJob(item) {

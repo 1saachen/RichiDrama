@@ -1,0 +1,11 @@
+dist/assets/FilmCreate-QpyYqrVQ.js                 203.73 kB │ gzip:  54.39 kB
+dist/assets/request-CmQwKrNn.js                    309.84 kB │ gzip:  97.68 kB
+dist/assets/AdminConsole-DfC6GDZo.js               599.76 kB │ gzip: 196.06 kB
+dist/assets/index-oTdryhp7.js                      940.90 kB │ gzip: 296.34 kB
+
+✓ built in 6.04s
+[plugin builtin:vite-reporter]
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOptions.codeSplitting
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.

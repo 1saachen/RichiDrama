@@ -191,6 +191,8 @@ function withTaskProgress(db, row) {
 function rowToItem(r, db) {
   return {
     id: r.id,
+    provider_task_id: r.provider_task_id || null,
+    provider_request_id: require('./videoRequestIdentityService').requestId(db, r),
     ...(db ? require('./videoDraftService').summary(db, r) : {}),
     storyboard_id: r.storyboard_id,
     drama_id: r.drama_id,
