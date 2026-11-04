@@ -508,6 +508,11 @@ function setupRouter(cfg, db, log) {
   r.get('/tool-runs/:id/stream', tools.stream);
   r.post('/tools/:type/runs', (req, res, next) => { require('../services/billingRequestContext').disableAutoBilling(); next(); }, tools.execute);
   r.get('/omni-video-jobs', omniVideo.list);
+  const videoDrafts = require('./videoDrafts')(db, log);
+  r.get('/video-drafts', videoDrafts.list);
+  r.post('/video-drafts/:id/final-quote', videoDrafts.quote);
+  r.post('/video-drafts/:id/finalize', videoDrafts.finalize);
+  r.post('/video-drafts/:id/recover', videoDrafts.recover);
   r.post('/omni-video-jobs/quote', omniVideo.quote);
   r.post('/omni-video-jobs', omniVideo.create);
   r.post('/omni-video-jobs/polish-prompt', omniVideo.polishPrompt);

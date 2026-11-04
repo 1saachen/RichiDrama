@@ -2,6 +2,7 @@ export const costStatuses = { calculated: '已计算', missing_usage: '缺用量
 export const callStatuses = { processing: '处理中', completed: '已完成', failed: '失败', unknown: '提交结果不明' }
 export const meterNames = { input_token: '文本输入 Token', input_image_token: '图片输入 Token', cache_token: '缓存 Token', output_token: '输出 Token', image: '输出图片', input_image: '输入图片', request: '请求', millisecond: '毫秒', second: '秒', character: '字符' }
 const sourceNames = {
+  video_draft: '480p样片', video_draft_final: '样片升级成片',
   single_video_tool: '单视频生成', omni_sequence_shot: '全能创作', omni_video: '全能创作', creative_board: '创作画布',
   video_generation: '视频生成', image_generation: '图片生成', storyboard: '项目分镜', storyboard_video: '分镜视频', storyboard_image: '分镜图片', story_generation: '剧本生成',
   project_text_generation: '项目文本生成', text_generation: '文本生成', tool_run: 'AI 工具箱', relay_model_job: '中转图片与素材理解',

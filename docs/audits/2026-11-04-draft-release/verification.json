@@ -1,0 +1,167 @@
+{
+  "checked_at": "2026-11-04T02:03:13.817Z",
+  "timezone": "Asia/Shanghai",
+  "base": "992ac3c2c616c6443f6129ff2eb14dbf9d0bce1d",
+  "scope": {
+    "entry": "项目镜头与全能创作工作台逐镜头样片",
+    "provider": "火山官方",
+    "model": "doubao-seedance-2-5-260628",
+    "draftResolution": "480p",
+    "finalResolution": "1080p",
+    "batch": false,
+    "relay": false,
+    "canvas": false,
+    "postMix": false
+  },
+  "compatibility": {
+    "enabledRecords": "仅显式draft_mode=true新建记录及其正式子任务；video_draft_tasks关联控制新行为",
+    "excludedRecords": "未关联video_draft_tasks的所有历史任务保持原路径、原状态、原账本和原默认模型",
+    "migration": "90只新增元数据表，不重写历史业务数据、不修改价目或生产配置"
+  },
+  "api": {
+    "create": "POST /api/v1/omni-video-jobs draft_mode=true",
+    "draftQuote": "POST /api/v1/omni-video-jobs/quote draft_mode=true",
+    "list": "GET /api/v1/video-drafts",
+    "finalQuote": "POST /api/v1/video-drafts/:id/final-quote",
+    "finalize": "POST /api/v1/video-drafts/:id/finalize",
+    "recover": "POST /api/v1/video-drafts/:id/recover"
+  },
+  "billing": {
+    "draft": "单独鉴权、模型权限、480p价目、预授权、实际usage结算",
+    "final": "独立1080p预授权与结算，沿用原有视频输入条件；draft_task本身不当作输入视频",
+    "snapshot": "恢复使用原授权价格快照，后续价目变化不改写原账本",
+    "unknown": "供应商结果未知保留预授权并待对账；禁止通过恢复接口重新提交",
+    "archiveFailure": "保留原预授权，恢复只查询已知任务与下载，归档成功后结算并关闭对应归档对账案件"
+  },
+  "expiry": {
+    "rule": "2026-10-28 10:00 Asia/Shanghai起14天，此前7天；供应商更短期限优先",
+    "localMedia": "有效期仅限制升级，不删除本地归档样片"
+  },
+  "consumers": {
+    "frontend": [
+      "FreeCreate项目镜头/自由创作共用入口",
+      "videosAPI",
+      "GenerationSettings读取及报价对接",
+      "账单来源展示"
+    ],
+    "backend": [
+      "Omni鉴权入口、普通视频接口拒绝误传Draft",
+      "模型/配置绑定与账本",
+      "原生HTTP创建与轮询",
+      "视频列表、普通历史、采用、播放引用与主视频写回保护",
+      "任务失败释放与待对账",
+      "重启轮询、认证等待恢复、本地归档恢复"
+    ]
+  },
+  "validation": {
+    "backend": {
+      "pass": 660,
+      "fail": 0,
+      "log": "backend-summary.txt"
+    },
+    "frontend": {
+      "pass": 299,
+      "fail": 0,
+      "log": "frontend-summary.txt"
+    },
+    "production_build": "passed",
+    "migrations": "empty database twice, integrity ok",
+    "http": "both stages independent authorization/actual usage, ownership, config binding, expiry, repeated/concurrent finalize, unknown result, archive recovery, restart, deleted child protection",
+    "browser": {
+      "viewports": [
+        "1280x720",
+        "1440x900",
+        "1920x1080",
+        "660x900"
+      ],
+      "sample": {
+        "width": 854,
+        "height": 480,
+        "readyState": 4,
+        "error": null
+      },
+      "final": {
+        "width": 1920,
+        "height": 1080,
+        "readyState": 4,
+        "error": null
+      },
+      "scroll": "last action reachable, no horizontal overflow; narrow controls and desktop sidebars verified",
+      "refresh": "both archived stages readable; completed shot restored"
+    },
+    "real_supplier": "not_run; only isolated SQLite, mock-only credentials, localhost provider and blue color clips",
+    "verifier": "verifier-tests.json: YAML/Bash syntax and three isolated cases passed; no network"
+  },
+  "production_preflight": {
+    "official_native_2_5_config": "already active",
+    "price": "existing output_token items; unchanged",
+    "historical_completed_id": 5607
+  },
+  "corrections": [
+    "Guard optional database in Draft metadata lookup so existing provider-only polling callers keep their behavior.",
+    "Preserve current main relay model routes and billing labels during migration."
+  ],
+  "delivery": "local validation complete; not yet committed/pushed/deployed",
+  "files": [
+    {
+      "file": "backend-node/migrations/90_video_draft_tasks.sql",
+      "sha256": "fde35ee8b7b62021dba16b8e9e9b450170b6f26b1b6121112d51b070f3fc0580"
+    },
+    {
+      "file": "backend-node/src/routes/videoDrafts.js",
+      "sha256": "06de220422f17afd25d00b80924cddc236d6ba18fc0089dd42dea801f776158c"
+    },
+    {
+      "file": "backend-node/src/services/videoDraftService.js",
+      "sha256": "33d422d9bf469463d3dc60d556effcd82c67c4381ba9dba21054e23d9cb2b912"
+    },
+    {
+      "file": "backend-node/test/videoDraftHttp.integration.test.js",
+      "sha256": "f927a7d4c98368353d79c388f3890601f66fa42fb9d49ddfea5e2f37090b67a5"
+    },
+    {
+      "file": "backend-node/src/routes/index.js",
+      "sha256": "0cb40277fd358a39e2f88087e8d2146bbbeae7476df6f5eea67bff9d2e83ccc9"
+    },
+    {
+      "file": "backend-node/src/routes/omniVideo.js",
+      "sha256": "860aec6f53d9362db8f16abefa89864e25f8bcc69c9eb0944ed71d1ce01cbc4a"
+    },
+    {
+      "file": "backend-node/src/routes/videos.js",
+      "sha256": "edfa48e9579659d1cab927ebe53ce139c41e592283f365b9d69b564a637db248"
+    },
+    {
+      "file": "backend-node/src/services/omniVideoService.js",
+      "sha256": "4093f6da48da3247888a830f6dcf8a75ffdaf1011bbd4940ad2fd8d8c7e03811"
+    },
+    {
+      "file": "backend-node/src/services/videoService.js",
+      "sha256": "3137cc5c025cf1a9c5f479496ac9ceb6e7685758f526f201b33b2a6f716e7b66"
+    },
+    {
+      "file": "backend-node/src/services/videoClient.js",
+      "sha256": "2a571fbe4bb7a94ea5c508c48c15f75660ca63079ae67d850196dc489a367927"
+    },
+    {
+      "file": "backend-node/src/services/taskService.js",
+      "sha256": "6761647b8fbccfdd64c8daff5f855810631464f06578cb2cd4e4e2a68fc0224a"
+    },
+    {
+      "file": "frontweb/src/api/videos.js",
+      "sha256": "49043bb2b44db664b1538ee4c3fe5d81ed3807afd0280e1333c6dd832aff628c"
+    },
+    {
+      "file": "frontweb/src/components/SeedanceDraftPanel.vue",
+      "sha256": "2f0699871f31bf271bd4ed94af61be0892df05db771c8345e74e4165c486ddd6"
+    },
+    {
+      "file": "frontweb/src/views/FreeCreate.vue",
+      "sha256": "701d677ef98053cb815f0dd5afe81bf264b8670208e4c57e8a706d15b3d657c6"
+    },
+    {
+      "file": "frontweb/src/utils/costPresentation.js",
+      "sha256": "31cfc87bb6baff6f903ea3efd91d33cf4c16807483420c026439f28dc46a5de6"
+    }
+  ]
+}

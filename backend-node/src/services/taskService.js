@@ -81,7 +81,10 @@ function releaseTaskAuthorization(db, taskId, reason) {
         // record is malformed; reconciliation tooling can repair that record.
       }
     };
-    tryVoid(row.billing_authorization_id, reason || '异步任务失败，释放预授权');
+    const draftPending = table === 'video_generations'
+      && require('./videoDraftService').record(db, row.id)
+      && db.prepare("SELECT 1 FROM billing_reconciliation_cases WHERE authorization_id=? AND status='pending'").get(row.billing_authorization_id);
+    if (!draftPending) tryVoid(row.billing_authorization_id, reason || '异步任务失败，释放预授权');
     // 视频任务还挂有独立的插帧/超分预授权，必须一并释放，否则会形成永久冻结
     if (table === 'video_generations' && row.id != null) {
       for (const stageTable of ['video_interpolation_jobs', 'video_upscale_jobs']) {

@@ -117,6 +117,7 @@ function quote(db, body, payer) {
       has_video_input: !!body.has_video_input,
       resolution: body.resolution || '480p',
       has_audio: !!body.has_audio,
+      ...(body.draft_mode === true ? { generation_mode: 'draft' } : {}),
     },
   });
   // 让用户看得到冻结是按什么估出来的（时长/分辨率/画幅/token 数）。
@@ -210,7 +211,7 @@ function create(db, log, body, billingUser) {
   const authorization = waitingForSd2 ? null : billing.createAuthorization(db, payer, {
     idempotency_key: idempotencyKey,
     service_type: 'video', model: billingTarget.billing_key, provider_model: billingTarget.provider_model, provider: billingTarget.provider, usage,
-    pricing_context: { has_video_input: routed.some((asset) => asset.type === 'video' && asset.send_to_model), resolution: body.resolution || '480p', has_audio: !!inputValidation?.automatic_voice_url || routed.some((asset) => asset.type === 'audio' && asset.send_to_model), ...(reserveBasis ? { reserve: reserveBasis } : {}) }, reference_type: 'omni_video_job', reference_id: body.shot_id || body.sequence_id || body.board_id || null, drama_id: body.drama_id || null, source_kind: body.source_context === 'creative_board' ? 'creative_board' : body.source_context === 'single_video_tool' ? 'single_video_tool' : body.storyboard_id ? 'storyboard' : 'omni_sequence_shot', source_id: body.board_id || body.storyboard_id || body.shot_id || null,
+    pricing_context: { has_video_input: routed.some((asset) => asset.type === 'video' && asset.send_to_model), resolution: body.resolution || '480p', has_audio: !!inputValidation?.automatic_voice_url || routed.some((asset) => asset.type === 'audio' && asset.send_to_model), ...(reserveBasis ? { reserve: reserveBasis } : {}), ...(body.draft_mode === true ? { generation_mode: 'draft' } : {}) }, reference_type: 'omni_video_job', reference_id: body.shot_id || body.sequence_id || body.board_id || null, drama_id: body.drama_id || null, source_kind: body.draft_mode === true ? 'video_draft' : body.source_context === 'creative_board' ? 'creative_board' : body.source_context === 'single_video_tool' ? 'single_video_tool' : body.storyboard_id ? 'storyboard' : 'omni_sequence_shot', source_id: body.board_id || body.storyboard_id || body.shot_id || null,
   });
   let task = null;
   let videoGenerationId = null;
@@ -254,7 +255,7 @@ function create(db, log, body, billingUser) {
   const insertAsset = db.prepare(`INSERT INTO omni_video_job_assets (omni_job_id, asset_id, ordinal, alias, media_type, role, usage, send_to_model, derived_asset_id, snapshot_json, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   for (const asset of routed) insertAsset.run(jobId, asset.id, asset.ordinal, asset.alias, asset.type, asset.role, asset.usage, asset.send_to_model ? 1 : 0, null, JSON.stringify(publicAsset(asset)), now);
-  if (body.shot_id && body.sequence_id) {
+  if (body.shot_id && body.sequence_id && body.draft_mode !== true && !require('./videoDraftService').isDraft(db, videoGenerationId)) {
     const shot = db.prepare('SELECT id FROM omni_video_sequence_shots WHERE id = ? AND sequence_id = ? AND deleted_at IS NULL').get(Number(body.shot_id), Number(body.sequence_id));
     if (shot) db.prepare('UPDATE omni_video_sequence_shots SET omni_job_id = ?, prompt = ?, prompt_document_json = ?, assets_json = ?, settings_json = ?, updated_at = ? WHERE id = ?').run(
       jobId, prompt, body.prompt_document ? JSON.stringify(body.prompt_document) : null, JSON.stringify(routed.map(publicAsset)), JSON.stringify({ model: body.model, creation_mode: creationMode, aspect_ratio: body.aspect_ratio || '16:9', duration: body.duration, resolution: body.resolution || null, upscale_resolution: upscaleResolution, target_fps: targetFps, audio_strategy: body.audio_strategy || 'reference_only' }), now, shot.id);
@@ -263,13 +264,13 @@ function create(db, log, body, billingUser) {
     // Persist the user-facing stage as well as the generation row.  Without
     // this, a page refresh turns an in-progress certification into a vague
     // storyboard "draft/pending" state.
-    if (body.storyboard_id) {
+    if (body.storyboard_id && body.draft_mode !== true && !require('./videoDraftService').isDraft(db, videoGenerationId)) {
       try { db.prepare("UPDATE storyboards SET active_video_generation_id=?, status='sd2_waiting', error_msg=NULL, updated_at=? WHERE id=? AND deleted_at IS NULL").run(videoGenerationId, now, Number(body.storyboard_id)); } catch (_) {}
     }
     taskService.updateTaskStatus(db, task.id, 'processing', 0, '真人素材认证准备中，完成后将自动开始生成');
     return { omni_job_id: jobId, video_generation_id: videoGenerationId, task_id: task.id, status: 'sd2_waiting', resolved_model: capability.model, routing_summary: buildSummary(routed) };
   }
-  if (body.storyboard_id) {
+  if (body.storyboard_id && body.draft_mode !== true && !require('./videoDraftService').isDraft(db, videoGenerationId)) {
     try { db.prepare("UPDATE storyboards SET active_video_generation_id=?, status='processing', error_msg=NULL, updated_at=? WHERE id=? AND deleted_at IS NULL").run(videoGenerationId, now, Number(body.storyboard_id)); } catch (_) {}
   }
   try {
@@ -850,7 +851,7 @@ function list(db, query = {}) {
     LEFT JOIN async_tasks t ON t.id=v.task_id AND t.deleted_at IS NULL
     LEFT JOIN storyboards s ON s.id = v.storyboard_id AND s.deleted_at IS NULL`;
   const params = [];
-  const filters = ['j.hidden_at IS NULL'];
+  const filters = ['j.hidden_at IS NULL', require('./videoDraftService').normalPredicate(db, 'v')];
   let currentStoryboard = null;
   if (query.owner_user_id) {
     const projectAccess = require('./projectAccessService');
@@ -958,6 +959,7 @@ function retryPostprocess(db, log, omniJobId, actor, requestedStage) {
  */
 function adoptSourceVideo(db, log, omniJobId, actor, options = {}) {
   const job = assertOwnedJob(db, omniJobId, actor);
+  if (require('./videoDraftService').isDraft(db, job.video_generation_id)) throw new Error('样片不能设为正式成片，请先升级');
   if (job.status !== 'failed') throw new Error('只有后处理失败且保留原片的任务可以采用原片');
   if (!job.source_local_path) throw new Error('原始视频不存在，无法采用');
   if (!['failed', 'cancelled', 'reconciliation_required'].includes(String(job.upscale_status || ''))
@@ -1004,6 +1006,7 @@ function adoptCompletedVersion(db, omniJobId, actor, targetStoryboardId = null) 
     FROM omni_video_jobs j JOIN video_generations v ON v.id=j.video_generation_id WHERE j.id=? AND v.deleted_at IS NULL`).get(Number(omniJobId));
   const job = shared?.drama_id && require('./projectAccessService').access(db, shared.drama_id, actor?.id)?.can_edit
     ? shared : assertOwnedJob(db, omniJobId, actor);
+  if (require('./videoDraftService').isDraft(db, job.video_generation_id)) throw new Error('样片不能设为正式成片，请先升级');
   if (!job.storyboard_id || job.status !== 'completed' || !job.local_path) throw new Error('只有已完成并已本地归档的分镜历史版本可设为当前成片');
   const targetId = Number(targetStoryboardId || job.storyboard_id);
   const allowedIds = require('./storyboardIdentityService').historyStoryboardIds(db, targetId);
@@ -1018,6 +1021,7 @@ function adoptCompletedVersion(db, omniJobId, actor, targetStoryboardId = null) 
 }
 function retry(db, log, id, billingUser) {
   const job = assertOwnedJob(db, id, billingUser);
+  if (require('./videoDraftService').record(db, job.video_generation_id)) throw new Error('样片流程不能通过普通重试重复提交，请核对原任务后新建样片');
   const generation = db.prepare('SELECT status, error_msg, provider_task_id, drama_id, storyboard_id FROM video_generations WHERE id = ?').get(job.video_generation_id);
   if (!canRetryGeneration(generation)) throw new Error('该任务不是可安全重试的中断或参考素材读取超时任务');
   const snapshot = parse(job.request_snapshot_json);
@@ -1051,7 +1055,7 @@ function resumeSd2WaitingGenerations(db, log) {
       const message = '真人素材认证任务缺少可恢复的请求快照，未提交生成模型；请重新生成。';
       const now = new Date().toISOString();
       db.prepare('UPDATE video_generations SET status=?, error_msg=?, updated_at=? WHERE id=?').run('invalid', message, now, job.video_generation_id);
-      if (job.storyboard_id) {
+      if (job.storyboard_id && !require('./videoDraftService').isDraft(db, job.video_generation_id)) {
         try { db.prepare("UPDATE storyboards SET status='invalid', error_msg=?, updated_at=? WHERE id=? AND deleted_at IS NULL").run(message, now, job.storyboard_id); } catch (_) {}
       }
       const task = db.prepare('SELECT task_id FROM video_generations WHERE id=?').get(job.video_generation_id);
@@ -1090,7 +1094,7 @@ function resumeSd2WaitingGenerations(db, log) {
           const authRow = db.prepare('SELECT billing_authorization_id, owner_user_id FROM video_generations WHERE id = ?').get(job.video_generation_id);
           if (authRow?.billing_authorization_id) require('./billingService').voidAuthorization(db, { id: authRow.owner_user_id, role: 'admin' }, authRow.billing_authorization_id, 'SD2 准备超时标记可重试, 释放未提交模型的旧预授权');
         } catch (voidError) { log.warn('void stale authorization on sd2-timeout failed', { videoGenerationId: job.video_generation_id, error: voidError.message }); }
-        if (job.storyboard_id) {
+        if (job.storyboard_id && !require('./videoDraftService').isDraft(db, job.video_generation_id)) {
           try { db.prepare('UPDATE storyboards SET status=?, error_msg=?, updated_at=? WHERE id=? AND deleted_at IS NULL').run(status, message, now, job.storyboard_id); } catch (_) {}
         }
         const task = db.prepare('SELECT task_id FROM video_generations WHERE id = ?').get(job.video_generation_id);

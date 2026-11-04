@@ -43,9 +43,12 @@ function setVideoGenFailed(db, videoGenId, errorMsg, now, options = {}) {
     if (row?.owner_user_id && row?.billing_authorization_id) {
       const billing = require('./billingService');
       const owner = { id: row.owner_user_id, role: 'admin' };
-      if (options.unverifiedProviderResult) {
+      if (options.unverifiedProviderResult || options.archiveFailure) {
+        if (options.unverifiedProviderResult && require('./videoDraftService').record(db, videoGenId)) {
+          require('./costLedgerService').forAuthorization(db, row.billing_authorization_id, { status: 'unknown', reason: '样片流程提交结果未知，等待核对供应商结果' });
+        }
         billing.markPendingReconciliation(db, owner, row.billing_authorization_id, {
-          reason: `供应商提交未取得确定结果，不能判定是否已计费：${String(errorMsg || '').slice(0, 180)}`,
+          reason: `${options.archiveFailure ? '供应商已完成但媒体归档失败，保留预授权等待恢复' : '供应商提交未取得确定结果，不能判定是否已计费'}：${String(errorMsg || '').slice(0, 180)}`,
           provider_request_id: options.providerRequestId || null,
         });
       } else {
@@ -55,7 +58,7 @@ function setVideoGenFailed(db, videoGenId, errorMsg, now, options = {}) {
     // Only the version explicitly selected by the storyboard can change its
     // visible state. A late failure of an old history record must not replace
     // a newer adopted completed video.
-    if (row?.storyboard_id) {
+    if (row?.storyboard_id && !require('./videoDraftService').isDraft(db, videoGenId)) {
       try {
         db.prepare(`UPDATE storyboards SET active_video_generation_id=COALESCE(active_video_generation_id, ?),
           status='failed', error_msg=?, updated_at=?
@@ -90,7 +93,7 @@ function setVideoGenFailed(db, videoGenId, errorMsg, now, options = {}) {
  */
 function syncVideoGenerationFailure(db, videoGenId, errorMsg, at = new Date().toISOString()) {
   const row = db.prepare('SELECT storyboard_id, task_id FROM video_generations WHERE id=? AND deleted_at IS NULL').get(Number(videoGenId));
-  if (!row?.storyboard_id) return { storyboard_updated: false };
+  if (!row?.storyboard_id || require('./videoDraftService').isDraft(db, videoGenId)) return { storyboard_updated: false };
   const result = db.prepare(`UPDATE storyboards SET active_video_generation_id=COALESCE(active_video_generation_id, ?),
       status='failed', error_msg=?, updated_at=?
     WHERE id=? AND deleted_at IS NULL
@@ -101,6 +104,7 @@ function syncVideoGenerationFailure(db, videoGenId, errorMsg, at = new Date().to
 
 function list(db, query) {
   let sql = 'FROM video_generations WHERE deleted_at IS NULL';
+  sql += ` AND ${require('./videoDraftService').normalPredicate(db)}`;
   const params = [];
   if (query.owner_user_id) {
     sql += ` AND ${require('./projectAccessService').generationPredicate(db, query.owner_user_id, 'video_generations')}`;
@@ -187,6 +191,7 @@ function withTaskProgress(db, row) {
 function rowToItem(r, db) {
   return {
     id: r.id,
+    ...(db ? require('./videoDraftService').summary(db, r) : {}),
     storyboard_id: r.storyboard_id,
     drama_id: r.drama_id,
     provider: require('./videoProviderService').recordedProvider(db, r),
@@ -240,6 +245,7 @@ function getById(db, id) {
 // expose a signed provider URL or a generation that has been soft-deleted.
 function playbackGeneration(db, id, storageRoot = null) {
   if (!Number.isSafeInteger(Number(id)) || Number(id) <= 0) return null;
+  if (require('./videoDraftService').isDraft(db, id)) return null;
   let row;
   try { row = db.prepare(`SELECT id, status, local_path, poster_local_path FROM video_generations
     WHERE id=? AND deleted_at IS NULL AND status='completed' AND local_path IS NOT NULL`).get(Number(id)); }
@@ -529,6 +535,9 @@ function resolveStoragePath(cfg) {
 }
 
 function settleGenerationBeforePostProcess(db, log, row, videoGenId, providerUsage, providerRequestId) {
+  // Draft stages have no paid post-processing. Settle only after the final
+  // local artifact is validated; an archive interruption retains its hold.
+  if (require('./videoDraftService').record(db, videoGenId)) return;
   if (!row?.owner_user_id || !row?.billing_authorization_id) return;
   try {
     const billing = require('./billingService');
@@ -603,12 +612,12 @@ async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, v
   } catch (error) {
     log.warn('全能视频本地归档/后期处理失败', { video_gen_id: videoGenId, error: error.message });
     // No local bytes exist, so this is a genuine generation-delivery failure.
-    setVideoGenFailed(db, videoGenId, '视频下载或本地处理失败：' + error.message, new Date().toISOString());
+    setVideoGenFailed(db, videoGenId, '视频下载或本地处理失败：' + error.message, new Date().toISOString(), { archiveFailure: !!require('./videoDraftService').record(db, videoGenId) });
     if (row?.task_id) taskService.updateTaskError(db, row.task_id, '视频下载或本地处理失败');
     return;
   }
   if (!localPath) {
-    setVideoGenFailed(db, videoGenId, '视频下载失败，供应商临时地址未能归档到本地', new Date().toISOString());
+    setVideoGenFailed(db, videoGenId, '视频下载失败，供应商临时地址未能归档到本地', new Date().toISOString(), { archiveFailure: !!require('./videoDraftService').record(db, videoGenId) });
     if (row?.task_id) taskService.updateTaskError(db, row.task_id, '视频下载失败');
     return;
   }
@@ -687,7 +696,7 @@ async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, v
       };
     }
   } catch (error) {
-    setVideoGenFailed(db, videoGenId, '视频后处理失败：' + error.message, new Date().toISOString());
+    setVideoGenFailed(db, videoGenId, '视频后处理失败：' + error.message, new Date().toISOString(), { archiveFailure: !!require('./videoDraftService').record(db, videoGenId) });
     if (row.task_id) taskService.updateTaskError(db, row.task_id, '视频后处理失败');
     return;
   }
@@ -707,7 +716,7 @@ async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, v
     localPath = normalized.local_path;
     finalProbe = normalized.probe;
   } catch (error) {
-    setVideoGenFailed(db, videoGenId, '最终成片画幅规范化失败：' + error.message, new Date().toISOString());
+    setVideoGenFailed(db, videoGenId, '最终成片画幅规范化失败：' + error.message, new Date().toISOString(), { archiveFailure: !!require('./videoDraftService').record(db, videoGenId) });
     if (row.task_id) taskService.updateTaskError(db, row.task_id, '最终成片画幅规范化失败');
     return;
   }
@@ -774,6 +783,7 @@ async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, v
         billing.settleAuthorization(db, { id: row.owner_user_id, role: 'admin' }, row.billing_authorization_id, {
           usage: usage || auth?.snapshot?.usage, provider_request_id: providerRequestId || `video-generation:${videoGenId}`,
         });
+        require('./videoDraftService').resolveArchiveReconciliation(db, row);
       }
     }
   } catch (err) {
@@ -793,7 +803,7 @@ async function finalizeSuccessfulVideo(db, log, videoGenId, row, rowForAspect, v
       log.error('[billing] video settlement reconciliation failed', { video_gen_id: videoGenId, error: reconciliationError.message });
     }
   }
-  if (row.storyboard_id) {
+  if (row.storyboard_id && !require('./videoDraftService').isDraft(db, videoGenId)) {
     try {
       db.prepare(`UPDATE storyboards SET active_video_generation_id=COALESCE(active_video_generation_id, ?), video_url=?, local_path=?,
         status='completed', error_msg=NULL, updated_at=?
@@ -954,6 +964,10 @@ async function resumePollForVideoGeneration(db, log, videoGenId) {
   const config = pinnedConfigId
     ? require('./aiConfigService').getConfig(db, pinnedConfigId)
     : videoClient.getDefaultVideoConfig(db, row.model, { tenant_id: row.tenant_id, scene_defaults: false });
+  if (config && require('./videoDraftService').record(db, videoGenId)) {
+    try { require('./videoDraftService').assertPinnedConfig(db, videoGenId, config, row.model); }
+    catch (error) { db.prepare('UPDATE video_generations SET error_msg=?,updated_at=? WHERE id=?').run(error.message, new Date().toISOString(), videoGenId); return; }
+  }
   if (!config) {
     if (pinnedConfigId) {
       // 不能退回默认配置：那等于拿别的 Key 查这个任务。保持 processing、留住宿预授权，
@@ -1071,7 +1085,7 @@ function reconcileUnarchivedCompletedVideos(db, log) {
     if (row.task_id) taskService.updateTaskError(db, row.task_id, message);
     // Storyboards may have copied the same signed URL. Clear only the video
     // field; local_path can also be an image cover and must be preserved.
-    if (row.storyboard_id) {
+    if (row.storyboard_id && !require('./videoDraftService').isDraft(db, row.id)) {
       try {
         const hasArchivedReplacement = db.prepare(`SELECT 1 FROM video_generations
           WHERE storyboard_id = ? AND status = 'completed' AND local_path IS NOT NULL

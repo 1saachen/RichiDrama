@@ -4,9 +4,10 @@ const capabilityService = require('../services/videoModelCapabilities');
 const sequenceService = require('../services/omniSequenceService');
 module.exports = function routes(db, log, cfg) { return {
   list(req, res) { try { response.success(res, omniVideoService.list(db, { ...(req.query || {}), owner_user_id: req.auth.id })); } catch (err) { response.internalError(res, err.message); } },
-  quote(req, res) { try { if (req.body?.source_context === 'creative_board') require('../services/creativeBoardService').assertBoard(db, req.body.board_id, req.auth.id); response.success(res, omniVideoService.quote(db, req.body || {}, req.auth)); } catch (err) { response.badRequest(res, err.message); } },
+  quote(req, res) { try { if (req.body?.source_context === 'creative_board') require('../services/creativeBoardService').assertBoard(db, req.body.board_id, req.auth.id); response.success(res, req.body?.draft_mode === true ? require('../services/videoDraftService').quote(db, req.body, req.auth) : omniVideoService.quote(db, req.body || {}, req.auth)); } catch (err) { response.badRequest(res, err.message); } },
   create(req, res) { try {
     const body = req.body || {};
+    if (body.draft_mode !== undefined && typeof body.draft_mode !== 'boolean') return response.badRequest(res, 'draft_mode 必须为布尔值');
     const standaloneTool = body.source_context === 'single_video_tool';
     const creativeBoard = body.source_context === 'creative_board';
     if (creativeBoard) {
@@ -33,7 +34,8 @@ module.exports = function routes(db, log, cfg) { return {
     if (sequence?.drama_id && Number(sequence.drama_id) !== dramaId) return response.badRequest(res, '该全能创作序列已绑定其他计费项目，请新建序列后再生成');
     if (sequence && !sequence.drama_id && Number.isInteger(dramaId) && dramaId > 0) db.prepare('UPDATE omni_video_sequences SET drama_id=?, updated_at=? WHERE id=?').run(dramaId, new Date().toISOString(), sequence.id);
     const tenant = require('../services/tenantService').tenantForUser(db, req.auth.id);
-    response.created(res, omniVideoService.create(db, log, { ...body, owner_user_id: req.auth.id, tenant_id: tenant?.id || null }, req.auth));
+    const service = body.draft_mode === true ? require('../services/videoDraftService') : omniVideoService;
+    response.created(res, service.create(db, log, { ...body, owner_user_id: req.auth.id, tenant_id: tenant?.id || null }, req.auth));
   } catch (err) { response.badRequest(res, err.message); } },
   polishPrompt: async (req, res) => {
     try {

@@ -730,6 +730,7 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
     duration: effectiveDuration,
     watermark: watermark != null ? Boolean(watermark) : false,
   };
+  if (opts.draft_mode === true) body.draft = true;
   if (resolution) body.resolution = resolution;
   if (seed != null) body.seed = Number(seed);
   // Seedance 2.0 Mini rejects camera_fixed for text-to-video. Omitting the
@@ -861,7 +862,14 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
     has_voice_ref: !!voice_reference_url,
   });
 
-  const res = await fetch(url, {
+  let draftResponse = null;
+  if (opts.draft_mode === true) {
+    try { draftResponse = await postJSONWithTimeout(url, {
+      Authorization: 'Bearer ' + (config.api_key || ''), 'Idempotency-Key': opts.draft_request_key,
+    }, body, 600000); }
+    catch (error) { return { error: `样片提交结果未知：${error.message}`, ambiguous: true }; }
+  }
+  const res = draftResponse ? { status: draftResponse.statusCode, ok: draftResponse.statusCode >= 200 && draftResponse.statusCode < 300, text: async () => draftResponse.raw } : await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -881,14 +889,14 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
     } catch (_) {
       if (raw) errMsg += ' - ' + raw.slice(0, 200);
     }
-    return { error: errMsg };
+    return { error: errMsg, ...(opts.draft_mode === true && res.status >= 500 ? { ambiguous: true } : {}) };
   }
 
   let data;
   try {
     data = JSON.parse(raw);
   } catch (e) {
-    return { error: '火山 Seedance 全能响应非 JSON: ' + raw.slice(0, 200) };
+    return { error: '火山 Seedance 全能响应非 JSON: ' + raw.slice(0, 200), ...(opts.draft_mode === true ? { ambiguous: true } : {}) };
   }
 
   const taskId = data.id || data.task_id || (data.data && data.data.id);
@@ -3821,10 +3829,11 @@ function resolveVideoConfigForSubmit(db, opts) {
 async function callVideoApi(db, log, opts) {
   const config = resolveVideoConfigForSubmit(db, opts);
   const row = opts.video_gen_id ? db.prepare('SELECT * FROM video_generations WHERE id=?').get(opts.video_gen_id) : null;
+  const draftMeta = row ? require('./videoDraftService').record(db, row.id) : null;
   return costTransport.run(db, { config, model: config ? getModelFromConfig(config, opts.model) : opts.model,
     service_type: 'video', authorization_id: opts.billing_authorization_id || row?.billing_authorization_id,
     user_id: row?.owner_user_id, drama_id: opts.drama_id || row?.drama_id,
-    pricing_context: { ...(opts.resolution ? { resolution: opts.resolution } : {}), has_video_input: !!(opts.reference_video_urls?.length || opts.video_url) },
+    pricing_context: { ...(opts.resolution ? { resolution: opts.resolution } : {}), has_video_input: draftMeta ? !!draftMeta.has_video_input : !!(opts.reference_video_urls?.length || opts.video_url) },
   }, () => executeVideoApi(db, log, opts));
 }
 /**
@@ -3951,6 +3960,24 @@ async function executeVideoApi(db, log, opts) {
   const model = getModelFromConfig(config, preferredModel);
   const provider = (config.provider || '').toLowerCase();
   const protocol = resolveVideoProtocol(config, preferredModel);
+  const draftMeta = require('./videoDraftService').record(db, opts.video_gen_id);
+  if (draftMeta) {
+    require('./videoDraftService').assertPinnedConfig(db, opts.video_gen_id, config, model);
+    if (draftMeta.stage === 'final') {
+      const body = require('./videoDraftService').providerFinalBody(db, opts.video_gen_id, model, opts.watermark);
+      const url = buildVideoUrl(config, { defaultEndpoint: '/api/v3/contents/generations/tasks' });
+      try {
+        const result = await postJSONWithTimeout(url, { Authorization: 'Bearer ' + config.api_key, 'Idempotency-Key': draftMeta.request_key }, body, 600000);
+        let data;
+        try { data = JSON.parse(result.raw); } catch (_) { return { error: '正式视频响应无法解析，等待核对供应商结果', ambiguous: true }; }
+        if (result.statusCode >= 400) return { error: `正式视频提交失败：${String(data.error?.message || data.message || result.statusCode).slice(0, 300)}`, ambiguous: result.statusCode >= 500 };
+        if (!data.id && !data.task_id) return { error: '正式视频响应缺少任务ID，等待核对供应商结果', ambiguous: true };
+        return { task_id: data.id || data.task_id };
+      } catch (error) { return { error: `正式视频提交结果未知：${error.message}`, ambiguous: true }; }
+    }
+    opts.draft_mode = true;
+    opts.draft_request_key = draftMeta.request_key;
+  }
   if (db && opts.drama_id && VIDEO_PROTOCOLS_SUPPORT_SD2_ASSET_SCHEME.has(protocol)
       && process.env.SD2_DISABLE_ASSET_INJECT !== '1') {
     opts = applySeedance2CertifiedAssetUrlsToVideoOpts(db, log, opts);
@@ -4069,8 +4096,10 @@ async function executeVideoApi(db, log, opts) {
     });
   }
 
-  if (protocol === 'volcengine_omni') {
+  if (protocol === 'volcengine_omni' || draftMeta?.stage === 'draft') {
     return callVolcengineOmniVideoApi(config, log, {
+      draft_mode: opts.draft_mode,
+      draft_request_key: opts.draft_request_key,
       prompt,
       model,
       duration: opts.duration,
@@ -4200,6 +4229,7 @@ async function executeVideoApi(db, log, opts) {
     body.camera_fixed = Boolean(camera_fixed);
   }
   if (volcTaskType) body.task_type = volcTaskType;
+  if (opts.draft_mode === true) body.draft = true;
 
   // 按官方要求：first_frame 必须在 last_frame 之前；role 严格区分
   if (firstForApi) {
@@ -4441,6 +4471,7 @@ async function executePollVideoTask(db, log, videoGenId, taskId, config, maxAtte
         });
         continue;
       }
+      require('./videoDraftService').capture(db, videoGenId, data);
 
       // 中转站的状态机由 richbestProvider 定义（expired / cancelled 都是终态），不能沿用通用启发式：
       // isPollTaskFailed 里没有 expired，会让已过期任务一直轮询到超时。

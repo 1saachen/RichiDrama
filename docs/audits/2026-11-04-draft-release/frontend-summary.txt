@@ -1,0 +1,9 @@
+✔ workspace exposes finals-only toggle, format badges, search + load-more, and disposal-safe polling (0.5816ms)
+ℹ tests 299
+ℹ suites 0
+ℹ pass 299
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1205.8029

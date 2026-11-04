@@ -29,6 +29,7 @@ function routes(db, log) {
     create: (req, res) => {
       try {
         const body = req.body || {};
+        if (body.draft_mode === true) return response.badRequest(res, '请通过镜头工作台样片入口提交，普通视频接口不支持样片参数');
         let policy;
         try { policy = postprocessPolicy.normalize(body); }
         catch (error) { return response.badRequest(res, error.message); }
