@@ -1,0 +1,9 @@
+✔ native OpenAPI signature matches SDK vector: empty body and optional parameters (2.5034ms)
+ℹ tests 664
+ℹ suites 12
+ℹ pass 664
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 123489.3823

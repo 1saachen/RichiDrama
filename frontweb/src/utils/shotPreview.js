@@ -71,3 +71,21 @@ export function shotPreviewVideoUrl(job, shot) {
   if (!job && activeGenerationStatuses.has(shot?.status)) return backup
   return job ? job.videoUrl || backup : shot?.video_url || ''
 }
+
+// Preview selection is separate from the persisted adoption/binding.
+export function previewVersionLabel(job) {
+  if (!job) return '成片预览：'
+  if (job.is_playback_reference) return '预览引用：'
+  return job.is_current ? '当前采用：' : '历史预览：'
+}
+
+export function markCurrentHistoryJob(history, id) {
+  if (id == null) return
+  for (const job of history || []) job.is_current = !job.is_playback_reference && String(job.id) === String(id)
+}
+
+export function isCurrentProjectVideo(video, storyboard) {
+  if (!video || !storyboard) return false
+  if (storyboard.active_video_generation_id != null) return Number(storyboard.active_video_generation_id) === Number(video.id)
+  return Boolean(storyboard.local_path && video.local_path && storyboard.local_path === video.local_path)
+}

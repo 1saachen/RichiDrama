@@ -1,0 +1,108 @@
+{
+  "checked_at": "2026-11-04T05:46:00.519Z",
+  "timezone": "Asia/Shanghai",
+  "base": "1ac5f1d718fdba569ce62e4d1fd3b3676fb0d181",
+  "branch": "codex/history-current-fix",
+  "delivery": "local_only_not_committed_pushed_or_deployed",
+  "causes": [
+    "Omni list and detail determined is_current only from storyboards, omitting standalone sequence-shot omni_job_id bindings.",
+    "Player heading hard-coded current-adoption for any non-reference preview."
+  ],
+  "changes": [
+    "List/detail/polling read standalone job binding, with job-ID/generation-ID namespaces kept distinct.",
+    "Current, historical preview and copied playback reference labels are distinct.",
+    "Clear stale current flags on successful submission, adoption and current-job polling.",
+    "Legacy project videos with no Omni snapshot use existing generation binding or matching non-empty local path; explicit pointers stay authoritative."
+  ],
+  "consumers": {
+    "frontend": [
+      "FreeCreate player heading, history cards, legacy history mapping, create/adopt/replacePolledJob",
+      "shotPreview normalization/resolution helpers",
+      "copied playback references"
+    ],
+    "backend": [
+      "GET /omni-video-jobs list",
+      "GET /omni-video-jobs/:id detail/polling",
+      "Draft final child in normal history",
+      "project storyboard adoption and legacy paths",
+      "ownership and shared-project filtering retained"
+    ],
+    "unchanged": [
+      "API field names and boolean types",
+      "stored task/shot bindings",
+      "billing and price books",
+      "media URLs and files",
+      "history-detail service without is_current consumers"
+    ]
+  },
+  "validation": {
+    "before_fix": "isolated HTTP regression fails: expected current job202, got []",
+    "backend_full": {
+      "passed": 664,
+      "failed": 0,
+      "note": "Full regression passed; subsequent legacy/zero-pointer refinement covered by final 19-test group."
+    },
+    "backend_final_focused": {
+      "passed": 19,
+      "failed": 0,
+      "includes": [
+        "current history HTTP and restart",
+        "poster listing",
+        "Omni recovery",
+        "generation history detail",
+        "Draft HTTP billing/restart/recovery"
+      ]
+    },
+    "frontend": {
+      "passed": 304,
+      "failed": 0
+    },
+    "build": "passed",
+    "diff_whitespace": "passed",
+    "browser": {
+      "viewports": [
+        "1280x720",
+        "1440x900",
+        "1920x1080",
+        "660x900"
+      ],
+      "interactions": [
+        "current902 has matching current heading and history marker",
+        "select older901: heading historical-preview; current card remains902",
+        "refresh restores current902",
+        "legacy project video904 with no Omni snapshot has current heading and card",
+        "last action reachable, no page horizontal overflow"
+      ],
+      "supplier_calls": 0,
+      "media": "local green/blue FFmpeg test clips, no real generation"
+    },
+    "environment": "Initial unrelated workflow-format assertion failed on Windows CRLF checkout. Restored canonical Git LF bytes for workflow files without changing Git content; full backend rerun passed."
+  },
+  "compatibility": {
+    "scope": "Read-only marker correction applies to existing histories using their existing durable bindings; no migration or data rewrite.",
+    "excluded": "No generation retry, paid action, historical billing/media change, cost-account configuration or short-window layout fix."
+  },
+  "files": [
+    {
+      "file": "backend-node/src/services/omniVideoService.js",
+      "sha256": "841fbcae10374ada84fd3f742b1b6b2a7f1c1e75dc1249caba16afc4f2d54bff"
+    },
+    {
+      "file": "frontweb/src/utils/shotPreview.js",
+      "sha256": "5299e0f0dd38e9ea044ceab8e10cf28f4f1ec9e8a8ca41cb10974936ad451290"
+    },
+    {
+      "file": "frontweb/src/views/FreeCreate.vue",
+      "sha256": "109659b32de929ee53a851d7b5594ebf16d235fd8306134a244b484204a51f49"
+    },
+    {
+      "file": "backend-node/test/historyCurrentHttp.integration.test.js",
+      "sha256": "6201b46c15b97211e2e7a7ff4ff2cde0441cc7248a65413ee3f11755903b3c6f"
+    },
+    {
+      "file": "frontweb/test/historyAdoption.test.js",
+      "sha256": "bf026c0150204e0e8f755e0088da3b2994631a77501942348392441b789768f5"
+    }
+  ],
+  "hash_basis": "UTF-8 source text with CRLF normalized to LF; verified identical between original and isolated workspaces before release commit"
+}

@@ -1,0 +1,54 @@
+name: History Adoption Release Verification 2026-11-04
+
+on:
+  schedule:
+    - cron: '35 10 4 11 *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-20261104-history-verification
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Verify exact revision and stable readiness
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          end=$(date -u -d '2026-11-04 12:00:00 UTC' +%s)
+          stable=0
+          while true; do
+            if curl --fail --silent --show-error --max-time 15 http://drama.richbest.cn/ready -o /tmp/history-release-ready.json &&
+              node -e 'const r=require("/tmp/history-release-ready.json");process.exit(r.revision===process.env.EXPECTED_SHA && r.status==="ready" && r.checks?.database && r.checks?.frontend ? 0 : 1)'; then
+              stable=$((stable + 1))
+              if (( stable >= 4 )); then
+                echo "Verified stable history-adoption release $EXPECTED_SHA" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+            else
+              stable=0
+              if (( $(date -u +%s) >= end )); then
+                echo 'The expected healthy revision was not observed; this verifier never deploys or retries a release.' >&2
+                exit 1
+              fi
+            fi
+            sleep 30
+          done
+      - name: Disable this one-time verification schedule
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh api --method PUT "repos/$GH_REPO/actions/workflows/release-20261104-history-verify.yml/disable"

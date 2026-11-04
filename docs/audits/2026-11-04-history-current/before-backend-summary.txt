@@ -1,0 +1,22 @@
+test at test\historyCurrentHttp.integration.test.js:5:1
+✖ history adoption matches durable standalone and project bindings across HTTP reads and restart (26300.3801ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+
+  + []
+  - [
+  -   202
+  - ]
+
+      at verify (D:\1Code\cyl\RichiDrama\.contributions\history-current-fix\backend-node\test\historyCurrentHttp.integration.test.js:36:14)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async TestContext.<anonymous> (D:\1Code\cyl\RichiDrama\.contributions\history-current-fix\backend-node\test\historyCurrentHttp.integration.test.js:41:5)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [],
+    expected: [ 202 ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }

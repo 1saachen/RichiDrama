@@ -738,9 +738,15 @@ function get(db, id) {
   if (generation?.storyboard_id) {
     try {
       const storyboard = db.prepare('SELECT active_video_generation_id, local_path FROM storyboards WHERE id=? AND deleted_at IS NULL').get(generation.storyboard_id);
-      isCurrent = Number(storyboard?.active_video_generation_id) === Number(generation.id)
-        || (!storyboard?.active_video_generation_id && String(storyboard?.local_path || '') === String(generation.local_path || ''));
+      isCurrent = storyboard?.active_video_generation_id != null
+        ? Number(storyboard.active_video_generation_id) === Number(generation.id)
+        : Boolean(storyboard?.local_path && generation.local_path && storyboard.local_path === generation.local_path);
     } catch (_) {}
+  } else if (job.sequence_id && job.shot_id) {
+    const shot = db.prepare(`SELECT s.omni_job_id FROM omni_video_sequence_shots s
+      JOIN omni_video_sequences q ON q.id=s.sequence_id AND q.deleted_at IS NULL
+      WHERE s.id=? AND s.sequence_id=? AND s.deleted_at IS NULL`).get(job.shot_id,job.sequence_id);
+    isCurrent = shot?.omni_job_id != null && Number(shot.omni_job_id) === Number(job.id);
   }
   return { ...job, is_current: isCurrent, actual_points: actualPoints, can_retry_generation: canRetryGeneration(generation), capability_snapshot: parse(job.capability_snapshot_json), request_snapshot: safeSnapshot(parse(job.request_snapshot_json)), input_summary: parse(job.input_summary_json), assets: assets.map((asset) => ({ ...asset, snapshot: safeAssetSummary(parse(asset.snapshot_json)) })), real_person_failure_asset: locateRealPersonFailureAsset(db, job.id), copyright_failure_asset_summary: copyrightFailureAssetSummary(db, job.id), generation: safeGeneration };
 }
@@ -847,10 +853,12 @@ function list(db, query = {}) {
   let sql = `SELECT j.*, v.status, v.video_url, v.local_path, v.poster_local_path, v.source_local_path, v.upscale_local_path,
     v.resolution, v.aspect_ratio, v.upscale_resolution, v.target_fps, v.upscale_status, v.interpolation_status,
     v.output_width, v.output_height, v.output_resolution, v.output_fps, v.output_duration_ms, v.error_msg, v.task_id, v.provider_task_id, v.billing_authorization_id, (SELECT charged_micro / 10000.0 FROM billing_usage_logs u WHERE u.authorization_id=v.billing_authorization_id LIMIT 1) AS actual_points, t.progress AS task_progress, t.message AS task_message, t.updated_at AS task_updated_at,
-    s.active_video_generation_id, s.local_path AS storyboard_local_path
+    s.active_video_generation_id, s.local_path AS storyboard_local_path, sequence_shot.omni_job_id AS sequence_current_omni_job_id
     FROM omni_video_jobs j JOIN video_generations v ON v.id = j.video_generation_id
     LEFT JOIN async_tasks t ON t.id=v.task_id AND t.deleted_at IS NULL
-    LEFT JOIN storyboards s ON s.id = v.storyboard_id AND s.deleted_at IS NULL`;
+    LEFT JOIN storyboards s ON s.id = v.storyboard_id AND s.deleted_at IS NULL
+    LEFT JOIN omni_video_sequence_shots sequence_shot ON sequence_shot.id=j.shot_id AND sequence_shot.sequence_id=j.sequence_id
+      AND sequence_shot.deleted_at IS NULL AND EXISTS (SELECT 1 FROM omni_video_sequences q WHERE q.id=sequence_shot.sequence_id AND q.deleted_at IS NULL)`;
   const params = [];
   const filters = ['j.hidden_at IS NULL', require('./videoDraftService').normalPredicate(db, 'v')];
   let currentStoryboard = null;
@@ -884,7 +892,9 @@ function list(db, query = {}) {
       ? (currentStoryboard.active_video_generation_id != null
         ? Number(currentStoryboard.active_video_generation_id) === Number(item.video_generation_id)
         : Boolean(currentStoryboard.local_path && item.local_path && currentStoryboard.local_path === item.local_path))
-      : (item.active_video_generation_id != null
+      : (item.sequence_current_omni_job_id != null
+        ? Number(item.sequence_current_omni_job_id) === Number(item.id)
+        : item.active_video_generation_id != null
         ? Number(item.active_video_generation_id) === Number(item.video_generation_id)
         : Boolean(item.storyboard_local_path && item.local_path && item.storyboard_local_path === item.local_path)),
     target_storyboard_id: currentStoryboard ? storyboardId : undefined,
@@ -892,7 +902,7 @@ function list(db, query = {}) {
     video_url: videoService.publicVideoUrl(item.video_url, item.local_path),
     postprocess_chain: `${require('./videoPostprocessPolicy').describe(item)} → 本地规范 ${item.aspect_ratio || '原画幅'}`,
     request_snapshot: safeSnapshot(parse(item.request_snapshot_json)),
-  })).map(({ billing_authorization_id, ...item }) => item)
+  })).map(({ billing_authorization_id, sequence_current_omni_job_id, ...item }) => item)
     .map(item => !query.owner_user_id || Number(item.owner_user_id) === Number(query.owner_user_id) ? item : sharedProjectJob(item));
 }
 
