@@ -20,3 +20,16 @@ test('tiered prices preserve each tier and quantity, and unknown charges remain 
   assert.equal(supplierPriceText({ provider_unit_price: null }), '—')
   assert.equal(priceRuleSummary({ image_pricing_version: 'seedream-pro-v1', free_units: 1 }, 'input_image'), '每次请求首张输入图免费，第 2 张起按张计费')
 })
+
+test('Flash prices describe free reference inputs and avoid Pro pixel tiers', () => {
+  const row = { provider_model: 'doubao-seedream-5-0-flash', unit_code: '张', provider_unit_price: 'ToICompletion=0.12; ToILayerCompletion=0.12' }
+  assert.equal(supplierPriceText(row), '单图生成：0.12 元 / 张\n图层拆分：0.12 元 / 张')
+  const summary = priceRuleSummary({ image_pricing_version: 'seedream-flash-v1', unit_size: 1, rates: [
+    { when: { image_scene: 'single' }, unit_price_points: 12, unit_size: 1 },
+    { when: { image_scene: 'layer' }, unit_price_points: 12, unit_size: 1 },
+  ] }, 'image')
+  assert.match(summary, /参考图输入免费/)
+  assert.match(summary, /不按像素分档/)
+  assert.match(summary, /单图生成：12 积分/)
+  assert.doesNotMatch(summary, /261/)
+})

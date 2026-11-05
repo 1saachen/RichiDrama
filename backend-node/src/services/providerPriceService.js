@@ -11,7 +11,7 @@ const BILLING_VERSION = '2022-01-01';
 const POINTS_PER_CNY = 100;
 const MICRO_PER_POINT = 10000;
 const LOCK_MS = 10 * 60 * 1000;
-const MAPPING_RULE_VERSION = 'verified-platform-models-v8';
+const MAPPING_RULE_VERSION = 'verified-platform-models-v9-seedream-flash';
 
 function now() { return new Date().toISOString(); }
 function parse(value, fallback = {}) { try { return value ? JSON.parse(value) : fallback; } catch (_) { return fallback; } }
@@ -486,10 +486,22 @@ function verifiedMultiChargeSpecs(item, groups) {
       { id: 'image_to_image', when: { has_image_input: true } },
       { id: 'text_to_image', when: { has_image_input: false } },
     ], 'text_to_image')];
+  } else if (model === 'doubao-seedream-5-0-flash') {
+    const charges = groups[0]?.ChargeItems || [];
+    const expected = ['ToICompletion', 'ToILayerCompletion'];
+    if (groups.length !== 1 || Object.keys(groups[0]).some(key => key !== 'ChargeItems') || charges.length !== expected.length ||
+        expected.some(type => charges.filter(charge => charge.Type === type && charge.UnitCode === '张' && charge.Price != null).length !== 1)) return [];
+    serviceTypes = ['image', 'storyboard_image'];
+    const output = compoundSpec(groups, 'image', 'VerifiedSeedreamFlashOutput', expected.map(type => chargeIn(groups, type)), [
+      { id: 'single', when: { image_scene: 'single' } },
+      { id: 'layer', when: { image_scene: 'layer' } },
+    ], 'single');
+    if (output) output.conditions.image_pricing_version = require('./seedreamProPricing').FLASH_VERSION;
+    specs = [output];
   } else if (model === 'doubao-seedream-5-0-pro') {
     const expected = ['ToIPrompt', 'ToICompletion', 'ToILargeCompletion', 'ToILayerCompletion', 'ToILayerLargeCompletion'];
     const charges = groups[0]?.ChargeItems || [];
-    if (groups.length !== 1 || charges.length !== expected.length || expected.some(type => charges.filter(charge => charge.Type === type).length !== 1)) return [];
+    if (groups.length !== 1 || Object.keys(groups[0]).some(key => key !== 'ChargeItems') || charges.length !== expected.length || expected.some(type => charges.filter(charge => charge.Type === type).length !== 1)) return [];
     serviceTypes = ['image', 'storyboard_image'];
     const output = compoundSpec(groups, 'image', 'VerifiedSeedreamProOutput',
       ['ToICompletion', 'ToILargeCompletion', 'ToILayerCompletion', 'ToILayerLargeCompletion'].map(type => chargeIn(groups, type)), [
@@ -570,7 +582,7 @@ function buildCandidateRows(db, item) {
   if (require('./supplierCostRates').fixedRate(model) || !providerModelIsConfigured(db, model)) return [];
   let multi = Array.isArray(item.MultiChargeItems) ? item.MultiChargeItems : [];
   const charges = Array.isArray(item.ChargeItems) ? item.ChargeItems : [];
-  if (!multi.length && normalizeName(model) === 'doubao-seedream-5-0-pro' && charges.length) multi = [{ ChargeItems: charges }];
+  if (!multi.length && ['doubao-seedream-5-0-pro', 'doubao-seedream-5-0-flash'].includes(normalizeName(model)) && charges.length) multi = [{ ChargeItems: charges }];
   if (multi.length) {
     const verified = verifiedMultiChargeRows(db, item, multi);
     if (verified?.length) return verified;

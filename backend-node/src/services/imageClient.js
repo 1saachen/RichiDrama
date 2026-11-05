@@ -1745,6 +1745,10 @@ async function executeImageApi(db, log, opts) {
   if (finalized) {
     pending('图片已返回，等待本地保存和结算', providerRequestId);
     if (data.data?.length !== 1) return { error: '图片数量与单图请求不一致，等待对账' };
+    if ((data.usage?.generated_images != null && data.usage.generated_images !== 1) ||
+        (data.usage?.input_images != null && data.usage.input_images !== resolvedRefs.length)) {
+      return { error: '供应商图片用量与本次单图请求不一致，等待对账' };
+    }
     try {
       const cfg = loadConfig();
       const storagePath = path.resolve(cfg.storage?.local_path || './data/storage');

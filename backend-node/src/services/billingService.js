@@ -182,7 +182,7 @@ function rateFor(row, context = {}, usage = {}) {
   const rates = Array.isArray(conditions.rates) ? conditions.rates : [];
   if (seedreamPricing.enabled(conditions) && row.meter === 'image'
       && !rates.some(rate => Object.entries(rate.when || {}).every(([key, value]) => context[key] === value))) {
-    throw new Error('Seedream Pro 报价需要明确的像素档位和生成场景');
+    throw new Error('Seedream 报价需要明确的生成场景及对应计费规格');
   }
   // Prefer the most specific matching condition instead of trusting the
   // administrator's JSON-array order. Price-book validation rejects equally
@@ -220,11 +220,16 @@ function quote(db, user, input) {
   const byMeter = new Map(); for (const row of rows) if (!byMeter.has(row.meter)) byMeter.set(row.meter, row);
   const imageConditions = parseConditions(byMeter.get('image')?.conditions_json);
   if (seedreamPricing.enabled(imageConditions)) {
-    if (!seedreamPricing.enabled(parseConditions(byMeter.get('input_image')?.conditions_json))) throw new Error('Seedream Pro 输入图价格缺失，已拒绝调用');
     const count = input.pricing_context?.input_image_count;
-    if (!Number.isSafeInteger(count) || count < 0) throw new Error('Seedream Pro 需要每次请求的输入图数量');
-    if (usage.image !== 1) throw new Error('Seedream Pro 请逐次请求报价，不能合并首张免费额度');
-    usage.input_image = count;
+    if (!Number.isSafeInteger(count) || count < 0 || count > 10) throw new Error('Seedream 需要每次请求的输入图数量，最多 10 张');
+    if (usage.image !== 1) throw new Error('Seedream 请逐次单图请求报价');
+    if (seedreamPricing.isPro(imageConditions)) {
+      if (!seedreamPricing.isPro(parseConditions(byMeter.get('input_image')?.conditions_json))) throw new Error('Seedream Pro 输入图价格缺失，已拒绝调用');
+      usage.input_image = count;
+    } else {
+      // Flash reference inputs are free, even if an older client sends counts.
+      delete usage.input_image;
+    }
   }
   const rates = []; let amountMicro = 0;
   for (const [meter, qty] of Object.entries(usage)) {
@@ -322,8 +327,9 @@ function authorizeImageRequest(db, authorizationId, context, imageGenerationId) 
       throw new Error('图片请求已提交或等待对账，不能重复调用供应商');
     }
     if (db.prepare("SELECT 1 FROM billing_transactions WHERE authorization_id=? AND type IN ('void','settlement')").get(original.id)) throw new Error('图片预授权已结束');
-    const usage = { image: 1, input_image: context.input_image_count };
-    if (!Number.isSafeInteger(usage.input_image) || usage.input_image < 0) throw new Error('输入图数量无效');
+    if (!Number.isSafeInteger(context.input_image_count) || context.input_image_count < 0 || context.input_image_count > 10) throw new Error('输入图数量无效，最多 10 张');
+    const usage = { image: 1 };
+    if (original.snapshot.rates.some(rate => rate.meter === 'input_image' && seedreamPricing.isPro(rate.conditions))) usage.input_image = context.input_image_count;
     const rates = original.snapshot.rates.map(previous => {
       const selected = rateFor({ meter: previous.meter, model: original.snapshot.model, unit_price_micro: previous.unit_price_micro, conditions_json: json(previous.conditions) }, context, usage);
       const quantity = usage[previous.meter];

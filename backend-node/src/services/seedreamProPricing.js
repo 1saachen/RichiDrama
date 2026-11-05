@@ -1,11 +1,13 @@
 'use strict';
 
 const VERSION = 'seedream-pro-v1';
+const FLASH_VERSION = 'seedream-flash-v1';
 const PIXEL_THRESHOLD = 2610000;
 
-function enabled(conditions) { return conditions?.image_pricing_version === VERSION; }
+function isPro(conditions) { return conditions?.image_pricing_version === VERSION; }
+function isFlash(conditions) { return conditions?.image_pricing_version === FLASH_VERSION; }
+function enabled(conditions) { return isPro(conditions) || isFlash(conditions); }
 function billableQuantity(conditions, quantity) {
-  if (require('./relayModelPolicy').enabled(conditions)) return require('./relayModelPolicy').quantity(conditions, quantity);
   return Math.max(0, quantity - (enabled(conditions) ? conditions.free_units || 0 : 0));
 }
 
@@ -38,6 +40,15 @@ function context(input = {}) {
 
 function validate(conditions, meter) {
   if (!enabled(conditions)) return;
+  if (isFlash(conditions)) {
+    const rates = conditions.rates || [];
+    if (meter !== 'image' || Number(conditions.unit_size) !== 1 || conditions.free_units ||
+        rates.length !== 2 || ['single', 'layer'].some(scene =>
+          rates.filter(rate => rate.when?.image_scene === scene && Object.keys(rate.when).length === 1 && Number(rate.unit_size) === 1).length !== 1)) {
+      throw new Error('Seedream Flash 仅按输出张数计费，需要单图和图层两项价格；参考图免费且不按像素分档');
+    }
+    return;
+  }
   if (meter === 'input_image') {
     if (conditions.free_units !== 1 || Number(conditions.unit_size) !== 1) throw new Error('Seedream Pro 输入图必须按张计费，且每次请求首张免费');
   } else if (meter === 'image') {
@@ -55,10 +66,16 @@ function validateItems(items) {
     const conditions = typeof item.conditions_json === 'string' ? JSON.parse(item.conditions_json) : item.conditions_json;
     if (!enabled(conditions)) continue;
     validate(conditions, item.meter);
+    if (isFlash(conditions)) {
+      if (items.some(other => other.service_type === item.service_type && other.model === item.model && other.meter !== 'image')) {
+        throw new Error('Seedream Flash 参考图免费，不能配置额外输入图或 Token 价目');
+      }
+      continue;
+    }
     const companion = items.find(other => other.service_type === item.service_type && other.model === item.model && other.meter === (item.meter === 'image' ? 'input_image' : 'image'));
     const otherConditions = typeof companion?.conditions_json === 'string' ? JSON.parse(companion.conditions_json) : companion?.conditions_json;
     if (!enabled(otherConditions)) throw new Error('Seedream Pro 输入图和输出图价目必须成对发布');
   }
 }
 
-module.exports = { VERSION, PIXEL_THRESHOLD, enabled, billableQuantity, pixelBand, referenceCount, context, validate, validateItems };
+module.exports = { VERSION, FLASH_VERSION, PIXEL_THRESHOLD, isPro, isFlash, enabled, billableQuantity, pixelBand, referenceCount, context, validate, validateItems };

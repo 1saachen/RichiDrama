@@ -43,6 +43,7 @@ export function conditionLabel(when = {}) {
 }
 export function priceRuleSummary(value, meter) {
   if (!value) return '无附加条件'
+  if (value.image_pricing_version === 'seedream-flash-v1') return '参考图输入免费；输出按张计费，不按像素分档\n' + (value.rates || []).map(rate => `${conditionLabel(rate.when)}：${rate.unit_price_points} 积分 / ${billingUnitLabel(meter, rate.unit_size || value.unit_size)}`).join('\n')
   if (value.relay_model_billing_version === 1) return `${value.provider_site === 'international' ? '国际站（人民币） · ' : value.provider_site === 'domestic' ? '国内站 · ' : ''}${meter === 'input_image' && value.free_units === 3 ? '每次任务前 3 张参考图免费，第 4 张起按张结算' : `每 ${billingUnitLabel(meter,value.unit_size)}`}`
   if (value.relay_video_billing_version === 1 && meter === 'input_image' && value.provider_model === 'vega-1.0-lite') return '每次任务前 5 张参考图免费，第 6 张起按张结算'
   if (value.image_pricing_version === 'seedream-pro-v1' && value.free_units === 1) return '每次请求首张输入图免费，第 2 张起按张计费'
@@ -65,7 +66,8 @@ export function supplierPriceText(row) {
     const text = part.trim(); const separator = text.indexOf('=')
     if (separator < 0) return `${text} 元 / ${unit}`
     const key = text.slice(0, separator)
-    const label = chargeLabels[key] || (/^≤\d+K$/.test(key) ? `输入量 ${key} Token` : '供应商价格档位')
+    const flash = /^doubao-seedream-5-0-flash(?:-\d{6})?$/.test(row.provider_model || '')
+    const label = (flash ? { ToICompletion: '单图生成', ToILayerCompletion: '图层拆分' }[key] : null) || chargeLabels[key] || (/^≤\d+K$/.test(key) ? `输入量 ${key} Token` : '供应商价格档位')
     return `${label}：${text.slice(separator + 1)} 元 / ${unit}`
   }).join('\n')
 }

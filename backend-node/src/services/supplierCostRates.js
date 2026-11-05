@@ -22,7 +22,7 @@ function decode(item, at) {
     }
   }
   let groups = source.MultiChargeItems || [];
-  if (!groups.length && modelKey(source.FoundationModelName || source.Name) === 'doubao-seedream-5-0-pro') groups = [{ ChargeItems: source.ChargeItems || [] }];
+  if (!groups.length && ['doubao-seedream-5-0-pro', 'doubao-seedream-5-0-flash'].includes(modelKey(source.FoundationModelName || source.Name))) groups = [{ ChargeItems: source.ChargeItems || [] }];
   if (groups.length) {
     const decoded = provider.verifiedMultiChargeSpecs(source, groups);
     return decoded?.specs || [];
