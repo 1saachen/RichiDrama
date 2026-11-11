@@ -1,9 +1,9 @@
 <template>
   <div v-if="projectSession.enabled" class="project-collaboration-bar" role="status">
-    <span :class="{ offline: !projectSession.connected }">{{ projectSession.connected ? (projectSession.pending ? '正在保存…' : '协作已连接') : '连接已断开 · 文本修改保留在此页面' }}</span>
-    <span class="participants">{{ names || '当前仅你在线' }}</span>
+    <span v-if="!quiet || !projectSession.connected || projectSession.pending" :class="{ offline: !projectSession.connected }">{{ projectSession.connected ? (projectSession.pending ? '正在保存…' : '协作已连接') : '连接已断开 · 文本修改保留在此页面' }}</span>
+    <span v-if="!quiet" class="participants">{{ names || '当前仅你在线' }}</span>
     <span v-if="!projectSession.canEdit">只读成员</span>
-    <div class="collaboration-feedback" aria-live="polite">
+    <div v-if="!quiet || projectSession.error" class="collaboration-feedback" aria-live="polite">
       <span v-if="projectSession.error" class="collaboration-error">{{ projectSession.error }}</span>
       <button v-if="projectSession.error && projectSession.errorCode !== 'ENTITY_DELETED' && projectSession.connected && !projectSession.drafts.length" type="button" @click="retryPendingProjectText">重试保存</button>
     </div>
@@ -16,7 +16,10 @@
 import { computed, onBeforeUnmount, watch } from 'vue'
 import ProjectSuggestions from './ProjectSuggestions.vue'
 import { closeProjectSession, openProjectSession, projectSession, retryPendingProjectText, hasUnsavedProjectText } from '@/composables/useProjectCollaboration'
-const props = defineProps({ dramaId: { type: [Number, String], required: true } })
+const props = defineProps({
+  dramaId: { type: [Number, String], required: true },
+  quiet: Boolean,
+})
 const emit = defineEmits(['refresh', 'refresh-workbench'])
 function editingLabel(location) {
   if (!location) return ''
@@ -46,6 +49,7 @@ onBeforeUnmount(() => { clearTimeout(deferred); closeProjectSession() })
 
 <style scoped>
 .project-collaboration-bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 20px;padding:10px 16px;border:1px solid var(--border-subtle);border-radius:12px;background:var(--bg-surface);font-size:12px;color:var(--text-muted)}
+.project-collaboration-bar:empty{display:none}
 .project-collaboration-bar>span:first-child{color:var(--accent)}.project-collaboration-bar .offline,.collaboration-error{color:var(--el-color-warning)}.participants{flex:1;min-width:0;overflow-wrap:anywhere}details{width:100%}textarea{width:100%;min-height:120px;box-sizing:border-box}
 .collaboration-feedback{display:flex;align-items:center;justify-content:flex-end;gap:12px;flex:0 0 100%;min-height:32px;min-width:0}.collaboration-error{overflow-wrap:anywhere}.collaboration-feedback button{flex:none}
 </style>
