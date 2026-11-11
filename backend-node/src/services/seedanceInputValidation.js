@@ -144,12 +144,12 @@ function resolveReference(db, asset, ownerId) {
     : { ...asset, local_path: key || asset.local_path };
 }
 
-function validateSubmission(db, capability, assets, body) {
+function validateSubmission(db, capability, assets, body, { skipLegacyVoice = false } = {}) {
   if (!rulesForModel(capability.model)) return null;
   const cfg = require('../config').loadConfig();
   const root = path.resolve(cfg.storage?.local_path || './data/storage');
   const sent = assets.filter((asset) => asset.send_to_model !== false).map((asset) => resolveReference(db, asset, body.owner_user_id));
-  const automaticVoice = sent.some((asset) => asset.type === 'audio') ? null
+  const automaticVoice = skipLegacyVoice || sent.some((asset) => asset.type === 'audio') ? null
     : require('./videoClient').selectCharacterVoiceReference(db, body.drama_id, body.storyboard_id);
   if (automaticVoice) sent.push(resolveReference(db, { type: 'audio', url: automaticVoice, alias: '角色音色参考', send_to_model: true }, body.owner_user_id));
   const inspected = validateAssets(capability.model, sent, body.creation_mode || 'multi_reference', root);

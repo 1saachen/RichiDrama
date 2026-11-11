@@ -39,7 +39,7 @@ test('authenticated submissions reject invalid assets before billing and preserv
     const tenant = tenants.tenantForUser(db, user.id);
     const aiConfig = aiConfigs.createConfig(db, log, {
       service_type: 'video', provider: 'volcengine', api_protocol: 'volcengine_omni', name: 'input-validation-test',
-      base_url: 'https://example.invalid', api_key: 'dummy-key', model: [MODEL], default_model: MODEL, is_default: true,
+      base_url: 'https://example.invalid', api_key: 'dummy-key', model: [MODEL, 'doubao-seedance-2-5-260628'], default_model: MODEL, is_default: true,
       settings: JSON.stringify({ billing_reserve_output_tokens: 1000000 }), owner_tenant_id: tenant.id,
     });
     tenants.bindOwnedConfig(db, tenant.id, aiConfig, { is_default: true });
@@ -130,6 +130,52 @@ test('authenticated submissions reject invalid assets before billing and preserv
     const snapshot = db.prepare('SELECT request_snapshot_json FROM omni_video_jobs WHERE id=?').get(jobId).request_snapshot_json;
     assert.equal(JSON.parse(snapshot).input_validation.version, 1);
 
+    const episode = db.prepare('INSERT INTO episodes (drama_id,episode_number,title,created_at,updated_at) VALUES (?,1,?,?,?)')
+      .run(dramaId, '第一集', now, now).lastInsertRowid;
+    const addVoice = db.prepare('INSERT INTO characters (drama_id,name,seedance2_voice_asset,created_at,updated_at) VALUES (?,?,?,?,?)');
+    const bind = (name, filename) => Number(addVoice.run(dramaId, name, JSON.stringify({
+      status: 'active', url: `/static/${filename}`, certified_at: now,
+    }), now, now).lastInsertRowid);
+    const lin = bind('林老师', '西西.wav');
+    const zhou = bind('小周', 'second.wav');
+    bind('本镜未选角色', 'other.wav');
+    const shot = Number(db.prepare('INSERT INTO storyboards (episode_id,storyboard_number,title,characters,created_at,updated_at) VALUES (?,1,?,?,?,?)')
+      .run(episode, '对话', JSON.stringify([{ id: zhou }, lin, lin]), now, now).lastInsertRowid);
+    const bindings = [{ character_id: zhou, name: '小周', revision: now }, { character_id: lin, name: '林老师', revision: now }];
+    const manualAudio = addAsset('manual.wav', 'audio', 2);
+    const voiceInput = {
+      ...input, model: 'doubao-seedance-2-5-260628', storyboard_id: shot, idempotency_key: 'multi-character-voices',
+      assets: [{ asset_id: imageId }, { asset_id: manualAudio }], storyboard_voice_bindings: bindings,
+    };
+    const stale = await post('/api/v1/omni-video/jobs', { ...voiceInput, storyboard_voice_bindings: bindings.slice(0, 1) });
+    assert.equal(stale.status, 400);
+    assert.match(stale.json.error.message, /音色已更新/);
+    db.prepare('UPDATE assets SET duration=16 WHERE id IN (?,?)').run(audioId, audio2);
+    const overLimit = await post('/api/v1/omni-video/jobs', voiceInput);
+    assert.equal(overLimit.status, 400);
+    assert.match(overLimit.json.error.message, /参考音频总时长 34 秒/);
+    assert.equal(authorizationCalls, 2);
+    db.prepare('UPDATE assets SET duration=2 WHERE id IN (?,?)').run(audioId, audio2);
+    const multi = await post('/api/v1/omni-video/jobs', voiceInput);
+    assert.equal(multi.status, 201, JSON.stringify(multi.json));
+    await new Promise(setImmediate);
+    assert.equal(processed.length, 3);
+    const multiJobId = multi.json.data.omni_job_id;
+    const multiSnapshot = db.prepare('SELECT request_snapshot_json FROM omni_video_jobs WHERE id=?').get(multiJobId).request_snapshot_json;
+    assert.match(JSON.parse(multiSnapshot).prompt, /小周.*@音频2[\s\S]*林老师.*@音频3/);
+
+    const emptyShot = Number(db.prepare('INSERT INTO storyboards (episode_id,storyboard_number,title,characters,created_at,updated_at) VALUES (?,2,?,?,?,?)')
+      .run(episode, '无角色', '[]', now, now).lastInsertRowid);
+    const noVoices = await post('/api/v1/omni-video/jobs', {
+      ...voiceInput, storyboard_id: emptyShot, idempotency_key: 'empty-character-voices',
+      assets: [{ asset_id: imageId }], storyboard_voice_bindings: [],
+    });
+    assert.equal(noVoices.status, 201, JSON.stringify(noVoices.json));
+    const noVoiceSnapshot = JSON.parse(db.prepare('SELECT request_snapshot_json FROM omni_video_jobs WHERE id=?')
+      .get(noVoices.json.data.omni_job_id).request_snapshot_json);
+    assert.equal(noVoiceSnapshot.input_validation.automatic_voice_url, null);
+    assert.deepEqual(noVoiceSnapshot.storyboard_voices, []);
+
     await new Promise((resolve) => server.close(resolve)); server = null; closeDb();
     db = getDb({ path: filename, type: 'sqlite' }); runMigrationsAndEnsure(db); base = await serve();
     const read = await fetch(`${base}/api/v1/omni-video/jobs/${jobId}`, { headers: { Authorization: `Bearer ${token}` } });
@@ -138,7 +184,14 @@ test('authenticated submissions reject invalid assets before billing and preserv
     assert.equal(restored.data.assets.filter((asset) => asset.media_type === 'audio').length, 2);
     assert.equal(db.prepare('SELECT request_snapshot_json FROM omni_video_jobs WHERE id=?').get(jobId).request_snapshot_json, snapshot);
     assert.deepEqual(db.prepare('SELECT * FROM video_generations WHERE id=?').get(historyId), history);
-    assert.equal(processed.length, 2);
+    const multiRead = await fetch(`${base}/api/v1/omni-video/jobs/${multiJobId}`, { headers: { Authorization: `Bearer ${token}` } });
+    assert.equal(multiRead.status, 200);
+    const restoredMulti = (await multiRead.json()).data;
+    assert.deepEqual(restoredMulti.assets.filter(asset => asset.media_type === 'audio')
+      .map(asset => [asset.alias, asset.send_to_model]), [['manual.wav', 1], ['小周 · 角色音色', 1], ['林老师 · 角色音色', 1]]);
+    assert.deepEqual(restoredMulti.request_snapshot.storyboard_voice_bindings, bindings);
+    assert.equal(db.prepare('SELECT request_snapshot_json FROM omni_video_jobs WHERE id=?').get(multiJobId).request_snapshot_json, multiSnapshot);
+    assert.equal(processed.length, 4);
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));
     closeDb(); config.loadConfig = originalConfig; videoService.processVideoGeneration = originalProcess;
