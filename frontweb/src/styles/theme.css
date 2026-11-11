@@ -297,15 +297,12 @@ html body #app .project-storyboard-page .creation-panel, html body #app .project
 
 /* Legacy configuration and project-flow shells previously carried their own light palettes. */
 html body #app .ai-config .main, html body #app .ai-config .main > * { background: var(--bg-surface) !important; color: var(--text-primary) !important; border-color: var(--border-color) !important; box-shadow: none !important; }
-html body #app .film-create .quick-nav, html body #app .film-create .nav-sidebar-header, html body #app .film-create .workflow-shell,
-html body #app .film-create .workflow-step, html body #app .film-create .workflow-step span, html body #app .film-create .workflow-episode,
+html body #app .film-create .quick-nav, html body #app .film-create .nav-sidebar-header,
 html body #app .film-create .resource-center, html body #app .film-create .resource-center-group, html body #app .film-create .resource-media-library,
 html body #app .film-create .resource-center-item, html body #app .film-create .resource-media-card, html body #app .film-create .storyboard-reference-panel {
   background: var(--bg-surface) !important; color: var(--text-regular) !important; border-color: var(--border-color) !important; box-shadow: none !important;
 }
-html body #app .film-create .workflow-step.active { background: var(--bg-hover) !important; color: var(--text-primary) !important; border-color: var(--text-primary) !important; }
-html body #app .film-create .workflow-step.active span, html body #app .film-create .workflow-step.complete:not(.active) span { background: var(--bg-active) !important; color: var(--text-primary) !important; }
-html body #app .film-create .workflow-head p, html body #app .film-create .workflow-kicker, html body #app .film-create .resource-center-item b, html body #app .film-create .resource-media-card small { color: var(--text-muted) !important; }
+html body #app .film-create .resource-center-item b, html body #app .film-create .resource-media-card small { color: var(--text-muted) !important; }
 html body #app .default-tip { background: var(--bg-raised) !important; color: var(--text-regular) !important; border: 1px solid var(--border-color) !important; }
 
 /* A restrained depth layer keeps the workbench tactile without obscuring content. */

@@ -18,7 +18,35 @@
 
     <aside v-if="reproductionMode" class="reproduction-banner" role="status"><div><b>失败快照复现 · 任务 #{{ reproductionMode.video_generation_id }}</b><span>当前提示词、参数和素材来自失败时快照。页面不会自动保存、调用模型或产生计费。</span></div><div><el-button size="small" @click="copyReproductionPrompt">复制完整提示词</el-button><el-button size="small" type="primary" plain @click="exitReproduction">退出复现</el-button></div></aside>
 
-    <section class="workbench" :class="`mobile-${mobileWorkspaceTab}`">
+    <section
+      class="workbench"
+      :class="[`mobile-${mobileWorkspaceTab}`, {
+        'resizable-columns': resizeStoryboard && currentShot,
+        'is-settings-collapsed': columnWidths.left === 0,
+        'is-shots-collapsed': columnWidths.right === 0,
+      }]"
+      :style="resizeStoryboard && currentShot ? { '--settings-width': `${columnWidths.left}px`, '--shots-width': `${columnWidths.right}px` } : undefined"
+    >
+      <template v-if="resizeStoryboard && currentShot">
+        <div
+          v-for="(label, side) in columnResizeLabels"
+          :key="side"
+          class="storyboard-splitter column-splitter"
+          :class="`is-${side}`"
+          role="separator"
+          tabindex="0"
+          :aria-label="label"
+          aria-orientation="vertical"
+          :aria-valuetext="columnWidths[side] === 0 ? '已收起' : `${Math.round(columnWidths[side])} 像素`"
+          :title="columnWidths[side] === 0 ? '向中间拖动展开' : '左右拖动调整宽度，向外拉到边缘收起'"
+          @pointerdown="startPanelResize($event, side)"
+          @pointermove="movePanelResize"
+          @lostpointercapture="finishPanelResize"
+          @keydown="onPanelResizeKey($event, side)"
+        >
+          <span v-if="columnWidths[side] === 0">{{ side === 'left' ? '右拉展开设置' : '左拉展开镜头' }}</span>
+        </div>
+      </template>
       <aside class="panel shot-panel" aria-label="镜头导航">
         <div class="shot-heading"><b>镜头列表</b><small>{{ shots.length }} 个</small></div>
         <div class="shot-actions"><el-button size="small" type="primary" plain :disabled="(projectSession.enabled && !projectSession.canEdit) || (reproductionMode)" @click="addShot(false)">+ 尾部添加</el-button><el-button size="small" :disabled="(projectSession.enabled && !projectSession.canEdit) || (!currentShot || reproductionMode)" @click="addShot(true)">当前镜头后添加</el-button></div>
@@ -32,11 +60,21 @@
       </aside>
 
       <template v-if="currentShot">
-      <section class="center-stage" aria-label="当前镜头播放与时间线">
+      <section
+        class="center-stage"
+        :class="{
+          'resizable-storyboard': resizeStoryboard,
+          'is-preview-collapsed': previewCollapsed,
+          'is-prompt-collapsed': promptCollapsed,
+        }"
+        :style="resizeStoryboard ? { '--preview-share': previewShare / 100 } : undefined"
+        aria-label="当前镜头播放与时间线"
+      >
+        <div class="storyboard-preview-pane" :inert="previewCollapsed || undefined">
         <template v-if="activeVideoUrl && !previewVideoError && !previewVideoProgress">
           <div class="player-tools"><el-button text size="small" @click="selectRelative(-1)">上一镜</el-button><el-button text size="small" @click="selectRelative(1)">下一镜</el-button><span class="current-version">{{ previewVersionLabel(activeJob) }}{{ activeJob ? `版本 #${activeJob.video_generation_id || activeJob.id}` : '已有成片' }}</span><el-tag :type="stageTagType" effect="dark">{{ stageLabel }}</el-tag></div>
           <div class="video-stage has-video" :style="{ '--preview-aspect-ratio': previewAspectRatio }">
-            <template v-if="mediaLayers.length"><video v-for="layer in mediaLayers" :key="layer.id" :src="layer.url" :controls="layer.id === topMediaLayerId && layer.ready" playsinline preload="metadata" :autoplay="playOnSelection && layer.id === topMediaLayerId" class="main-video" :class="{ 'is-ready': layer.ready, 'is-current': layer.id === topMediaLayerId }" @canplay="promoteMediaLayer(layer.id)" @error="discardMediaLayer(layer.id)" /></template>
+            <template v-if="mediaLayers.length"><video v-for="layer in mediaLayers" :key="layer.id" :src="layer.url" :controls="layer.id === topMediaLayerId && layer.ready" playsinline preload="metadata" :autoplay="!previewCollapsed && playOnSelection && layer.id === topMediaLayerId" class="main-video" :class="{ 'is-ready': layer.ready, 'is-current': layer.id === topMediaLayerId }" @canplay="promoteMediaLayer(layer.id)" @error="discardMediaLayer(layer.id)" /></template>
             <template v-else><b>正在载入成片…</b></template>
           </div>
           <div class="frame-actions" aria-label="成片操作"><el-button size="small" @click="downloadCurrentVideo">下载成片</el-button><el-button v-if="activeJob?.video_generation_id" size="small" @click="openHistoryDetail(activeJob)">查看本版本详情</el-button><template v-if="activeJob"><el-button size="small" type="primary" :disabled="(projectSession.enabled && !projectSession.canEdit) || (savedResultJobId === activeJob.id)" @click="saveResultAsAsset">{{ savedResultJobId === activeJob.id ? '已加入素材' : '作为视频素材继续创作' }}</el-button><el-button v-if="isProjectMode && savedResultJobId === activeJob.id" size="small" @click="$router.push(`/film/${projectDramaId}/canvas`)">在项目画布中打开</el-button><template v-if="canExtractFrames"><el-button size="small" :loading="extractingPosition === 'first'" :disabled="(projectSession.enabled && !projectSession.canEdit) || (!!extractingPosition)" @click="extractFrame('first')">提取首帧</el-button><el-button size="small" :loading="extractingPosition === 'last'" :disabled="(projectSession.enabled && !projectSession.canEdit) || (!!extractingPosition)" @click="extractFrame('last')">提取尾帧</el-button></template></template><el-button v-if="videoStatusPreviewEnabled" size="small" plain @click="previewVideoError = true; previewVideoProgress = false">预览真人授权提示</el-button><el-button v-if="videoStatusPreviewEnabled" size="small" plain @click="previewVideoError = 'copyright'; previewVideoProgress = false">预览版权限制提示</el-button></div>
@@ -50,10 +88,31 @@
           <template v-else-if="activeJob && ['failed','retryable','invalid','billing_reconciliation','unknown'].includes(activeJob.status)"><div class="generation-error-copy"><el-icon class="stage-warning"><WarningFilled /></el-icon><GenerationFailureDetails :job="activeJob" /></div><div class="failure-actions"><el-button v-if="activeJob.status === 'unknown' || activeJob.status === 'billing_reconciliation'" type="primary" @click="refreshUnknownJob(activeJob)">手动刷新状态</el-button><el-button :disabled="projectSession.enabled && !projectSession.canEdit" v-if="canAdoptSource(activeJob)" type="primary" @click="adoptSource(activeJob)">采用已生成原片</el-button><el-button :disabled="projectSession.enabled && !projectSession.canEdit" v-if="canRetryPostprocess(activeJob)" :type="canAdoptSource(activeJob) ? 'default' : 'primary'" @click="retryPostprocess(activeJob)">仅重试{{ activeJob.upscale_status === 'failed' ? '超分' : '插帧' }}</el-button><el-button :disabled="projectSession.enabled && !projectSession.canEdit" v-else-if="activeJob.status === 'retryable' || activeJob.can_retry_generation" type="primary" @click="retry(activeJob)">{{ activeJob.can_retry_generation ? '使用原配置重试' : '重新生成' }}</el-button></div></template>
           <template v-else><b>尚未生成视频</b><small>完成生成后，播放器和成片操作将在这里显示。</small><div v-if="videoStatusPreviewEnabled" class="failure-actions"><el-button size="small" plain @click="previewVideoProgress = true; previewVideoError = false">预览生成进度</el-button><el-button size="small" plain @click="previewVideoError = true; previewVideoProgress = false">预览错误状态</el-button></div></template>
         </section>
+        </div>
+        <div
+          v-if="resizeStoryboard"
+          class="storyboard-splitter"
+          role="separator"
+          tabindex="0"
+          aria-label="调整视频与提示词高度"
+          aria-orientation="horizontal"
+          :aria-valuenow="Math.round(previewShare)"
+          :aria-valuetext="previewCollapsed ? '视频区已收起' : promptCollapsed ? '提示词区已收起' : undefined"
+          :title="previewCollapsed ? '下拉或按方向键 ↓ 展开视频' : promptCollapsed ? '上拉或按方向键 ↑ 展开提示词' : '上下拖动调整高度，拖到边缘收起'"
+          @pointerdown="startPanelResize($event, 'preview')"
+          @pointermove="movePanelResize"
+          @lostpointercapture="finishPanelResize"
+          @keydown="onPanelResizeKey($event, 'preview')"
+        >
+          <span v-if="previewCollapsed">下拉展开视频</span>
+          <span v-else-if="promptCollapsed">上拉展开提示词</span>
+        </div>
+        <div class="storyboard-prompt-pane" :inert="promptCollapsed || undefined">
         <div class="shot-tabs"><span class="active">镜头提示词</span><span>镜头 {{ activeShotIndex + 1 }} / {{ shots.length }}</span></div>
         <!-- 提示词渲染只读取当前镜头工作集。项目库素材必须先“加入本镜”，
              才能成为 @ 引用候选，绝不能借用其他镜头的同名素材。 -->
         <div class="shot-script" :aria-busy="!collaborativePrompt.ready.value"><OmniAssetPromptEditor :key="activeShotId" ref="promptEditorRef" v-model="prompt" :readonly="projectSession.enabled && (!projectSession.canEdit || !collaborativePrompt.ready.value)" @compositionstart="collaborativePrompt.compositionStart" @compositionend="collaborativePrompt.compositionEnd" :assets="promptAssets" :chosen-ids="selected" :reference-document="promptDocument" @pick="onPickFromEditor" @references="setPromptReferences" /></div>
+        </div>
       </section>
 
       <aside class="panel creation-panel" aria-label="创作输入与生成设置">
@@ -292,6 +351,124 @@ let mediaLayerTransitionTimer = null
 const generationClock = ref(Date.now())
 const shotListRef = ref(null)
 const promptEditorRef = ref(null)
+const resizeStoryboard = computed(() => embedded.value && isProjectMode.value)
+const previewShareKey = 'richidrama-storyboard-preview-share'
+const columnWidthsKey = 'richidrama-storyboard-column-widths'
+const columnResizeLabels = { left: '调整创作设置栏宽度', right: '调整镜头列表宽度' }
+const previewShare = ref(40)
+const previewCollapsed = computed(() => resizeStoryboard.value && previewShare.value === 0)
+const promptCollapsed = computed(() => resizeStoryboard.value && previewShare.value === 100)
+const columnWidths = ref({ left: 340, right: 270 })
+try {
+  const savedShare = JSON.parse(localStorage.getItem(previewShareKey))
+  if (Number.isFinite(savedShare) && savedShare >= 0 && savedShare <= 100) previewShare.value = savedShare
+  const savedWidths = JSON.parse(localStorage.getItem(columnWidthsKey))
+  for (const side of Object.keys(columnResizeLabels)) {
+    if (Number.isFinite(savedWidths?.[side]) && savedWidths[side] >= 0) columnWidths.value[side] = savedWidths[side]
+  }
+} catch { /* Storage can be unavailable in some browser sessions. */ }
+let panelDrag = null
+
+function previewResize(handle) {
+  const preview = handle.previousElementSibling
+  const available = handle.parentElement.clientHeight - handle.offsetHeight
+  const style = getComputedStyle(handle.parentElement)
+  const expandedMin = parseFloat(style.getPropertyValue('--preview-min-height'))
+  const expandedMax = Math.max(expandedMin, available - parseFloat(style.getPropertyValue('--prompt-min-height')))
+  const previewThreshold = previewCollapsed.value ? 48 : expandedMin - 24
+  const promptThreshold = promptCollapsed.value ? available - 48 : expandedMax + 24
+  return {
+    current: promptCollapsed.value ? available : preview.offsetHeight,
+    min: 0, max: available, expandedMin, expandedMax,
+    snap(height) {
+      if (height < previewThreshold) return 0
+      if (height > promptThreshold) return available
+      return Math.min(expandedMax, Math.max(expandedMin, height))
+    },
+    apply(height) {
+      if (available <= 0) return
+      if (height === 0) preview.querySelectorAll('video').forEach(video => video.pause())
+      previewShare.value = height / available * 100
+    },
+  }
+}
+
+function columnResize(handle, side) {
+  const workbench = handle.parentElement
+  const settings = workbench.querySelector('.creation-panel')
+  const shots = workbench.querySelector('.shot-panel')
+  const center = workbench.querySelector('.center-stage')
+  const other = side === 'left' ? 'right' : 'left'
+  const current = (side === 'left' ? settings : shots).offsetWidth
+  const otherWidth = (side === 'left' ? shots : settings).offsetWidth
+  const style = getComputedStyle(workbench)
+  const expandedMin = parseFloat(style.getPropertyValue(side === 'left' ? '--settings-min' : '--shots-min'))
+  const max = Math.max(expandedMin, current + center.offsetWidth - parseFloat(style.getPropertyValue('--stage-min')))
+  const collapseThreshold = current === 0 ? 48 : expandedMin - 24
+  return {
+    current, min: 0, max, expandedMin, expandedMax: max,
+    snap: width => width < collapseThreshold ? 0 : Math.max(width, expandedMin),
+    apply: width => { columnWidths.value = { [side]: width, [other]: otherWidth } },
+  }
+}
+
+function applyPanelSize(size, resize) {
+  const clamped = Math.min(resize.max, Math.max(resize.min, size))
+  const next = resize.snap(clamped)
+  if (Math.abs(next - (resize.applied ?? resize.current)) < 1) return
+  resize.apply(next)
+  resize.applied = next
+}
+
+function savePanelSize(pane) {
+  const key = pane === 'preview' ? previewShareKey : columnWidthsKey
+  const value = pane === 'preview' ? previewShare.value : columnWidths.value
+  try { localStorage.setItem(key, JSON.stringify(value)) } catch { /* Keep the in-memory value. */ }
+}
+
+function startPanelResize(event, pane) {
+  if (event.button !== 0 || !event.isPrimary) return
+  const handle = event.currentTarget
+  const resize = pane === 'preview' ? previewResize(handle) : columnResize(handle, pane)
+  event.preventDefault()
+  handle.focus({ preventScroll: true })
+  handle.setPointerCapture(event.pointerId)
+  panelDrag = { pane, resize, pointerId: event.pointerId, x: event.clientX, y: event.clientY }
+}
+
+function movePanelResize(event) {
+  if (panelDrag?.pointerId !== event.pointerId) return
+  const { pane, resize, x, y } = panelDrag
+  const delta = pane === 'preview' ? event.clientY - y : event.clientX - x
+  const size = resize.current + (pane === 'right' ? -delta : delta)
+  applyPanelSize(size, resize)
+}
+
+function finishPanelResize(event) {
+  if (panelDrag?.pointerId !== event.pointerId) return
+  savePanelSize(panelDrag.pane)
+  panelDrag = null
+}
+
+function onPanelResizeKey(event, pane) {
+  const vertical = pane === 'preview'
+  const backward = vertical ? 'ArrowUp' : 'ArrowLeft'
+  const forward = vertical ? 'ArrowDown' : 'ArrowRight'
+  if (![backward, forward, 'Home', 'End'].includes(event.key)) return
+  event.preventDefault()
+  const resize = vertical ? previewResize(event.currentTarget) : columnResize(event.currentTarget, pane)
+  const { current, min, max, expandedMin, expandedMax } = resize
+  const smaller = current <= expandedMin ? min : current > expandedMax ? expandedMax : Math.max(expandedMin, current - 24)
+  const larger = current === min ? expandedMin : current >= expandedMax ? max : Math.min(expandedMax, current + 24)
+  const sizes = {
+    [backward]: pane === 'right' ? larger : smaller,
+    [forward]: pane === 'right' ? smaller : larger,
+    Home: min,
+    End: max,
+  }
+  applyPanelSize(sizes[event.key], resize)
+  savePanelSize(pane)
+}
 let wheelShotLocked = false
 let wheelShotTimer = null
 const shotHistory = ref([]), shotHistoryShotId = ref(null), selectedHistoryJobId = ref(null)
@@ -705,7 +882,7 @@ function historyPoster(job) {
 }
 function containWorkbenchScroll(event) {
   if (!event.deltaY || !(event.target instanceof Element)) return
-  const selector = 'textarea.el-textarea__inner, .prompt-rich-editor, .shot-list, .creation-panel, .shot-script, .center-stage, .material-pool, .selected-assets, .frame-picker-grid'
+  const selector = 'textarea.el-textarea__inner, .prompt-rich-editor, .shot-list, .creation-panel, .shot-script, .center-stage, .material-pool, .selected-assets, .frame-picker-grid, .resizable-storyboard .storyboard-preview-pane'
   let panel = event.target.closest(selector)
   while (panel && panel.scrollHeight <= panel.clientHeight) panel = panel.parentElement?.closest(selector)
   // Keep wheel movement in the nearest scrollable workbench panel.
@@ -1979,4 +2156,162 @@ defineExpose({ refreshProjectShots, refreshCollaboration })
 .creation-secondary-body{padding:0 10px 10px;border-top:1px solid var(--border-subtle)}
 .creation-secondary-body .materials-title{margin-top:10px}.creation-history-section .generation-history{margin-top:0;padding-top:10px;border-top:0}
 .shot-actions{flex-wrap:wrap}
+.storyboard-preview-pane, .storyboard-prompt-pane { display: contents; }
+.project-storyboard-page .center-stage.resizable-storyboard {
+  --preview-min-height: 156px;
+  --prompt-min-height: 184px;
+  --splitter-height: 22px;
+  grid-template-rows:
+    clamp(var(--preview-min-height), calc((100% - var(--splitter-height)) * var(--preview-share)), max(var(--preview-min-height), calc(100% - var(--splitter-height) - var(--prompt-min-height))))
+    var(--splitter-height) minmax(var(--prompt-min-height), 1fr);
+  overflow-y: auto;
+}
+@media (min-width: 761px) {
+  .project-storyboard-page .center-stage.resizable-storyboard { display: grid; }
+}
+@media (max-width: 960px) {
+  .project-storyboard-page .center-stage.resizable-storyboard { height: clamp(520px, 64dvh, 680px); }
+}
+@media (max-width: 760px) {
+  .workbench.mobile-stage > .center-stage.resizable-storyboard { display: grid !important; }
+}
+.resizable-storyboard .storyboard-preview-pane,
+.resizable-storyboard .storyboard-prompt-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.resizable-storyboard .storyboard-preview-pane {
+  min-height: var(--preview-min-height);
+  overflow: auto;
+}
+.project-storyboard-page .resizable-storyboard.is-preview-collapsed {
+  grid-template-rows: 0 var(--splitter-height) minmax(var(--prompt-min-height), 1fr);
+}
+.project-storyboard-page .resizable-storyboard.is-prompt-collapsed {
+  grid-template-rows: minmax(var(--preview-min-height), 1fr) var(--splitter-height) 0;
+}
+.resizable-storyboard .storyboard-prompt-pane { min-height: var(--prompt-min-height); }
+.is-preview-collapsed .storyboard-preview-pane,
+.resizable-storyboard.is-prompt-collapsed .storyboard-prompt-pane {
+  min-height: 0;
+  overflow: hidden;
+  visibility: hidden;
+}
+.resizable-storyboard:is(.is-preview-collapsed, .is-prompt-collapsed) > .storyboard-splitter {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.resizable-storyboard:is(.is-preview-collapsed, .is-prompt-collapsed) > .storyboard-splitter::after { order: -1; }
+.project-storyboard-page .resizable-storyboard .video-stage {
+  flex: 1 0 96px !important;
+  height: auto;
+  aspect-ratio: auto;
+  margin: 8px 12px !important;
+}
+.project-storyboard-page .resizable-storyboard .player-tools {
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  height: auto;
+  padding: 4px 10px;
+}
+.resizable-storyboard .player-tools .el-button { margin-inline-start: 0; }
+.resizable-storyboard .player-tools .current-version { flex: 1 0 auto; }
+.resizable-storyboard .player-tools .el-tag { flex: 0 0 auto; }
+.resizable-storyboard .generation-stage-status { flex: 1 0 auto; align-content: start; }
+.resizable-storyboard .shot-script { flex: 1 1 auto; min-height: 0; }
+.resizable-storyboard .shot-script :deep(:is(.editor, .prompt-rich-editor)) { min-height: 0; }
+.storyboard-splitter {
+  display: grid;
+  place-items: center;
+  border-block: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  cursor: ns-resize;
+  touch-action: none;
+  user-select: none;
+}
+.storyboard-splitter::after {
+  width: 34px;
+  height: 4px;
+  border-radius: 4px;
+  background: var(--text-muted);
+  content: '';
+}
+.storyboard-splitter:is(:hover, :focus-visible, :active)::after { background: var(--accent); }
+.storyboard-splitter:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.column-splitter { display: none; }
+@media (min-width: 961px) {
+  .project-storyboard-page .workbench.resizable-columns {
+    --settings-min: 184px;
+    --shots-min: 172px;
+    --stage-min: 220px;
+    --settings-track-min: var(--settings-min);
+    --shots-track-min: var(--shots-min);
+    --settings-grip-width: 12px;
+    --shots-grip-width: 12px;
+    grid-template-columns:
+      minmax(var(--settings-track-min), max(var(--settings-track-min), var(--settings-width)))
+      var(--settings-grip-width) minmax(var(--stage-min), 1fr) var(--shots-grip-width)
+      minmax(var(--shots-track-min), max(var(--shots-track-min), var(--shots-width))) !important;
+  }
+  .project-storyboard-page .resizable-columns.is-settings-collapsed {
+    --settings-track-min: 0px;
+    --settings-grip-width: 22px;
+  }
+  .project-storyboard-page .resizable-columns.is-shots-collapsed {
+    --shots-track-min: 0px;
+    --shots-grip-width: 22px;
+  }
+  .resizable-columns.is-settings-collapsed > .creation-panel,
+  .resizable-columns.is-shots-collapsed > .shot-panel { display: none; }
+  .project-storyboard-page .resizable-columns > .center-stage { grid-column: 3; }
+  .project-storyboard-page .resizable-columns > .shot-panel { grid-column: 5; }
+  .resizable-columns > .creation-panel { container: storyboard-settings / inline-size; }
+  .resizable-columns > .shot-panel { container: storyboard-shots / inline-size; }
+  .resizable-columns .generation-progress { grid-template-columns: minmax(0, 240px) auto; }
+  .resizable-columns .frame-actions { flex-wrap: wrap; }
+  .resizable-columns .frame-actions .el-button { margin-inline-start: 0; }
+  .resizable-columns > .column-splitter {
+    display: grid;
+    grid-row: 1;
+    position: relative;
+    border-block: 0;
+    cursor: ew-resize;
+  }
+  .column-splitter.is-left { grid-column: 2; }
+  .column-splitter.is-right { grid-column: 4; }
+  .column-splitter::after { width: 3px; height: 34px; }
+  .column-splitter > span {
+    position: absolute;
+    bottom: calc(50% + 24px);
+    color: var(--text-muted);
+    font-size: 11px;
+    writing-mode: vertical-rl;
+    white-space: nowrap;
+  }
+}
+@container storyboard-settings (max-width: 205px) {
+  .mode-switch { flex-direction: column; align-items: stretch; gap: 4px; }
+  .mode-switch :deep(.el-radio-button__inner) {
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+  }
+  .creation-panel :is(.parameters, .materials-title.is-actions, .creation-generate-actions) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .creation-generate-dock { grid-template-columns: minmax(0, 1fr); }
+  .creation-generate-summary { flex-direction: column; align-items: flex-start; gap: 3px; }
+  .creation-generate-summary small { white-space: normal; }
+}
+@container storyboard-shots (max-width: 170px) {
+  .shot-actions .el-button { flex-basis: 100%; }
+  .shot-card .shot-title { flex-wrap: wrap; }
+  .shot-title > b { flex-basis: calc(100% - 42px); }
+  .shot-controls { margin-left: auto; }
+}
 </style>

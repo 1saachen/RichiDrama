@@ -181,7 +181,8 @@ assert.match(freeCreate, /while \(panel && panel\.scrollHeight <= panel\.clientH
 assert.match(freeCreate, /Desktop free-create uses a fixed-height workbench too/)
 assert.match(freeCreate, /\.shot-panel\{overflow:hidden\}\.shot-list\{flex:1 1 auto;min-height:0\}/)
   assert.match(freeCreate, /\.omni-page\.embedded\.project-storyboard-page\{position:sticky!important;top:58px;z-index:20;height:calc\(100dvh - 58px\)!important/)
-  assert.match(filmCreate, /\.storyboard-stage-active \.omni-page\.embedded\.project-storyboard-page\{position:static!important;top:auto;height:auto!important;min-height:0!important;overflow:hidden!important;flex:1/)
+  assert.match(filmCreate, /\.storyboard-stage-active \.omni-page\.embedded\.project-storyboard-page\s*\{\s*position: static !important/)
+  assert.match(filmCreate, /\.film-create > \.main\s*\{[^}]*overflow: auto/)
 })
 
 test('long prompt text keeps an independently scrollable textarea', () => {
