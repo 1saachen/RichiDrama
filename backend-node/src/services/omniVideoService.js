@@ -125,7 +125,29 @@ function quote(db, body, payer) {
   return quoted;
 }
 
-function create(db, log, body, billingUser) {
+function storyboardVoiceReferences(db, dramaId, storyboardId) {
+  const shot = db.prepare(`SELECT s.characters FROM storyboards s JOIN episodes e ON e.id = s.episode_id
+    WHERE s.id = ? AND e.drama_id = ? AND s.deleted_at IS NULL AND e.deleted_at IS NULL`).get(storyboardId, dramaId);
+  if (!shot) throw new Error('请先选择当前项目的分镜');
+  const characters = parse(shot.characters);
+  if (!Array.isArray(characters)) return [];
+  const ids = new Set(characters.map((value) => Number(value?.id ?? value)));
+  const find = db.prepare('SELECT name, seedance2_voice_asset FROM characters WHERE id = ? AND drama_id = ? AND deleted_at IS NULL');
+  return [...ids].flatMap((characterId) => {
+    if (!Number.isSafeInteger(characterId) || characterId <= 0) return [];
+    const character = find.get(characterId, dramaId);
+    const voice = parse(character?.seedance2_voice_asset);
+    if (voice?.status !== 'active' || !(voice.local_path || voice.url)) return [];
+    return [{
+      character_id: characterId, name: character.name, revision: voice.certified_at || '',
+      local_path: voice.local_path || null, url: voice.url || null,
+    }];
+  });
+}
+
+function voiceIdentity({ character_id, name, revision }) { return { character_id, name, revision }; }
+
+function create(db, log, body, billingUser, savedVoices = null) {
   body = { ...(body || {}) };
   if (!String(body.model || '').trim() || String(body.model).trim() === 'auto') throw new Error('请选择一个明确的视频模型');
   const prompt = String(body.prompt || '').trim();
@@ -171,14 +193,48 @@ function create(db, log, body, billingUser) {
   const waitingSnapshot = body.__sd2_waiting_generation_id
     ? parse(db.prepare('SELECT request_snapshot_json FROM omni_video_jobs WHERE video_generation_id=?').get(Number(body.__sd2_waiting_generation_id))?.request_snapshot_json)
     : null;
+  const useStoryboardVoices = body.storyboard_voice_bindings !== undefined || savedVoices !== null;
+  let storyboardVoices = null;
+  let voicePrompt = '';
+  if (useStoryboardVoices) {
+    if (!body.storyboard_id || !body.drama_id || creationMode !== 'multi_reference' || body.audio_strategy === 'post_mix'
+      || !capability.supports.audio_reference || !require('./seedanceInputValidation').rulesForModel(capability.model)) {
+      throw new Error('分镜角色音色仅支持 Seedance 多参考生视频的音频参考模式');
+    }
+    storyboardVoices = savedVoices ?? storyboardVoiceReferences(db, body.drama_id, body.storyboard_id);
+    if (savedVoices === null) {
+      const expected = body.storyboard_voice_bindings;
+      const matches = Array.isArray(expected) && expected.length === storyboardVoices.length
+        && storyboardVoices.every((voice, index) => {
+          const entry = expected[index];
+          return entry?.character_id === voice.character_id && entry.name === voice.name && entry.revision === voice.revision;
+        });
+      if (!matches) throw new Error('本镜的角色或绑定音色已更新，请刷新分镜后核对音色再生成');
+    }
+    const manualAudioCount = routed.filter((asset) => asset.send_to_model && asset.type === 'audio').length;
+    const lastOrdinal = Math.max(0, ...routed.map((asset) => asset.ordinal));
+    for (const [index, voice] of storyboardVoices.entries()) {
+      routed.push({
+        id: null, type: 'audio', role: 'reference', usage: 'ambience', strategy: 'native', send_to_model: true,
+        ordinal: lastOrdinal + index + 1, alias: `${voice.name} · 角色音色`, url: voice.url, local_path: voice.local_path,
+      });
+    }
+    if (routed.length > 50) throw new Error('角色音色与其他参考素材合计最多 50 项，请减少本镜素材');
+    if (storyboardVoices.length) {
+      const mappings = storyboardVoices.map((voice, index) => `${JSON.stringify(voice.name)} 使用 @音频${manualAudioCount + index + 1} 作为音色参考。`);
+      voicePrompt = `\n\n【角色音色参考】\n${mappings.join('\n')}\n仅在对应角色说话时参考其音色，按原提示词的台词和出场安排生成。`;
+    }
+  }
   const inputValidation = !body.__sd2_waiting_generation_id || waitingSnapshot?.input_validation
-    ? require('./seedanceInputValidation').validateSubmission(db, capability, routed, { ...body, creation_mode: creationMode })
+    ? require('./seedanceInputValidation').validateSubmission(db, capability, routed, {
+      ...body, prompt: prompt + voicePrompt, creation_mode: creationMode,
+    }, { skipLegacyVoice: useStoryboardVoices })
     : null;
   const sd2 = sd2IdentityState(routed, capability);
   if (sd2.invalid.length) enforceSd2IdentityAssets(routed, capability, log);
   const waitingForSd2 = sd2.pending.length > 0;
   applySd2CertifiedAssetReferences(routed, capability);
-  const modelPrompt = bindPromptReferences(prompt, body.prompt_document, routed);
+  const modelPrompt = bindPromptReferences(prompt, body.prompt_document, routed) + voicePrompt;
   const now = new Date().toISOString();
   const billing = require('./billingService');
   const aiConfigs = require('./aiConfigService');
@@ -238,6 +294,10 @@ function create(db, log, body, billingUser) {
   const postProcess = { keep_original_audio: !!body.keep_original_audio, audio_volume: clamp(body.audio_volume, 0, 2, 1), audio_fade_seconds: clamp(body.audio_fade_seconds, 0, 10, 0) };
   const requestSnapshot = { source_context: body.source_context || null, board_id: body.board_id || null, idempotency_key: idempotencyKey || String(body.idempotency_key || '').trim() || null, prompt: modelPrompt, original_prompt: prompt, prompt_document: body.prompt_document || null, asset_selection_policy: assetSelectionPolicy, negative_prompt: body.negative_prompt || '', creation_mode: creationMode, model: capability.model, aspect_ratio: body.aspect_ratio || null, duration: body.duration || null, resolution: body.resolution || null, upscale_resolution: upscaleResolution, target_fps: targetFps, audio_strategy: body.audio_strategy || 'reference_only', post_process: postProcess, assets: routed.map(publicAsset) };
   if (inputValidation) requestSnapshot.input_validation = inputValidation;
+  if (useStoryboardVoices) {
+    requestSnapshot.storyboard_voices = storyboardVoices;
+    requestSnapshot.assets = requestSnapshot.assets.slice(0, routed.length - storyboardVoices.length);
+  }
   const job = !existingWaitingId ? db.prepare(`INSERT INTO omni_video_jobs (video_generation_id, owner_user_id, prompt, negative_prompt, model_requested, model_resolved, capability_snapshot_json, request_snapshot_json, preprocess_snapshot_json, input_summary_json, audio_strategy, sequence_id, shot_id, storyboard_id, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(videoGenerationId, body.owner_user_id || payer.id, modelPrompt, body.negative_prompt || null, body.model || 'auto', capability.model,
@@ -538,7 +598,8 @@ function safeAssetSummary(asset) {
 }
 function safeSnapshot(snapshot) {
   if (!snapshot) return null;
-  const { idempotency_key: _idempotencyKey, input_validation: _inputValidation, ...safe } = snapshot;
+  const { idempotency_key: _idempotencyKey, input_validation: _inputValidation, storyboard_voices: storyboardVoices, ...safe } = snapshot;
+  if (Array.isArray(storyboardVoices)) safe.storyboard_voice_bindings = storyboardVoices.map(voiceIdentity);
   return { ...safe, original_prompt: originalPromptFromSnapshot(snapshot), assets: Array.isArray(snapshot.assets) ? snapshot.assets.map(safeAssetSummary) : [] };
 }
 function originalPromptFromSnapshot(snapshot, fallback = '') {
@@ -1038,7 +1099,8 @@ function retry(db, log, id, billingUser) {
   const generation = db.prepare('SELECT status, error_msg, provider_task_id, drama_id, storyboard_id FROM video_generations WHERE id = ?').get(job.video_generation_id);
   if (!canRetryGeneration(generation)) throw new Error('该任务不是可安全重试的中断或参考素材读取超时任务');
   const snapshot = parse(job.request_snapshot_json);
-  if (!(snapshot?.original_prompt || snapshot?.prompt) || !Array.isArray(snapshot.assets) || !snapshot.assets.length) throw new Error('该任务没有可重试的完整请求快照');
+  if (!(snapshot?.original_prompt || snapshot?.prompt) || !Array.isArray(snapshot.assets)
+    || (!snapshot.assets.length && !snapshot.storyboard_voices?.length)) throw new Error('该任务没有可重试的完整请求快照');
   return create(db, log, {
     source_context: snapshot.source_context || undefined, board_id: snapshot.board_id || undefined, prompt: originalPromptFromSnapshot(snapshot), negative_prompt: snapshot.negative_prompt, model: snapshot.model,
     aspect_ratio: snapshot.aspect_ratio, duration: snapshot.duration, resolution: snapshot.resolution,
@@ -1054,7 +1116,7 @@ function retry(db, log, id, billingUser) {
     })),
     owner_user_id: job.owner_user_id,
     idempotency_key: `omni-video:retry:${job.omni_job_id}`,
-  }, billingUser);
+  }, billingUser, snapshot.storyboard_voices ?? null);
 }
 function resumeSd2WaitingGenerations(db, log) {
   let rows = [];
@@ -1087,7 +1149,7 @@ function resumeSd2WaitingGenerations(db, log) {
         drama_id: job.drama_id || undefined, sequence_id: job.sequence_id || undefined, shot_id: job.shot_id || undefined, storyboard_id: job.storyboard_id || undefined,
         assets: snapshot.assets.map((asset) => ({ asset_id: asset.asset_id, alias: asset.alias, role: asset.role, usage: asset.usage, ordinal: asset.ordinal, send_to_model: asset.send_to_model, url: asset.url || null, local_path: asset.local_path || null, type: asset.type || 'image' })),
         owner_user_id: job.owner_user_id, idempotency_key: snapshot.idempotency_key || undefined, __sd2_waiting_generation_id: job.video_generation_id,
-      }, { id: job.owner_user_id, role: job.user_role || 'user' });
+      }, { id: job.owner_user_id, role: job.user_role || 'user' }, snapshot.storyboard_voices ?? null);
     } catch (error) {
       // Still processing is normal; only terminal certification failures should
       // surface to the user, and never create a billing authorization.  A

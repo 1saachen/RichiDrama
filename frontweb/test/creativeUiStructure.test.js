@@ -64,7 +64,7 @@ test('自由创作报价由后端按模型的有效计量单位计算', async ()
   assert.match(quoteHandler, /model: currentCapability\.value\.model/)
   assert.match(quoteHandler, /duration: normalizeDuration\(duration\.value\)/)
   assert.match(source, /quoteHasVideoInput = computed\(\(\) => requestMaterialRouting\.value\.sent\.video > 0\)/)
-  assert.match(source, /quoteHasAudioInput = computed\(\(\) => requestMaterialRouting\.value\.sent\.audio > 0\)/)
+  assert.match(source, /quoteHasAudioInput = computed\(\(\) => manualReferenceAudioCount\.value > 0 \|\| storyboardVoices\.value\.length > 0\)/)
   assert.match(quoteHandler, /has_video_input: quoteHasVideoInput\.value/)
   assert.match(quoteHandler, /has_audio: quoteHasAudioInput\.value/)
   assert.doesNotMatch(quoteHandler, /usage:\s*\{\s*second:/)
@@ -584,7 +584,7 @@ test('project storyboard generation settings include the video generation quote'
   assert.match(filmCreate, /<FreeCreate[\s\S]*embedded/)
   assert.match(freeCreate, /<GenerationSettings[\s\S]*include-generation-quote[\s\S]*:has-video-input="quoteHasVideoInput"[\s\S]*:has-audio-input="quoteHasAudioInput"/)
   assert.match(freeCreate, /quoteHasVideoInput = computed\(\(\) => requestMaterialRouting\.value\.sent\.video > 0\)/)
-  assert.match(freeCreate, /quoteHasAudioInput = computed\(\(\) => requestMaterialRouting\.value\.sent\.audio > 0\)/)
+  assert.match(freeCreate, /quoteHasAudioInput = computed\(\(\) => manualReferenceAudioCount\.value > 0 \|\| storyboardVoices\.value\.length > 0\)/)
 })
 
 test('运营页面始终提供单一路径返回', async () => {
