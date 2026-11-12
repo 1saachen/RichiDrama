@@ -147,7 +147,7 @@ function storyboardVoiceReferences(db, dramaId, storyboardId) {
 
 function voiceIdentity({ character_id, name, revision }) { return { character_id, name, revision }; }
 
-function create(db, log, body, billingUser, savedVoices = null) {
+function create(db, log, body, billingUser, savedVoices = null, savedResolutions = null) {
   body = { ...(body || {}) };
   if (!String(body.model || '').trim() || String(body.model).trim() === 'auto') throw new Error('请选择一个明确的视频模型');
   const prompt = String(body.prompt || '').trim();
@@ -176,7 +176,11 @@ function create(db, log, body, billingUser, savedVoices = null) {
   const assets = prioritizePromptReferenceAssets(input.map((entry, ordinal) => resolveAsset(db, entry, ordinal, body.owner_user_id)), body.prompt_document, prompt);
   const capability = capabilityService.resolve(db, body.model, assets, tenantOptions);
   if (!capability.model) throw new Error('请先在 AI 配置中启用视频模型');
-  capabilityService.validateResolution(capability, body.resolution);
+  // Only background recovery receives the limits under which the job was admitted.
+  const resolutionCapability = Array.isArray(savedResolutions) && capability.model === body.model
+    ? { ...capability, limits: { ...capability.limits, resolutions: savedResolutions } }
+    : capability;
+  capabilityService.validateResolution(resolutionCapability, body.resolution);
   capabilityService.validateAspectRatio(capability, body.aspect_ratio);
   validateShotAssetLimits(assets, capability);
   const relayProfile = capability.provider === 'richbest' ? require('./richbestProvider').videoProfile(capability.model) : null;
@@ -309,7 +313,7 @@ function create(db, log, body, billingUser, savedVoices = null) {
     : Number(job.lastInsertRowid);
   if (existingWaitingId) {
     db.prepare('UPDATE omni_video_jobs SET prompt = ?, negative_prompt = ?, model_resolved = ?, capability_snapshot_json = ?, request_snapshot_json = ?, preprocess_snapshot_json = ?, input_summary_json = ?, updated_at = ? WHERE id = ?')
-      .run(modelPrompt, body.negative_prompt || null, capability.model, JSON.stringify({ supports: capability.supports, limits: capability.limits, reason: capability.reason }), JSON.stringify(requestSnapshot), JSON.stringify(routed.filter((asset) => asset.strategy !== 'native').map(publicAsset)), JSON.stringify(buildSummary(routed)), now, jobId);
+      .run(modelPrompt, body.negative_prompt || null, capability.model, JSON.stringify({ supports: capability.supports, limits: resolutionCapability.limits, reason: capability.reason }), JSON.stringify(requestSnapshot), JSON.stringify(routed.filter((asset) => asset.strategy !== 'native').map(publicAsset)), JSON.stringify(buildSummary(routed)), now, jobId);
     db.prepare('DELETE FROM omni_video_job_assets WHERE omni_job_id = ?').run(jobId);
   }
   const insertAsset = db.prepare(`INSERT INTO omni_video_job_assets (omni_job_id, asset_id, ordinal, alias, media_type, role, usage, send_to_model, derived_asset_id, snapshot_json, created_at)
@@ -1149,7 +1153,8 @@ function resumeSd2WaitingGenerations(db, log) {
         drama_id: job.drama_id || undefined, sequence_id: job.sequence_id || undefined, shot_id: job.shot_id || undefined, storyboard_id: job.storyboard_id || undefined,
         assets: snapshot.assets.map((asset) => ({ asset_id: asset.asset_id, alias: asset.alias, role: asset.role, usage: asset.usage, ordinal: asset.ordinal, send_to_model: asset.send_to_model, url: asset.url || null, local_path: asset.local_path || null, type: asset.type || 'image' })),
         owner_user_id: job.owner_user_id, idempotency_key: snapshot.idempotency_key || undefined, __sd2_waiting_generation_id: job.video_generation_id,
-      }, { id: job.owner_user_id, role: job.user_role || 'user' }, snapshot.storyboard_voices ?? null);
+      }, { id: job.owner_user_id, role: job.user_role || 'user' }, snapshot.storyboard_voices ?? null,
+      parse(job.capability_snapshot_json)?.limits?.resolutions ?? null);
     } catch (error) {
       // Still processing is normal; only terminal certification failures should
       // surface to the user, and never create a billing authorization.  A

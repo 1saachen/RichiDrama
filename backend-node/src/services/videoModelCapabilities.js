@@ -16,6 +16,7 @@ const DEFAULT_LIMITS = {
   duration: { min: 4, max: 15, step: 1 },
   resolutions: ['480p', '720p', '1080p'],
 };
+const SEEDANCE20_FAST_MINI_RESOLUTIONS = ['480p', '720p'];
 
 function parseSettings(raw) {
   if (!raw) return {};
@@ -55,8 +56,8 @@ function seedance25Limits(model) {
 }
 
 function seedance20FastLimits(model) {
-  return /seedance[-_]?2[-_]?0[-_]?fast|2[-_]?0[-_]?fast[-_]?260128/i.test(String(model || ''))
-    ? { duration: { min: 4, max: 15, step: 1 }, resolutions: ['480p', '720p'] }
+  return /seedance[-_.]?2[-_.]?0[-_.]?fast|2[-_.]?0[-_.]?fast[-_.]?260128/i.test(String(model || ''))
+    ? { duration: { min: 4, max: 15, step: 1 }, resolutions: SEEDANCE20_FAST_MINI_RESOLUTIONS }
     : {};
 }
 
@@ -78,13 +79,22 @@ function modelLimits(settings, declared, model, config = null) {
     aspect_ratios: ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16'],
   };
   const shared = declared.limits || settings.video_limits || {};
+  const fastLimits = seedance20FastLimits(model);
   const limits = {
     ...DEFAULT_LIMITS,
     ...shared,
     ...seedance25Limits(model),
-    ...seedance20FastLimits(model),
+    ...fastLimits,
     ...configuredModelLimits(settings, model),
   };
+  const isMini = /seedance[-_.]?2[-_.]?0[-_.]?mini(?=$|[-_.])/i.test(String(model || '').trim());
+  if (fastLimits.resolutions || isMini) {
+    const configured = Array.isArray(limits.resolutions)
+      ? limits.resolutions.map((value) => String(value).trim().toLowerCase())
+      : [];
+    const available = SEEDANCE20_FAST_MINI_RESOLUTIONS.filter((resolution) => configured.includes(resolution));
+    limits.resolutions = available.length ? available : [...SEEDANCE20_FAST_MINI_RESOLUTIONS];
+  }
   if (Array.isArray(limits.aspect_ratios) && limits.aspect_ratios.length) return limits;
   const protocol = String(config?.api_protocol || '').trim().toLowerCase();
   const provider = String(config?.provider || '').trim().toLowerCase();
