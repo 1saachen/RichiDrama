@@ -308,7 +308,23 @@ test('project HTTP permissions, concurrent text, copies and restart persistence'
   assert.equal((await request(editor.token, 'GET', prefix)).status, 404);
   assert.equal((await request(editor.token, 'GET', `/assets/${copy.body.data.id}`)).status, 404);
   assert.equal((await mediaRequest(editor.token)).status, 404);
+  const legacyEpisode = db.prepare('INSERT INTO episodes (drama_id,episode_number,title) VALUES (?,1,?)').run(legacyId, '历史集').lastInsertRowid;
+  const legacyShot = db.prepare('INSERT INTO storyboards (episode_id,storyboard_number,title,status,video_url) VALUES (?,1,?,?,?)')
+    .run(legacyEpisode, '历史分镜', 'completed', '/static/videos/legacy.mp4').lastInsertRowid;
+  const legacyVideo = db.prepare(`INSERT INTO video_generations
+    (drama_id,storyboard_id,owner_user_id,status,local_path,poster_local_path,created_at,updated_at)
+    VALUES (?,?,?,'completed','videos/legacy.mp4','videos/legacy.jpg',datetime('now'),datetime('now'))`)
+    .run(legacyId, legacyShot, owner.id).lastInsertRowid;
+  db.prepare('UPDATE storyboards SET active_video_generation_id=? WHERE id=?').run(legacyVideo, legacyShot);
+  const legacyShotsRoute = `/episodes/${legacyEpisode}/storyboards`;
+  const defaultLegacyShot = (await request(owner.token, 'GET', legacyShotsRoute)).body.data.storyboards[0];
+  assert.equal(defaultLegacyShot.poster_local_path, null);
+  const optedInShot = { ...defaultLegacyShot, poster_local_path: 'videos/legacy.jpg' };
+  assert.deepEqual((await request(owner.token, 'GET', legacyShotsRoute + '?include_video_posters=1')).body.data.storyboards[0], optedInShot);
+  assert.equal((await request(stranger.token, 'GET', legacyShotsRoute + '?include_video_posters=1')).status, 404);
+
   await stop(); await start();
+  assert.deepEqual((await request(owner.token, 'GET', legacyShotsRoute + '?include_video_posters=1')).body.data.storyboards[0], optedInShot);
   const legacyAfter = (await request(owner.token, 'GET', `/dramas/${legacyId}`)).body.data;
   assert.equal(legacyAfter.title, legacyBefore.title);
   assert.deepEqual(legacyAfter.metadata, legacyBefore.metadata);

@@ -53,8 +53,15 @@
         <div ref="shotListRef" class="shot-list" tabindex="0" aria-label="镜头列表，可用上下方向键或滚轮切换镜头" @keydown.up.prevent="selectRelative(-1)" @keydown.down.prevent="selectRelative(1)" @wheel.prevent="onShotListWheel">
           <article v-for="(shot, index) in shots" :key="shot.id" class="shot-card" :class="{ active: shot.id === activeShotId, dragging: draggedShotId === shot.id }" :aria-current="shot.id === activeShotId ? 'true' : undefined" :draggable="!projectSession.enabled || projectSession.canEdit" @dragstart="draggedShotId = shot.id" @dragend="draggedShotId = null" @dragover.prevent @drop="dropShot(shot.id)" @click="selectShot(shot)">
             <div class="shot-title"><span class="drag-handle">⠿</span><span class="shot-number">{{ index + 1 }}</span><b :title="shot.title || '未命名镜头'">{{ shot.title || '未命名镜头' }}</b><span class="shot-controls"><el-button text size="small" :disabled="reproductionMode" title="复制镜头" aria-label="复制镜头" @click.stop="copyShot(shot)"><el-icon><CopyDocument /></el-icon></el-button><el-button text size="small" :disabled="reproductionMode" title="重命名镜头" aria-label="重命名镜头" @click.stop="renameShot(shot)"><el-icon><Edit /></el-icon></el-button><el-button class="shot-delete" text size="small" :disabled="shots.length <= 1 || reproductionMode" :title="shots.length <= 1 ? '至少保留一个镜头；请先新增镜头再删除当前镜头' : '删除镜头'" aria-label="删除镜头" @click.stop="removeShot(shot)"><el-icon><Delete /></el-icon></el-button></span></div>
-            <div class="shot-preview"><video v-if="shotPreviewUrl(shot)" :src="shotPreviewUrl(shot)" :poster="shot.poster_local_path ? `/static/${String(shot.poster_local_path).replace(/^\/+/, '')}` : undefined" muted playsinline preload="metadata" /><div v-else class="shot-video-placeholder" :aria-label="shotGenerationInProgress(shot) ? '视频生成中' : '尚未生成视频'"><span class="shot-play">{{ shotGenerationInProgress(shot) ? '…' : '▶' }}</span></div><span>{{ shot.settings?.duration || 15 }}s</span></div>
+            <div class="shot-preview">
+              <img v-if="shot.poster_local_path && !shotGenerationInProgress(shot)" :src="`/static/${String(shot.poster_local_path).replace(/^\/+/, '')}`" loading="lazy" decoding="async" alt="" />
+              <div v-else class="shot-video-placeholder" :aria-label="shotGenerationInProgress(shot) ? '视频生成中' : (shot.video_url ? '可预览视频' : '尚未生成视频')">
+                <span class="shot-play">{{ shotGenerationInProgress(shot) ? '…' : '▶' }}</span>
+              </div>
+              <span>{{ shot.settings?.duration || 15 }}s</span>
+            </div>
             <div class="shot-state" :class="shot.status"><i></i>{{ shotState(shot) }}</div>
+            <el-button v-if="failedShotSaves.has(shot.id)" type="warning" text size="small" @click.stop="retryShotSave(shot)">草稿未保存，重试</el-button>
           </article>
         </div>
       </aside>
@@ -474,13 +481,15 @@ let wheelShotTimer = null
 const shotHistory = ref([]), shotHistoryShotId = ref(null), selectedHistoryJobId = ref(null)
 const reproductionMode = ref(null)
 let saveTimer = null
-let promptRevision = 0
-let hasLocalShotChanges = false
+const shotDrafts = new Map()
+const queuedDraftSaves = new WeakMap()
+const failedShotSaves = reactive(new Set())
 let projectGenerationRevision = 0
 let activeShotEditBaseline
 let displayedGenerationState = []
 let activeGenerationEditState = []
 let shotSelectionRevision = 0
+let shotHistoryRevision = 0
 let applyingRemoteInputs = false
 let collaborationRefresh = null
 let collaborationRefreshPending = false
@@ -521,7 +530,8 @@ function currentPromptDraftIdentity(shotId = currentShot.value?.id) {
 function currentPromptDraftPayload() {
   return {
     prompt: prompt.value,
-    promptDocument: { ...(promptDocument.value || {}), text: prompt.value },
+    promptDocument: { ...promptDocument.value, text: prompt.value, refs: (promptDocument.value?.refs || []).map(ref => ({ ...ref })) },
+    generationDirty: projectGenerationDirty.value,
     settings: {
       model: model.value, creationMode: creationMode.value, aspectRatio: aspectRatio.value,
       duration: duration.value, resolution: resolution.value, upscaleResolution: upscaleResolution.value, targetFps: targetFps.value, audioStrategy: audioStrategy.value,
@@ -535,15 +545,24 @@ function currentPromptDraftPayload() {
 
 function persistCurrentPromptDraft() {
   if (loadingShot.value || applyingRemoteInputs || reproductionMode.value || !currentShot.value) return
-  hasLocalShotChanges = true
-  promptRevision += 1
-  writePromptDraft(localStorage, currentPromptDraftIdentity(), currentPromptDraftPayload())
+  const payload = currentPromptDraftPayload()
+  let draft
+  try { draft = writePromptDraft(localStorage, currentPromptDraftIdentity(), payload) }
+  catch (error) { console.warn('[FreeCreate] local draft storage:', error.message) }
+  shotDrafts.set(currentShot.value.id, {
+    ...draft, payload, editBaseline: activeShotEditBaseline, generationBaseline: activeGenerationEditState,
+  })
 }
 
 function restorePromptDraftForShot(shot) {
-  const draft = readPromptDraft(localStorage, currentPromptDraftIdentity(shot?.id))
-  if (!draft || !shouldRestorePromptDraft(draft, shot?.updated_at)) return false
+  const localDraft = shotDrafts.get(shot.id)
+  const draft = localDraft || readPromptDraft(localStorage, currentPromptDraftIdentity(shot.id))
+  if (!localDraft && !shouldRestorePromptDraft(draft, shot.updated_at)) return
+  if (!localDraft) {
+    shotDrafts.set(shot.id, { ...draft, editBaseline: activeShotEditBaseline, generationBaseline: activeGenerationEditState })
+  }
   const saved = draft.payload || {}
+  projectGenerationDirty.value = !!saved.generationDirty
   prompt.value = saved.prompt == null ? '' : String(saved.prompt)
   promptDocument.value = saved.promptDocument && typeof saved.promptDocument === 'object'
     ? { ...saved.promptDocument, text: prompt.value }
@@ -569,11 +588,10 @@ function restorePromptDraftForShot(shot) {
       if (asset && savedAsset.usage) asset.usage = savedAsset.usage
     })
   }
-  if (!restoredDraftNoticeShown) {
+  if (!localDraft && !restoredDraftNoticeShown) {
     restoredDraftNoticeShown = true
     ElMessage.info('已恢复刷新前尚未保存的提示词草稿')
   }
-  return true
 }
 
 const currentShot = computed(() => shots.value.find((shot) => shot.id === activeShotId.value) || null)
@@ -852,7 +870,6 @@ function assetRouteHint(asset) {
   return '按当前模型能力处理'
 }
 function shotGenerationInProgress(shot) { return activeGenerationStatuses.has(shot?.status) }
-function shotPreviewUrl(shot) { return shotGenerationInProgress(shot) ? '' : shot?.video_url || '' }
 function shotState(shot) { return ({ completed:'已完成',sd2_waiting:'真人素材认证中',processing:'生成中',upscale_pending:'等待画质增强',upscaling:'画质增强中',interpolation_pending:'等待补帧',interpolating:'画面补帧中',persisting:'保存中',billing_reconciliation:'等待结算',failed:'失败',retryable:'可重试',invalid:'无效',draft:'草稿' })[shot.status] || '草稿' }
 function historyStatus(status) { return ({ completed: '已完成', sd2_waiting: '真人素材认证中', processing: '生成中', upscale_pending: '等待画质增强', upscaling: '画质增强中', interpolation_pending: '等待补帧', interpolating: '画面补帧中', persisting: '保存中', billing_reconciliation: '等待结算', failed: '失败', retryable: '可重试', invalid: '无效' })[status] || '状态未知' }
 function postprocessSummary(job) {
@@ -914,7 +931,7 @@ function promptDocumentFor(text, preferredAssetIds = []) {
   })
   return { text: value, refs }
 }
-function projectShot(storyboard, video = null) {
+function projectShot(storyboard) {
   const { omni_asset_ids, omni_asset_usage, ...rest } = storyboard
   const ids = Array.isArray(omni_asset_ids) ? omni_asset_ids.map(Number).filter(Number.isFinite) : []
   const usage = omni_asset_usage || {}
@@ -923,13 +940,12 @@ function projectShot(storyboard, video = null) {
   const assetIds = [...ids]
   if (firstFrameId && !assetIds.includes(firstFrameId)) assetIds.push(firstFrameId)
   if (lastFrameId && !assetIds.includes(lastFrameId)) assetIds.push(lastFrameId)
-  const videoUrl = video ? localVideoUrl(video) : storyboard.video_url
-  const rawStatus = video?.status || storyboard.status
+  const videoUrl = storyboard.video_url
+  const rawStatus = storyboard.status
   return {
     ...rest,
     editBaseline: { ...JSON.parse(JSON.stringify(storyboard)), __projectId: projectDramaId.value, __projectRevision: projectSnapshot('storyboards', storyboard.id)?.__projectRevision },
     video_url: videoUrl,
-    poster_local_path: video?.poster_local_path || storyboard.poster_local_path || null,
     status: videoUrl && ['pending', 'draft', '', null, undefined].includes(rawStatus) ? 'completed' : rawStatus,
     prompt: storyboard.universal_segment_text || storyboard.video_prompt || '',
     prompt_document: storyboard.omni_prompt_document || promptDocumentFor(storyboard.universal_segment_text || storyboard.video_prompt || '', assetIds),
@@ -983,48 +999,31 @@ function openMediaLibrary() {
     },
   })
 }
-async function loadProjectVideos(storyboards) {
-  const groups = await Promise.all((storyboards || []).map(async (storyboard) => {
-    const result = await videosAPI.list({
-      storyboard_id: storyboard.id,
-      page_size: 20,
-    })
-    const videos = result?.items || []
-    const current = videos.find(video => Number(storyboard.active_video_generation_id) > 0 && Number(video.id) === Number(storyboard.active_video_generation_id) && video.status === 'completed' && !!localVideoUrl(video))
-    return [Number(storyboard.id), current || (storyboard.playback_video_generation_id ? null : videos.find(video => pendingPreviewStatuses.has(video.status)) || bestPlayableVideo(videos))]
-  }))
-  return new Map(groups)
-}
-function applyProjectVideoSources(storyboards, videos) {
-  shots.value = storyboards.map((storyboard) => projectShot(storyboard, videos.get(Number(storyboard.id))))
-  jobs.value = jobs.value.map((job) => {
-    const shot = shots.value.find((item) => Number(item.omni_job_id) === Number(job.id))
-    const video = videos.get(Number(shot?.id))
-    return video ? { ...job, videoUrl: localVideoUrl(video), generation: { ...(job.generation || {}), ...video } } : job
-  })
+function loadProjectStoryboards() {
+  return dramaAPI.getStoryboards(projectEpisodeId.value, { include_video_posters: 1 })
 }
 async function refreshProjectShots(preferredId = activeShotId.value, { light = false } = {}) {
-  const [result, generationContract] = await Promise.all([dramaAPI.getStoryboards(projectEpisodeId.value), storyboardsAPI.getEpisodeGenerationSettings(projectEpisodeId.value)])
-  const storyboards = result?.storyboards || []
-  if (light) {
-    // 高频轮询(如外部 AI 生成分镜期间)跳过逐镜视频查询,沿用已加载的 video_url,
-    // 只让新解析出的分镜实时出现在镜头列表中
-    const prevVideoUrls = new Map(shots.value.map((shot) => [Number(shot.id), shot.video_url]))
-    shots.value = storyboards.map((storyboard) => {
-      const shot = projectShot(storyboard)
-      return { ...shot, video_url: prevVideoUrls.get(Number(storyboard.id)) || shot.video_url }
-    })
-    applyGenerationContract(generationContract)
-    const target = shots.value.find((shot) => Number(shot.id) === Number(preferredId)) || shots.value[0] || null
-    if (target && Number(target.id) !== Number(activeShotId.value)) loadShot(target)
-    else if (!target) activeShotId.value = null
-    return
-  }
-  applyProjectVideoSources(storyboards, await loadProjectVideos(storyboards))
+  const selection = shotSelectionRevision
+  const [result, generationContract] = await Promise.all([
+    loadProjectStoryboards(), storyboardsAPI.getEpisodeGenerationSettings(projectEpisodeId.value),
+  ])
+  if (pollLifecycleStopped) return
+  const previous = new Map(shots.value.map(shot => [shot.id, shot]))
+  shots.value = (result?.storyboards || []).map(storyboard => {
+    const shot = projectShot(storyboard)
+    const old = previous.get(shot.id)
+    if (old && old.active_video_generation_id === shot.active_video_generation_id
+      && old.playback_video_generation_id === shot.playback_video_generation_id
+      && !shotGenerationInProgress(shot) && (!shot.video_url || shot.video_url === old.video_url)) {
+      shot.video_url ||= old.video_url
+      shot.poster_local_path ||= old.poster_local_path
+    }
+    return shot
+  })
   applyGenerationContract(generationContract)
-  const target = shots.value.find((shot) => Number(shot.id) === Number(preferredId)) || shots.value[0] || null
-  if (target) loadShot(target)
-  else activeShotId.value = null
+  const target = findShotById(shots.value, selection === shotSelectionRevision ? preferredId : activeShotId.value) || shots.value[0]
+  if (target && (!light || target.id !== activeShotId.value)) loadShot(target)
+  else if (!target) activeShotId.value = null
 }
 async function refreshCollaboration() {
   if (!isProjectMode.value || reproductionMode.value) return
@@ -1036,7 +1035,7 @@ async function refreshCollaboration() {
       collaborationRefreshPending = false
       const shotId = activeShotId.value
       const readBaseline = JSON.stringify(activeShotEditBaseline)
-      const result = await dramaAPI.getStoryboards(projectEpisodeId.value)
+      const result = await loadProjectStoryboards()
       const media = await loadProjectScopedAssets()
       if (pollLifecycleStopped) return
       if (shotSavesPending) { collaborationRefreshPending = true; return }
@@ -1299,10 +1298,54 @@ async function loadFreeScopedAssets() {
   return { items: [...(global.items || []), ...(project.items || [])] }
 }
 
-function loadShot(shot) { activeShotEditBaseline = shot.editBaseline ? JSON.parse(JSON.stringify(shot.editBaseline)) : undefined; activeGenerationEditState = JSON.parse(JSON.stringify(displayedGenerationState)); shotSelectionRevision += 1; loadingShot.value = true; projectGenerationDirty.value = false; activeShotId.value = shot.id; shotHistory.value = []; shotHistoryShotId.value = shot.id; selectedHistoryJobId.value = null; prompt.value = shot.prompt ?? ''; promptDocument.value = shot.prompt_document || promptDocumentFor(prompt.value); const settings = shot.settings || {}; model.value = settings.model === 'auto' ? '' : (settings.model || ''); creationMode.value = settings.creation_mode || 'multi_reference'; aspectRatio.value = settings.aspect_ratio || '16:9'; duration.value = normalizeDuration(settings.duration || 5); resolution.value = settings.resolution || '720p'; upscaleResolution.value = settings.upscale_resolution || null; targetFps.value = settings.target_fps || null; audioStrategy.value = settings.audio_strategy || 'reference_only'; keepOriginalAudio.value = !!settings.keep_original_audio; audioVolume.value = settings.audio_volume ?? 1; audioFadeSeconds.value = settings.audio_fade_seconds ?? 0; const materialIds = (shot.assets || []).map((item) => Number(item.asset_id)).filter((id) => assets.value.some((asset) => asset.id === id)); const firstFrameId = Number(shot.omni_first_frame_asset_id) || null; const lastFrameId = Number(shot.omni_last_frame_asset_id) || null; selectedOrder.value = [...new Set(materialIds)]; (shot.assets || []).forEach((saved) => { const asset = assets.value.find((item) => item.id === Number(saved.asset_id)); if (asset) asset.usage = Number(saved.asset_id) === firstFrameId ? 'first_frame' : Number(saved.asset_id) === lastFrameId ? 'last_frame' : saved.usage || asset.usage }); hasLocalShotChanges = restorePromptDraftForShot(shot); setPromptReferences(promptDocument.value); loadShotHistory(shot); queueMicrotask(() => { loadingShot.value = false; projectGenerationDirty.value = false }) }
+function loadShot(shot) {
+  const draft = shotDrafts.get(shot.id)
+  activeShotEditBaseline = draft?.editBaseline || (shot.editBaseline && JSON.parse(JSON.stringify(shot.editBaseline)))
+  activeGenerationEditState = draft?.generationBaseline || JSON.parse(JSON.stringify(displayedGenerationState))
+  const selection = ++shotSelectionRevision
+  loadingShot.value = true
+  projectGenerationDirty.value = false
+  activeShotId.value = shot.id
+  shotHistory.value = []
+  shotHistoryShotId.value = shot.id
+  selectedHistoryJobId.value = null
+  prompt.value = shot.prompt ?? ''
+  promptDocument.value = shot.prompt_document || promptDocumentFor(prompt.value)
+  const settings = shot.settings || {}
+  model.value = settings.model === 'auto' ? '' : (settings.model || '')
+  creationMode.value = settings.creation_mode || 'multi_reference'
+  aspectRatio.value = settings.aspect_ratio || '16:9'
+  duration.value = normalizeDuration(settings.duration || 5)
+  resolution.value = settings.resolution || '720p'
+  upscaleResolution.value = settings.upscale_resolution || null
+  targetFps.value = settings.target_fps || null
+  audioStrategy.value = settings.audio_strategy || 'reference_only'
+  keepOriginalAudio.value = !!settings.keep_original_audio
+  audioVolume.value = settings.audio_volume ?? 1
+  audioFadeSeconds.value = settings.audio_fade_seconds ?? 0
+  const assetsById = new Map(assets.value.map(asset => [Number(asset.id), asset]))
+  const materialIds = []
+  for (const saved of shot.assets || []) {
+    const assetId = Number(saved.asset_id)
+    const asset = assetsById.get(assetId)
+    if (!asset) continue
+    materialIds.push(assetId)
+    asset.usage = assetId === Number(shot.omni_first_frame_asset_id) ? 'first_frame'
+      : assetId === Number(shot.omni_last_frame_asset_id) ? 'last_frame' : saved.usage || asset.usage
+  }
+  selectedOrder.value = [...new Set(materialIds)]
+  restorePromptDraftForShot(shot)
+  setPromptReferences(promptDocument.value)
+  void loadShotHistory(shot)
+  queueMicrotask(() => {
+    if (selection === shotSelectionRevision) loadingShot.value = false
+  })
+}
 async function loadShotHistory(shot) {
   if (!shot?.id) return
   const shotId = Number(shot.id)
+  const request = ++shotHistoryRevision
+  const isCurrent = () => !pollLifecycleStopped && request === shotHistoryRevision && Number(activeShotId.value) === shotId
   try {
     const playbackId = Number(shot.playback_video_generation_id) || null
     const [result, videoResult, playbackResult] = await Promise.all([
@@ -1315,7 +1358,7 @@ async function loadShotHistory(shot) {
       // empty and version/frame actions stay hidden.
       playbackId ? videosAPI.get(playbackId).catch(() => null) : Promise.resolve(null),
     ])
-    if (Number(currentShot.value?.id) !== shotId) return
+    if (!isCurrent()) return
     const jobs = (result || []).map(normalizeJob)
     const currentVideo = (videoResult?.items || []).find(video => Number(shot.active_video_generation_id) > 0 && Number(video.id) === Number(shot.active_video_generation_id) && video.status === 'completed' && !!localVideoUrl(video))
     const playableVideo = currentVideo || (shot.playback_video_generation_id ? null : bestPlayableVideo(videoResult?.items))
@@ -1337,17 +1380,16 @@ async function loadShotHistory(shot) {
         ? null : shotHistory.value.find(job => pendingPreviewStatuses.has(job.status))?.id ?? null
     }
     jobs.filter((job) => activeGenerationStatuses.has(job.status)).forEach((job) => poll(job.id))
-  } catch (error) { if (Number(currentShot.value?.id) === shotId) ElMessage.warning(error?.message || '当前镜头的生成记录加载失败，请稍后刷新') }
+  } catch (error) { if (isCurrent()) ElMessage.warning(error?.message || '当前镜头的生成记录加载失败，请稍后刷新') }
 }
 async function selectShot(shot) {
+  if (creating.value) return false
   const requestedShotId = shot?.id
-  const selectionRevision = ++shotSelectionRevision
   if (Number(requestedShotId) === Number(activeShotId.value)) { playOnSelection.value = true; return true }
   if (reproductionMode.value) await exitReproduction()
-  await saveCurrentShot(false)
-  if (selectionRevision !== shotSelectionRevision) return false
   const target = findShotById(shots.value, requestedShotId)
   if (!target) return false
+  saveShotInBackground()
   playOnSelection.value = true
   loadShot(target)
   return true
@@ -1375,16 +1417,37 @@ async function saveStoryboardCharacters(characterIds) {
   }
 }
 
+function settleSavedDraft(shotId, identity, savedDraft, updatedAt) {
+  const latest = shotDrafts.get(shotId)
+  if (!latest) return
+  if (latest === savedDraft) {
+    shotDrafts.delete(shotId)
+    failedShotSaves.delete(shotId)
+  }
+  try {
+    const stored = readPromptDraft(localStorage, identity)
+    if (!stored || stored.savedAt !== latest.savedAt || !equalProjectValue(stored.payload, latest.payload)) return
+    if (latest === savedDraft) clearPromptDraft(localStorage, identity)
+    else if (!shouldRestorePromptDraft(stored, updatedAt)) {
+      latest.savedAt = writePromptDraft(localStorage, identity, latest.payload, Math.max(Date.now(), Date.parse(updatedAt) + 1)).savedAt
+    }
+  } catch (error) {
+    console.warn('[FreeCreate] local draft storage:', error.message)
+  }
+}
+
 async function saveCurrentShot(showMessage = true) {
   if (!sequence.value || !currentShot.value || loadingShot.value || reproductionMode.value) return
   clearTimeout(saveTimer)
   const savingShot = currentShot.value
   const savingShotId = savingShot.id
+  const savingDraft = shotDrafts.get(savingShotId)
+  if (!savingDraft && !showMessage) return
+  if (savingDraft && queuedDraftSaves.has(savingDraft)) return queuedDraftSaves.get(savingDraft)
   const savingShotTitle = savingShot.title
   const savingSequenceId = sequence.value.id
   const savingSequenceName = sequence.value.name
   const savingIdentity = currentPromptDraftIdentity(savingShotId)
-  const savingRevision = promptRevision
   const savingPrompt = prompt.value
   const savingPromptDocument = { ...promptDocument.value, text: savingPrompt, refs: (promptDocument.value?.refs || []).map((item) => ({ ...item })) }
   const savingAssets = chosenAssets.value.map((asset, index) => ({ asset_id: Number(asset.id), alias: assetDisplayName(asset), type: asset.type, usage: asset.usage || 'reference', ordinal: index + 1 }))
@@ -1395,7 +1458,7 @@ async function saveCurrentShot(showMessage = true) {
   const savingEditBaseline = activeShotEditBaseline
   const savingGenerationBaseline = activeGenerationEditState
   shotSavesPending += 1
-  return enqueueShotSave(savingShotId, async () => {
+  const operation = enqueueShotSave(savingShotId, async () => {
     const target = findShotById(shots.value, savingShotId)
     if (!target) return
     if (savingProjectMode) {
@@ -1415,16 +1478,24 @@ async function saveCurrentShot(showMessage = true) {
         omni_first_frame_asset_id: savingAssets.find((asset) => asset.usage === 'first_frame')?.asset_id || null,
         omni_last_frame_asset_id: savingAssets.find((asset) => asset.usage === 'last_frame')?.asset_id || null,
       }
-      const updated = await storyboardsAPI.update(savingShotId, changes, savingEditBaseline ? { projectBaseline: savingEditBaseline } : undefined)
+      const updated = await storyboardsAPI.update(savingShotId, changes, {
+        ...(savingEditBaseline ? { projectBaseline: savingEditBaseline } : {}), errorHandledLocally: true,
+      })
       advanceProjectEdit(savingEditBaseline, changes, updated)
       mergeSavedShot(shots.value, savingShotId, projectShot(updated), { preserveMedia: true })
-      if (savingAssets.some((asset, index) => Number(updated.omni_asset_ids?.[index]) !== asset.asset_id) && Number(activeShotId.value) === Number(savingShotId)) {
-        const refreshedAssets = await loadProjectScopedAssets()
-        assets.value = refreshedAssets.items
-        selectedOrder.value = (updated.omni_asset_ids || []).map(Number)
-        promptDocument.value = { ...(updated.omni_prompt_document || savingPromptDocument), text: prompt.value }
+      const canSyncEditor = () => !pollLifecycleStopped && activeShotId.value === savingShotId && shotDrafts.get(savingShotId) === savingDraft
+      if (canSyncEditor() && !equalProjectValue(updated.omni_asset_ids || [], ids)) {
+        const refreshedAssets = await loadProjectScopedAssets().catch(() => null)
+        if (refreshedAssets && canSyncEditor()) {
+          applyingRemoteInputs = true
+          assets.value = refreshedAssets.items
+          selectedOrder.value = (updated.omni_asset_ids || []).map(Number)
+          promptDocument.value = { ...(updated.omni_prompt_document || savingPromptDocument), text: prompt.value }
+          await nextTick()
+          applyingRemoteInputs = false
+        }
       }
-      if (savingRevision === promptRevision && Number(activeShotId.value) === Number(savingShotId)) { hasLocalShotChanges = false; clearPromptDraft(localStorage, savingIdentity) }
+      settleSavedDraft(savingShotId, savingIdentity, savingDraft, updated.updated_at)
       if (showMessage) ElMessage.success('当前项目分镜已保存')
       return
     }
@@ -1435,14 +1506,37 @@ async function saveCurrentShot(showMessage = true) {
     mergeSavedShot(shots.value, savingShotId, updated)
     if (Number(sequence.value?.id) === Number(savingSequenceId)) sequence.value.name = savedSequence.name
     if (showMessage) ElMessage.success('整集与当前镜头已保存')
-    if (savingRevision === promptRevision && Number(activeShotId.value) === Number(savingShotId)) { hasLocalShotChanges = false; clearPromptDraft(localStorage, savingIdentity) }
+    settleSavedDraft(savingShotId, savingIdentity, savingDraft, updated.updated_at)
+  }).catch(error => {
+    if (savingDraft && shotDrafts.get(savingShotId) === savingDraft && !failedShotSaves.has(savingShotId)) {
+      failedShotSaves.add(savingShotId)
+      if (!pollLifecycleStopped) ElMessage.error(`「${savingShotTitle || '未命名镜头'}」保存失败，草稿已保留`)
+    }
+    throw error
   }).finally(() => {
+    if (savingDraft) queuedDraftSaves.delete(savingDraft)
     shotSavesPending -= 1
     if (!shotSavesPending && collaborationRefreshPending && !pollLifecycleStopped) void refreshCollaboration()
   })
+  if (savingDraft) queuedDraftSaves.set(savingDraft, operation)
+  return operation
 }
-let autoSaveErrorShown = false
-function scheduleSave() { if (loadingShot.value || applyingRemoteInputs || reproductionMode.value || !currentShot.value) return; clearTimeout(saveTimer); saveTimer = setTimeout(() => saveCurrentShot(false).then(() => { autoSaveErrorShown = false }).catch((error) => { if (!autoSaveErrorShown) { autoSaveErrorShown = true; ElMessage.error(error?.message || '自动保存失败，草稿仍保留在当前页面，请重试保存') } }), 650) }
+
+function saveShotInBackground() {
+  void saveCurrentShot(false).catch(() => {})
+}
+
+async function retryShotSave(shot) {
+  if (!await selectShot(shot) || activeShotId.value !== shot.id) return
+  failedShotSaves.delete(shot.id)
+  saveShotInBackground()
+}
+
+function scheduleSave() {
+  if (loadingShot.value || applyingRemoteInputs || reproductionMode.value || !currentShot.value) return
+  clearTimeout(saveTimer)
+  saveTimer = setTimeout(saveShotInBackground, 650)
+}
 async function addShot(afterCurrent, copySourceId = null) {
   await saveCurrentShot(false)
   if (isProjectMode.value) {
@@ -1761,7 +1855,7 @@ async function extractFrame(position) { if (!canExtractFrames.value || extractin
 
 watch(prompt, () => { if (collaborativePrompt.applyingRemote) return; persistCurrentPromptDraft(); scheduleSave() }, { flush: 'sync' })
 watch(activeShotId, () => { previewVideoError.value = false; previewVideoProgress.value = false })
-watch([model, aspectRatio, duration, resolution, upscaleResolution, targetFps], () => { if (isProjectMode.value && !loadingShot.value) { projectGenerationDirty.value = true; projectGenerationRevision += 1 } persistCurrentPromptDraft(); scheduleSave() })
+watch([model, aspectRatio, duration, resolution, upscaleResolution, targetFps], () => { if (isProjectMode.value && !loadingShot.value && !applyingRemoteInputs) { projectGenerationDirty.value = true; projectGenerationRevision += 1 } persistCurrentPromptDraft(); scheduleSave() })
 watch([creationMode, audioStrategy, keepOriginalAudio, audioVolume, audioFadeSeconds], () => { persistCurrentPromptDraft(); scheduleSave() })
 watch(chosenAssets, () => { persistCurrentPromptDraft(); scheduleSave() }, { deep: true })
 watch([assetScope, freeProjectId], async () => {
@@ -1774,7 +1868,7 @@ watch([assetScope, freeProjectId], async () => {
     selected.value = new Set([...selected.value].filter((id) => available.has(Number(id))))
   } catch (error) { ElMessage.error(error?.message || '素材来源加载失败') }
 })
-function flushPromptBeforePageHide() { if (reproductionMode.value) return; if (!hasLocalShotChanges) return; persistCurrentPromptDraft(); saveCurrentShot(false).catch((error) => console.warn('[FreeCreate] page-hide save failed:', error?.message)) }
+function flushPromptBeforePageHide() { saveShotInBackground() }
 function onPromptVisibilityChange() { if (document.visibilityState === 'hidden') flushPromptBeforePageHide() }
 onBeforeUnmount(() => { pollLifecycleStopped = true; pendingPollVisibilityResumes.forEach((resume) => resume()); clearTimeout(saveTimer); clearTimeout(wheelShotTimer); window.clearTimeout(mediaLayerTransitionTimer); window.clearInterval(generationClockTimer); window.removeEventListener('pagehide', flushPromptBeforePageHide); document.removeEventListener('visibilitychange', onPromptVisibilityChange); flushPromptBeforePageHide() })
 onMounted(async () => {
@@ -1788,14 +1882,15 @@ onMounted(async () => {
       return
     }
     if (isProjectMode.value) {
-      const [media, caps, history, limits, boards, project, generationContract] = await Promise.all([loadProjectScopedAssets(), omniVideoAPI.capabilities(), omniVideoAPI.list(), omniVideoAPI.uploadLimits(), dramaAPI.getStoryboards(projectEpisodeId.value), dramaAPI.get(projectDramaId.value), storyboardsAPI.getEpisodeGenerationSettings(projectEpisodeId.value)])
+      const [media, caps, history, limits, boards, project, generationContract] = await Promise.all([loadProjectScopedAssets(), omniVideoAPI.capabilities(), omniVideoAPI.list(), omniVideoAPI.uploadLimits(), loadProjectStoryboards(), dramaAPI.get(projectDramaId.value), storyboardsAPI.getEpisodeGenerationSettings(projectEpisodeId.value)])
+      if (pollLifecycleStopped) return
       projectVoiceCharacters.value = (project?.characters || []).filter(character => character?.id)
       const allAssets = await ensureProjectResourceAssets(project, media.items || [])
+      if (pollLifecycleStopped) return
       assets.value = allAssets.filter(Boolean).map((item) => ({ ...item, usage: item.type === 'image' ? 'reference' : item.type === 'video' ? 'motion' : 'ambience' }))
       capabilities.value = caps || []; uploadLimits.value = limits || null; jobs.value = (history || []).map(normalizeJob); jobs.value.filter((job) => activeGenerationStatuses.has(job.status)).forEach((job) => poll(job.id))
       sequence.value = { id: projectEpisodeId.value, name: `项目剧集 ${projectEpisodeId.value}` }
-      const projectStoryboards = boards?.storyboards || []
-      applyProjectVideoSources(projectStoryboards, await loadProjectVideos(projectStoryboards))
+      shots.value = (boards?.storyboards || []).map(board => projectShot(board))
       applyGenerationContract(generationContract)
       if (shots.value[0]) loadShot(shots.value[0])
       await applyProductionReproduction()

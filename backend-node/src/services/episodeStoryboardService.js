@@ -229,13 +229,22 @@ function buildFallbackUniversalSeedanceLine(sb, d, styleHint) {
   return line.replace(/\r?\n/g, ' ');
 }
 
-function getStoryboardsForEpisode(db, episodeId, storageRoot = null) {
+function getStoryboardsForEpisode(db, episodeId, storageRoot = null, { includeVideoPosters = false } = {}) {
   const hasIdentity = require('./storyboardIdentityService').supportsIdentity(db);
   const rows = dedupeStoryboardRowsByNumber(
     db.prepare(
       `SELECT * FROM storyboards WHERE episode_id = ? AND deleted_at IS NULL ORDER BY ${hasIdentity ? 'COALESCE(position, sort_order, storyboard_number - 1, id)' : 'sort_order, storyboard_number'}, id ASC`
     ).all(episodeId)
   );
+  const videoPosters = includeVideoPosters && rows.length
+    ? new Map(db.prepare(`
+      SELECT s.id, v.poster_local_path
+      FROM storyboards s
+      JOIN video_generations v ON v.id = s.active_video_generation_id AND v.storyboard_id = s.id
+      WHERE s.episode_id = ? AND s.deleted_at IS NULL AND v.deleted_at IS NULL
+        AND v.status = 'completed' AND v.local_path <> '' AND v.poster_local_path <> ''
+    `).all(episodeId).map(row => [row.id, row.poster_local_path]))
+    : null;
   return rows.map((r) => {
     const playback = r.playback_video_generation_id
       ? require('./videoService').playbackGeneration(db, r.playback_video_generation_id, storageRoot) : null;
@@ -284,7 +293,7 @@ function getStoryboardsForEpisode(db, episodeId, storageRoot = null) {
       video_url: r.video_url || playback?.video_url || null,
       active_video_generation_id: r.active_video_generation_id ?? null,
       playback_video_generation_id: r.playback_video_generation_id ?? null,
-      poster_local_path: r.video_url ? null : (playback?.poster_local_path || null),
+      poster_local_path: videoPosters?.get(r.id) || (r.video_url ? null : (playback?.poster_local_path || null)),
       audio_local_path: r.audio_local_path ?? null,
       narration_audio_local_path: r.narration_audio_local_path ?? null,
       status: r.status || 'pending',

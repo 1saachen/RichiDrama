@@ -57,8 +57,8 @@ export const dramaAPI = {
     if (workflowGroups !== undefined) body.workflow_groups = workflowGroups
     return request.put(`/dramas/${id}/canvas-layout`, body, config)
   },
-  getStoryboards(episodeId) {
-    return request.get(`/episodes/${episodeId}/storyboards`)
+  getStoryboards(episodeId, params) {
+    return request.get(`/episodes/${episodeId}/storyboards`, { params })
   },
   generateStoryboard(episodeId, options) {
     // 兼容旧调用方式: generateStoryboard(episodeId, model, style)
