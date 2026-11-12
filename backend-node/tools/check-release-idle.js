@@ -7,7 +7,7 @@ const db = new Database(process.argv[2], { readonly: true, fileMustExist: true }
 try {
   const required = ['async_tasks', 'image_generations', 'video_generations'];
   // Omni jobs are request snapshots; their lifecycle is in video_generations.
-  const optional = ['video_upscale_jobs', 'video_interpolation_jobs', 'las_media_jobs', 'viral_edit_jobs'];
+  const optional = ['video_upscale_jobs', 'video_interpolation_jobs', 'las_media_jobs', 'viral_edit_jobs', 'standalone_video_upscale_jobs'];
   const active = ['pending', 'queued', 'running', 'processing', 'submitting', 'uploading', 'downloading', 'persisting', 'finalizing', 'upscale_pending', 'upscaling', 'interpolation_pending', 'interpolating', 'awaiting_source', 'waiting_asset'];
   const counts = {};
   db.transaction(() => {

@@ -97,6 +97,7 @@ const router = createRouter({
       props: { media: 'video' },
       meta: { title: '视频生成工作台' }
     },
+    { path: '/ai-tools/video-upscale', name: 'video-upscale', component: () => import('@/views/VideoUpscale.vue'), meta: { title: '视频超分' } },
     { path: '/ai-tools/video-localization', name: 'video-localization', component: () => import('@/views/VideoLocalization.vue'), meta: { title: '视频本地化' } }
   ]
 })

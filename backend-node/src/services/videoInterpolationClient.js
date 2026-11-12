@@ -5,8 +5,8 @@ const path = require('path');
 
 const DEFAULT_BASE_URL = 'https://mediakit.cn-beijing.volces.com';
 
-function config(db) {
-  const row = require('./aiConfigService').listConfigs(db, 'video_postprocess').find((item) => item.is_active);
+function config(db, selected) {
+  const row = selected || require('./aiConfigService').listConfigs(db, 'video_postprocess').find((item) => item.is_active);
   if (!row) throw new Error('未配置火山 AI MediaKit 视频插帧');
   let settings = {};
   try { settings = JSON.parse(row.settings || '{}'); } catch (_) {}
@@ -26,17 +26,16 @@ async function jsonRequest(url, apiKey, options = {}) {
   return data || {};
 }
 
-async function uploadLocalVideo(db, absolutePath) {
-  const cfg = config(db);
+async function uploadLocalVideo(db, absolutePath, cfg = config(db), signal) {
   const requested = await jsonRequest(`${cfg.base_url}/api/v1/tools-sync/request-media-upload-url`, cfg.api_key, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', signal,
   });
   const result = requested.result || {};
   if (!result.upload_url || !result.file_id) throw new Error('AI MediaKit 未返回上传地址或 file_id');
   const headers = {};
   for (const item of result.upload_headers || []) if (item?.key) headers[item.key] = item.value || '';
   if (!headers['Content-Type']) headers['Content-Type'] = path.extname(absolutePath).toLowerCase() === '.mov' ? 'video/quicktime' : 'video/mp4';
-  const uploaded = await fetch(result.upload_url, { method: result.method || 'PUT', headers, body: fs.createReadStream(absolutePath), duplex: 'half' });
+  const uploaded = await fetch(result.upload_url, { method: result.method || 'PUT', headers, body: fs.createReadStream(absolutePath), duplex: 'half', signal });
   if (!uploaded.ok) throw new Error(`AI MediaKit 本地视频上传失败（HTTP ${uploaded.status}）`);
   return { file_id: result.file_id, request_id: requested.request_id || null };
 }
@@ -59,9 +58,8 @@ async function submit(db, input) {
   return { task_id: data.task_id, request_id: data.request_id || null };
 }
 
-async function retrieve(db, taskId) {
-  const cfg = config(db);
-  const result = await jsonRequest(`${cfg.base_url}/api/v1/tasks/${encodeURIComponent(taskId)}`, cfg.api_key);
+async function retrieve(db, taskId, cfg = config(db), signal) {
+  const result = await jsonRequest(`${cfg.base_url}/api/v1/tasks/${encodeURIComponent(taskId)}`, cfg.api_key, { signal });
   require('./costLedgerService').byTask(db, taskId, { status: ['completed','failed'].includes(result.status) ? result.status : 'processing', usage: result.usage, provider_request_id: result.request_id }, cfg.id);
   return result;
 }

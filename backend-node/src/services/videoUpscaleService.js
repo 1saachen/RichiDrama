@@ -102,6 +102,16 @@ function targetSatisfied(probe, target) {
   return shortEdge >= 700;
 }
 
+function validateOutput(sourceProbe, outputProbe, target) {
+  if (!targetSatisfied(outputProbe, target)) throw new Error(`超分输出未达到 ${target}：${outputProbe.width}x${outputProbe.height}`);
+  if (Math.abs(outputProbe.fps - sourceProbe.fps) > 1) throw new Error(`超分阶段意外改变帧率：${sourceProbe.fps}fps → ${outputProbe.fps}fps`);
+  const sourceRatio = sourceProbe.width / sourceProbe.height;
+  const outputRatio = outputProbe.width / outputProbe.height;
+  if ((sourceRatio > 1) !== (outputRatio > 1) || Math.abs(outputRatio / sourceRatio - 1) > 0.08) {
+    throw new Error(`超分阶段画幅比例偏差过大：${sourceProbe.width}x${sourceProbe.height} → ${outputProbe.width}x${outputProbe.height}`);
+  }
+}
+
 async function process(db, log, videoGenerationId, storagePath) {
   if (active.has(Number(videoGenerationId))) return null;
   active.add(Number(videoGenerationId));
@@ -143,13 +153,7 @@ async function process(db, log, videoGenerationId, storagePath) {
     if (result?.status !== 'completed' || !result?.result?.video_url) throw new Error(result?.error?.message || 'AI MediaKit 超分超时或失败');
     const localPath = await downloadResult(result.result.video_url, storagePath, row, job);
     const outputProbe = probeVideoMedia(path.join(storagePath, localPath));
-    if (!targetSatisfied(outputProbe, job.target_resolution)) throw new Error(`超分输出未达到 ${job.target_resolution}：${outputProbe.width}x${outputProbe.height}`);
-    if (Math.abs(outputProbe.fps - sourceProbe.fps) > 1) throw new Error(`超分阶段意外改变帧率：${sourceProbe.fps}fps → ${outputProbe.fps}fps`);
-    const sourceRatio = sourceProbe.width / sourceProbe.height;
-    const outputRatio = outputProbe.width / outputProbe.height;
-    if ((sourceRatio > 1) !== (outputRatio > 1) || Math.abs(outputRatio / sourceRatio - 1) > 0.08) {
-      throw new Error(`超分阶段画幅比例偏差过大：${sourceProbe.width}x${sourceProbe.height} → ${outputProbe.width}x${outputProbe.height}`);
-    }
+    validateOutput(sourceProbe, outputProbe, job.target_resolution);
     try {
       require('./costLedgerService').forAuthorization(db, job.billing_authorization_id, { status: 'completed', usage: { millisecond: outputProbe.duration_ms }, evidence_kind: 'verified_local_media_duration' });
       billing.settleAuthorization(db, { id: row.owner_user_id, role: 'admin' }, job.billing_authorization_id, {
@@ -217,4 +221,4 @@ function resumePending(db, log, storagePath) {
   return { queued: rows.length };
 }
 
-module.exports = { process, resumePending, reserveForGeneration, retryFromSource, ensureJob, createAuthorization, targetResolution, targetSatisfied, BILLING_MODEL };
+module.exports = { process, resumePending, reserveForGeneration, retryFromSource, ensureJob, createAuthorization, targetResolution, targetSatisfied, validateOutput, BILLING_MODEL };
