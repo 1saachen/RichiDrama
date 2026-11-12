@@ -9,6 +9,7 @@ const express = require('express')
 const Database = require('better-sqlite3')
 const { runMigrationsAndEnsure } = require('../src/db/migrate')
 const { setupRouter } = require('../src/routes')
+const { createMediaUpload } = require('../src/routes/upload')
 const auth = require('../src/services/authService')
 const mediaAsset = require('../src/services/mediaAssetService')
 const uploadService = require('../src/services/uploadService')
@@ -109,9 +110,8 @@ test('uploadFileFromPath renames the temp file into the category layout', () => 
 })
 
 test('media limits stay single-sourced for multer and validation', () => {
-  assert.equal(mediaAsset.LIMITS.video, 2048)
-  assert.equal(mediaAsset.limits().files.video.max_mb, 2048, '/upload-limits 下发同一来源，前端提示自动跟随')
-  const routeSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'routes', 'upload.js'), 'utf8')
-  assert.match(routeSource, /limits: \{ fileSize: mediaAsset\.LIMITS\.video \* 1024 \* 1024 \}/, 'multer 上限必须引用同一 LIMITS 来源')
-  assert.doesNotMatch(routeSource, /50 \* 1024 \* 1024/, '媒体上传不得再各自硬编码 50MB')
+  const maxSizeMb = mediaAsset.limits().files.video.max_mb
+  assert.equal(maxSizeMb, 2048)
+  assert.equal(createMediaUpload({}).limits.fileSize, maxSizeMb * 1024 * 1024)
+  assert.equal(createMediaUpload({}, 30).limits.fileSize, 30 * 1024 * 1024)
 })

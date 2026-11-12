@@ -575,6 +575,7 @@ function setupRouter(cfg, db, log) {
   r.get('/homepage/default-videos', videos.homepageDefaults);
   r.get('/videos', videos.list);
   r.post('/videos/postprocess-quote', videos.postprocessQuote);
+  require('./standaloneVideoUpscales')(r, cfg, db);
   r.post('/videos', videos.create);
   r.post('/videos/image/:image_gen_id', videos.fromImage);
   r.post('/videos/episode/:episode_id/batch', videos.episodeBatch);
