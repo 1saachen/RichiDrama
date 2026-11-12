@@ -6704,8 +6704,17 @@ html.light .sb-panel {
   .merge-stage-active .main > .project-collaboration-bar { grid-column: 1 / -1; }
   .merge-stage-active .main > :is(.merge-settings, .merge-output) { margin: 0; }
   .merge-stage-active .config-grid { grid-template-columns: minmax(0, 1fr); }
-  .storyboard-stage-active .omni-page.embedded.project-storyboard-page {
-    height: clamp(500px, calc(100dvh - 185px), 900px) !important;
+  .storyboard-stage-active > .main {
+    display: flex;
+    flex-direction: column;
+    padding-bottom: 12px;
+  }
+  .storyboard-stage-active > .main > :is(.project-collaboration-bar, .sb-stage-actions) {
+    flex: none;
+  }
+  .storyboard-stage-active > .main > .omni-page.embedded.project-storyboard-page {
+    flex: 1 0 500px;
+    height: auto !important;
     min-height: 500px !important;
   }
 }
