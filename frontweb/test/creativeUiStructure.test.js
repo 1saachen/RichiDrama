@@ -876,13 +876,16 @@ test('成片操作栏不会覆盖视频，嵌入分镜保持三栏创作节奏',
 })
 
 test('生产工作流保持稳定导航、比例预览和可展开的次要信息', async () => {
-  const [film, free] = await Promise.all([
+  const [film, free, collaborationBar] = await Promise.all([
     readSource('../src/views/FilmCreate.vue'),
     readSource('../src/views/FreeCreate.vue'),
+    readSource('../src/components/ProjectCollaborationBar.vue'),
   ])
 
   assert.match(film, /:model-value="workflowStage"[\s\S]*?@change="setWorkflowStage"/)
   assert.match(film, /<ProjectCollaborationBar [^>]*\bquiet\b/)
+  assert.match(collaborationBar, /<span v-if="!quiet \|\| !projectSession\.connected"[^>]*>[^\n]*正在保存…/)
+  assert.match(collaborationBar, /\.project-collaboration-bar:empty\s*\{\s*display\s*:\s*none/)
   assert.match(film, /script-story-block/)
   assert.match(film, /script-content-block/)
   assert.match(film, /剧本确认后，再集中准备可复用资源。/)

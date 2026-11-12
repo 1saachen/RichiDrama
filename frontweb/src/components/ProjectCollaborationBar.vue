@@ -1,6 +1,6 @@
 <template>
   <div v-if="projectSession.enabled" class="project-collaboration-bar" role="status">
-    <span v-if="!quiet || !projectSession.connected || projectSession.pending" :class="{ offline: !projectSession.connected }">{{ projectSession.connected ? (projectSession.pending ? '正在保存…' : '协作已连接') : '连接已断开 · 文本修改保留在此页面' }}</span>
+    <span v-if="!quiet || !projectSession.connected" :class="{ offline: !projectSession.connected }">{{ projectSession.connected ? (projectSession.pending ? '正在保存…' : '协作已连接') : '连接已断开 · 文本修改保留在此页面' }}</span>
     <span v-if="!quiet" class="participants">{{ names || '当前仅你在线' }}</span>
     <span v-if="!projectSession.canEdit">只读成员</span>
     <div v-if="!quiet || projectSession.error" class="collaboration-feedback" aria-live="polite">
