@@ -424,7 +424,7 @@
         <el-button type="primary" :disabled="!currentEpisodeId" @click="setWorkflowStage('storyboard')">进入分镜管理</el-button>
       </div>
 
-      <FreeCreate v-if="workflowStage === 'storyboard' && currentEpisodeId" ref="freeCreateRef" :project-episode-id="currentEpisodeId" :project-drama-id="dramaId" embedded @reordered="loadDrama" @changed="loadDrama" />
+      <FreeCreate v-if="workflowStage === 'storyboard' && currentEpisodeId" :key="currentEpisodeId" ref="freeCreateRef" :project-episode-id="currentEpisodeId" :project-drama-id="dramaId" embedded @reordered="loadDrama" @changed="loadDrama" />
 
       <div v-show="workflowStage === 'storyboard'" class="workflow-next-action sb-stage-actions">
         <span>{{ storyboards.length ? `已有 ${storyboards.length} 个分镜，生成完成后可合成。` : '请先生成至少一个分镜。' }}</span>
@@ -518,18 +518,19 @@
         <h2 class="section-title">合成视频</h2>
         <div class="merge-readiness" :class="{ ready: mergeReadiness.total > 0 && mergeReadiness.missing === 0 }">
           <b>镜头就绪：{{ mergeReadiness.ready }} / {{ mergeReadiness.total }}</b>
-          <span v-if="mergeReadiness.missing">还有 {{ mergeReadiness.missing }} 个分镜没有可用于合成的视频。</span>
+          <span v-if="mergeMediaLoading">正在读取分镜视频…</span>
+          <span v-else-if="mergeReadiness.missing">还有 {{ mergeReadiness.missing }} 个分镜没有可用于合成的视频。</span>
           <span v-else>请先在分镜管理中生成视频。</span>
         </div>
         <div v-if="storyboards.length" class="merge-shot-grid" aria-label="分镜视频就绪状态">
-          <button v-for="(shot, index) in storyboards" :key="shot.id" type="button" :class="{ ready: getSbAllVideos(shot.id).length > 0 }" :title="`镜头 ${index + 1}：${getSbAllVideos(shot.id).length > 0 ? '已就绪' : '缺少视频'}`" @click="getSbAllVideos(shot.id).length === 0 && setWorkflowStage('storyboard')"><span>{{ String(index + 1).padStart(2, '0') }}</span><i></i></button>
+          <button v-for="(shot, index) in storyboards" :key="shot.id" type="button" :disabled="mergeMediaLoading" :class="{ ready: getSbAllVideos(shot.id).length > 0 }" :title="`镜头 ${index + 1}：${getSbAllVideos(shot.id).length > 0 ? '已就绪' : '缺少视频'}`" @click="getSbAllVideos(shot.id).length === 0 && setWorkflowStage('storyboard')"><span>{{ String(index + 1).padStart(2, '0') }}</span><i></i></button>
         </div>
-        <el-button v-if="mergeReadiness.missing" plain @click="setWorkflowStage('storyboard')">返回分镜补齐视频</el-button>
+        <el-button v-if="!mergeMediaLoading && mergeReadiness.missing" plain @click="setWorkflowStage('storyboard')">返回分镜补齐视频</el-button>
         <el-button
           type="primary"
           size="large"
           :loading="videoStatus === 'generating'"
-          :disabled="(projectSession.enabled && !projectSession.canEdit) || (!currentEpisodeId || mergeReadiness.total === 0 || mergeReadiness.missing > 0 || videoStatus === 'generating')"
+          :disabled="(projectSession.enabled && !projectSession.canEdit) || (!currentEpisodeId || mergeMediaLoading || mergeReadiness.total === 0 || mergeReadiness.missing > 0 || videoStatus === 'generating')"
           @click="onGenerateVideo"
         >
           合成视频
@@ -1555,8 +1556,9 @@ const workflowStages = [
   { key: 'storyboard', label: '分镜管理' },
   { key: 'merge', label: '视频合成' },
 ]
-watch(workflowStage, () => {
+watch(workflowStage, (stage) => {
   workbenchContent.value?.scrollTo(0, 0)
+  if (stage === 'merge' && currentEpisodeId.value) void loadMergeMedia()
 }, { flush: 'post' })
 function setWorkflowStage(stage) {
   if (!WORKFLOW_STAGE_KEYS.includes(stage)) return
@@ -1570,6 +1572,8 @@ watch(() => route.query.stage, (stage) => {
 })
 const currentEpisode = computed(() => store.currentEpisode)
 const currentEpisodeId = computed(() => store.currentEpisode?.id ?? null)
+const mergeMediaLoading = ref(false)
+let mergeMediaRequest = 0
 const videoProgress = computed(() => store.videoProgress)
 const videoStatus = computed(() => store.videoStatus)
 const mergeReadiness = computed(() => {
@@ -2187,20 +2191,31 @@ function getSbAllVideos(storyboardId) {
   if (!Array.isArray(list)) return []
   return list.filter((i) => i.status === 'completed' && recordHasPlayableVideoUrl(i))
 }
-async function loadStoryboardMedia() {
+async function loadMergeMedia() {
+  const request = ++mergeMediaRequest
+  mergeMediaLoading.value = true
+  try {
+    await loadStoryboardMedia({ includeImages: false })
+  } finally {
+    if (request === mergeMediaRequest) mergeMediaLoading.value = false
+  }
+}
+
+async function loadStoryboardMedia({ includeImages = true } = {}) {
+  const episodeId = currentEpisodeId.value
   const boards = store.storyboards || []
   if (boards.length === 0) {
     sbImages.value = {}
     sbVideos.value = {}
     return
   }
-  const nextImages = { ...sbImages.value }
-  const nextVideos = { ...sbVideos.value }
+  const nextImages = {}
+  const nextVideos = {}
   await Promise.all(
     boards.map(async (sb) => {
       try {
         const [imgRes, vidRes] = await Promise.all([
-          imagesAPI.list({ storyboard_id: sb.id, page: 1, page_size: 100 }),
+          includeImages ? imagesAPI.list({ storyboard_id: sb.id, page: 1, page_size: 100 }) : null,
           videosAPI.list({ storyboard_id: sb.id, page: 1, page_size: 50 })
         ])
         nextImages[sb.id] = (imgRes && imgRes.items) ? imgRes.items : []
@@ -2211,8 +2226,9 @@ async function loadStoryboardMedia() {
       }
     })
   )
-  sbImages.value = nextImages
-  sbVideos.value = nextVideos
+  if (episodeId !== currentEpisodeId.value) return
+  if (includeImages) sbImages.value = { ...sbImages.value, ...nextImages }
+  sbVideos.value = { ...sbVideos.value, ...nextVideos }
   // 从后端恢复主图选择
   restoreSelectionsFromBackend()
 }
@@ -2659,7 +2675,7 @@ function onEpisodeSelect(epId) {
   store.setScriptContent(ep.script_content || '')
   scriptTitle.value = ep.title || '第' + (ep.episode_number || 0) + '集'
   syncStoryboardStateFromEpisode(ep)
-  loadStoryboardMedia()
+  if (workflowStage.value === 'merge') void loadMergeMedia()
   recoverAndSyncEpisodeTasks(epId)
 }
 
@@ -2710,7 +2726,7 @@ async function loadDrama() {
       selectedEpisodeId.value = null
     }
     syncStoryboardStateFromEpisode(ep)
-    await loadStoryboardMedia()
+    if (workflowStage.value === 'merge') await loadMergeMedia()
     await loadUniversalLibraryAssets()
     await recoverAndSyncEpisodeTasks(ep?.id)
   } catch (e) {
@@ -4061,7 +4077,7 @@ async function startBatchImageGeneration() {
   batchImageRunning.value = true
   try {
     // 仅当媒体数据尚未加载时才全量拉取，避免点击时触发大量冗余请求
-    if (Object.keys(sbImages.value).length === 0) {
+    if (storyboards.value.some(shot => !Object.hasOwn(sbImages.value, shot.id))) {
       await loadStoryboardMedia()
     }
     const boards = store.storyboards || []
@@ -4143,7 +4159,7 @@ async function startBatchVideoGeneration() {
   batchVideoRunning.value = true
   try {
     // 仅当媒体数据尚未加载时才全量拉取，避免点击时触发大量冗余请求
-    if (Object.keys(sbVideos.value).length === 0) {
+    if (storyboards.value.some(shot => !Object.hasOwn(sbVideos.value, shot.id))) {
       await loadStoryboardMedia()
     }
     const boards = store.storyboards || []
@@ -6688,8 +6704,17 @@ html.light .sb-panel {
   .merge-stage-active .main > .project-collaboration-bar { grid-column: 1 / -1; }
   .merge-stage-active .main > :is(.merge-settings, .merge-output) { margin: 0; }
   .merge-stage-active .config-grid { grid-template-columns: minmax(0, 1fr); }
-  .storyboard-stage-active .omni-page.embedded.project-storyboard-page {
-    height: clamp(500px, calc(100dvh - 185px), 900px) !important;
+  .storyboard-stage-active > .main {
+    display: flex;
+    flex-direction: column;
+    padding-bottom: 12px;
+  }
+  .storyboard-stage-active > .main > :is(.project-collaboration-bar, .sb-stage-actions) {
+    flex: none;
+  }
+  .storyboard-stage-active > .main > .omni-page.embedded.project-storyboard-page {
+    flex: 1 0 500px;
+    height: auto !important;
     min-height: 500px !important;
   }
 }

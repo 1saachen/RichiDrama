@@ -6,9 +6,10 @@ import { createShotSaveQueue, mergeSavedShot } from '../src/utils/shotSaveCoordi
 
 const freeCreateSource = readFileSync(new URL('../src/views/FreeCreate.vue', import.meta.url), 'utf8')
 
-test('shot switching keeps the latest click and never merges a save into currentShot', () => {
-  assert.match(freeCreateSource, /const selectionRevision = \+\+shotSelectionRevision/)
-  assert.match(freeCreateSource, /if \(selectionRevision !== shotSelectionRevision\) return false/)
+test('shot switching starts background saving and never merges a save into currentShot', () => {
+  const selectShot = freeCreateSource.slice(freeCreateSource.indexOf('async function selectShot('), freeCreateSource.indexOf('async function saveStoryboardCharacters('))
+  assert.match(selectShot, /\n  saveShotInBackground\(\)[\s\S]*?loadShot\(target\)/)
+  assert.doesNotMatch(selectShot, /await save/)
   assert.match(freeCreateSource, /mergeSavedShot\(shots\.value, savingShotId,/)
   assert.doesNotMatch(freeCreateSource, /Object\.assign\(currentShot\.value, updated\)/)
   assert.doesNotMatch(freeCreateSource, /Object\.assign\(currentShot\.value, projectShot\(updated\)/)

@@ -15,8 +15,10 @@ const pointerDrag = readFileSync(new URL('../src/utils/assetPointerDrag.js', imp
 const canvasEpisodeGenerate = readFileSync(new URL('../src/composables/useCanvasEpisodeGenerate.js', import.meta.url), 'utf8')
 const canvasWorkflowRunner = readFileSync(new URL('../src/composables/useCanvasWorkflowRunner.js', import.meta.url), 'utf8')
 
-test('storyboard navigation uses real video, including retained source after post-processing failure', () => {
-  assert.match(freeCreate, /<video v-if="shotPreviewUrl\(shot\)"/)
+test('storyboard navigation uses lazy posters and the selected shot retains its playable history', () => {
+  const shotList = freeCreate.slice(freeCreate.indexOf('class="shot-list"'), freeCreate.indexOf('class="center-stage"'))
+  assert.match(shotList, /<img v-if="shot.poster_local_path[\s\S]*?loading="lazy"/)
+  assert.doesNotMatch(shotList, /<video\b/)
   assert.match(freeCreate, /function shotGenerationInProgress\(shot\) \{ return activeGenerationStatuses\.has\(shot\?\.status\) \}/)
   assert.match(freeCreate, /v-else class="shot-video-placeholder"/)
   assert.match(freeCreate, /class="shot-play"/)
@@ -25,8 +27,7 @@ test('storyboard navigation uses real video, including retained source after pos
   assert.match(freeCreate, /source_local_path/)
   assert.match(freeCreate, /function bestPlayableVideo/)
   assert.match(freeCreate, /currentShot\.value\.video_url = localVideoUrl\(playableVideo\)/)
-  assert.match(freeCreate, /videosAPI\.list\(\{\s*storyboard_id: storyboard\.id,\s*page_size: 20/)
-  assert.doesNotMatch(freeCreate, /storyboard_id: storyboard\.id,\s*episode_id:/)
+  assert.match(freeCreate, /videosAPI\.list\(\{ storyboard_id: shotId, page_size: 100 \}\)/)
   assert.doesNotMatch(freeCreate, /storyboard-placeholder\.svg|shotCover\(/)
 })
 
@@ -161,8 +162,8 @@ test('admin production detail opens an immutable workbench reproduction snapshot
   assert.match(freeCreate, /loadStandaloneProductionReproduction/)
   assert.match(freeCreate, /当前提示词、参数和素材来自失败时快照/)
   assert.match(freeCreate, /const canCreate = computed\(\(\) => !reproductionMode\.value/)
-  assert.match(freeCreate, /function scheduleSave\(\) \{ if \(loadingShot\.value \|\| applyingRemoteInputs \|\| reproductionMode\.value/)
-  assert.match(freeCreate, /function flushPromptBeforePageHide\(\) \{ if \(reproductionMode\.value\) return/)
+  assert.match(freeCreate, /function scheduleSave\(\) \{\s+if \(loadingShot\.value \|\| applyingRemoteInputs \|\| reproductionMode\.value/)
+  assert.match(freeCreate, /async function saveCurrentShot\(showMessage = true\) \{\s+if \([^\n]*\|\| reproductionMode\.value\) return/)
   assert.match(freeCreate, /document\.execCommand\('copy'\)/)
   assert.match(freeCreate, /delete query\.replay_generation_id/)
 })

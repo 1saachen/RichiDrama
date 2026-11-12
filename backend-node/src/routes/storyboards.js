@@ -448,7 +448,9 @@ function routes(db, log) {
     },
     episodeStoryboardsGet: (req, res) => {
       try {
-        const list = episodeStoryboardService.getStoryboardsForEpisode(db, req.params.episode_id);
+        const list = episodeStoryboardService.getStoryboardsForEpisode(db, req.params.episode_id, null, {
+          includeVideoPosters: req.query.include_video_posters === '1',
+        });
         response.success(res, { storyboards: list, total: list.length });
       } catch (err) {
         log.error('episode storyboards get', { error: err.message });

@@ -301,7 +301,8 @@ test('镜头素材集合从镜头保存的 assets 恢复，未引用素材不丢
   const source = await readSource('../src/views/FreeCreate.vue')
   const handler = source.slice(source.indexOf('function loadShot'), source.indexOf('async function loadShotHistory'))
 
-  assert.match(handler, /const materialIds = \(shot\.assets \|\| \[\]\)\.map/)
+  assert.match(handler, /for \(const saved of shot\.assets \|\| \[\]\)/)
+  assert.match(handler, /materialIds\.push\(assetId\)/)
   assert.match(handler, /selectedOrder\.value = \[\.\.\.new Set\(materialIds\)\]/)
   assert.match(source, /:class="\{ selected: selected\.has\(asset\.id\), 'is-readonly': reproductionMode \}"/)
 })
