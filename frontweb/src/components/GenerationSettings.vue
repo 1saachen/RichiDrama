@@ -3,7 +3,7 @@
     <UiChoiceField v-if="showTextModel" label="文本模型" :model-value="value.text_model || 'auto'" :options="textModelOptions" @update:model-value="set('text_model', $event)" />
     <UiChoiceField label="视频模型" :model-value="value.video_model || ''" :options="videoModelOptions" :invalid="videoModelInvalid" :error="videoModelError" @update:model-value="set('video_model', $event)" />
     <UiChoiceField class="duration-setting" label="时长（秒）" :model-value="duration" :options="durationOptions.map((second) => ({ label: `${second} 秒`, value: second }))" @update:model-value="set('duration', $event)" />
-    <UiChoiceField label="分辨率" :model-value="value.resolution || '720p'" :options="resolutionOptions" :invalid="resolutionInvalid" :error="resolutionError" @update:model-value="set('resolution', $event)" />
+    <UiChoiceField label="原片分辨率" :model-value="value.resolution || '720p'" :options="resolutionOptions" :disabled="!resolutionOptions.length" :invalid="resolutionInvalid" :error="resolutionError" @update:model-value="set('resolution', $event)" />
     <UiChoiceField label="AI 超分（新镜头默认 1080p）" :model-value="value.upscale_resolution || ''" :options="upscaleOptions" @update:model-value="set('upscale_resolution', $event || null)" />
     <UiChoiceField label="智能插帧（按需）" :model-value="value.target_fps || ''" :options="fpsOptions" @update:model-value="set('target_fps', $event || null)" />
     <UiChoiceField label="宽高比" :model-value="value.aspect_ratio || '16:9'" :options="aspectRatioOptions" :invalid="aspectRatioInvalid" :error="aspectRatioError" @update:model-value="set('aspect_ratio', $event)" />
@@ -54,6 +54,7 @@ const modelMaxDuration = computed(() => {
 const duration = computed(() => Math.min(modelMaxDuration.value, Math.max(4, Number(value.value.duration) || 15)))
 const durationOptions = computed(() => Array.from({ length: Math.max(0, modelMaxDuration.value - 3) }, (_, index) => index + 4))
 const allowedResolutions = computed(() => {
+  if (value.value.video_model && !selectedVideoCapability.value) return []
   const configured = selectedVideoCapability.value?.limits?.resolutions
   return Array.isArray(configured) && configured.length
     ? configured.map((item) => String(item || '').trim().toLowerCase()).filter(Boolean)
