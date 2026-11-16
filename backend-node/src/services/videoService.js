@@ -1180,7 +1180,7 @@ function startPendingVideoArchiveRetry(db, log) {
   return { runNow: run, stop: () => clearInterval(timer) };
 }
 
-function loadOmniReferenceImageInputs(db, videoGenId, referenceUrls = []) {
+function loadOmniReferenceImageInputs(db, videoGenId, referenceUrls = [], usesArkFrameRoles = false) {
   const omni = db.prepare('SELECT id FROM omni_video_jobs WHERE video_generation_id = ?').get(Number(videoGenId));
   if (!omni) return null;
   const imageRows = db.prepare(`SELECT j.ordinal, j.snapshot_json,
@@ -1194,6 +1194,7 @@ function loadOmniReferenceImageInputs(db, videoGenId, referenceUrls = []) {
     try { snapshot = JSON.parse(item.snapshot_json || '{}'); } catch (_) {}
     return {
       url: referenceUrls[index] || snapshot.model_url || snapshot.url || snapshot.local_path || null,
+      ...(usesArkFrameRoles ? { usage: snapshot.usage } : {}),
       local_path: item.asset_local_path || snapshot.local_path || null,
       width: Number(item.asset_width || snapshot.width) || null,
       height: Number(item.asset_height || snapshot.height) || null,
@@ -1296,10 +1297,13 @@ async function processVideoGeneration(db, log, videoGenId) {
     let voiceReferenceUrl = null;
     let referenceAudioUrls;
     let inputValidationVersion;
+    let usesArkFrameRoles = false;
     try {
       const omni = db.prepare('SELECT id, request_snapshot_json FROM omni_video_jobs WHERE video_generation_id = ?').get(Number(videoGenId));
       if (omni) {
-        referenceImageInputs = loadOmniReferenceImageInputs(db, videoGenId, reference_urls || []);
+        const requestSnapshot = JSON.parse(omni.request_snapshot_json || '{}');
+        usesArkFrameRoles = requestSnapshot.ark_frame_roles_version === 1;
+        referenceImageInputs = loadOmniReferenceImageInputs(db, videoGenId, reference_urls || [], usesArkFrameRoles);
         referenceVideoUrls = await loadOmniReferenceVideoUrls(db, cfg, storageLocalPath, videoGenId, log);
         const audio = db.prepare(`SELECT snapshot_json FROM omni_video_job_assets
           WHERE omni_job_id = ? AND media_type = 'audio' AND send_to_model = 1 ORDER BY ordinal LIMIT 1`).get(omni.id);
@@ -1307,7 +1311,6 @@ async function processVideoGeneration(db, log, videoGenId) {
           const snapshot = JSON.parse(audio.snapshot_json);
           voiceReferenceUrl = snapshot.local_path || snapshot.url || null;
         }
-        const requestSnapshot = JSON.parse(omni.request_snapshot_json || '{}');
         if (requestSnapshot.input_validation?.version) {
           inputValidationVersion = requestSnapshot.input_validation.version;
           referenceAudioUrls = db.prepare(`SELECT snapshot_json FROM omni_video_job_assets
@@ -1385,10 +1388,11 @@ async function processVideoGeneration(db, log, videoGenId) {
       provider: row.provider,
       drama_id: row.drama_id,
       storyboard_id: row.storyboard_id || undefined,
-      image_url: hasOmniRefs ? undefined : row.image_url,
-      first_frame_url: hasOmniRefs ? undefined : row.first_frame_url,
-      last_frame_url: hasOmniRefs ? undefined : row.last_frame_url,
-      reference_urls,
+      image_url: hasOmniRefs || usesArkFrameRoles ? undefined : row.image_url,
+      first_frame_url: usesArkFrameRoles || !hasOmniRefs ? row.first_frame_url : undefined,
+      last_frame_url: usesArkFrameRoles || !hasOmniRefs ? row.last_frame_url : undefined,
+      ark_frame_roles: usesArkFrameRoles,
+      reference_urls: usesArkFrameRoles ? null : reference_urls,
       reference_video_urls: referenceVideoUrls,
       reference_image_inputs: referenceImageInputs,
       voice_reference_url: voiceReferenceUrl,

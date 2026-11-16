@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const express = require('express');
@@ -24,13 +25,23 @@ test('authenticated submissions reject invalid assets before billing and preserv
   let authorizationCalls = 0;
   const processed = [];
   let server;
+  let provider;
   let db;
-  // Every dependency is isolated: fresh database, temporary storage, dummy key,
-  // and a replaced generation worker. No provider or OSS request can run.
-  config.loadConfig = () => ({ storage: { type: 'local', local_path: root, base_url: '/static' } });
+  // Use a local provider recorder, temporary storage, and a dummy key.
+  config.loadConfig = () => ({ storage: { type: 'local', local_path: root, base_url: '/static' }, image_proxy: { use_for_video: false } });
   videoService.processVideoGeneration = (_db, _log, id) => { processed.push(id); };
   billing.createAuthorization = (...args) => { authorizationCalls++; return originalAuthorization(...args); };
   try {
+    const upstream = [];
+    provider = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      upstream.push({ path: req.url, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'fixture: reject after recording the request' } }));
+    });
+    provider.listen(0, '127.0.0.1');
+    await new Promise(resolve => provider.once('listening', resolve));
     db = getDb({ path: filename, type: 'sqlite' });
     runMigrationsAndEnsure(db);
     const admin = auth.ensureBootstrapAdmin(db, log);
@@ -39,7 +50,8 @@ test('authenticated submissions reject invalid assets before billing and preserv
     const tenant = tenants.tenantForUser(db, user.id);
     const aiConfig = aiConfigs.createConfig(db, log, {
       service_type: 'video', provider: 'volcengine', api_protocol: 'volcengine_omni', name: 'input-validation-test',
-      base_url: 'https://example.invalid', api_key: 'dummy-key', model: [MODEL, 'doubao-seedance-2-5-260628'], default_model: MODEL, is_default: true,
+      base_url: `http://127.0.0.1:${provider.address().port}/api/v3`, endpoint: '/contents/generations/tasks',
+      api_key: 'dummy-key', model: [MODEL, 'doubao-seedance-2-5-260628'], default_model: MODEL, is_default: true,
       settings: JSON.stringify({ billing_reserve_output_tokens: 1000000 }), owner_tenant_id: tenant.id,
     });
     tenants.bindOwnedConfig(db, tenant.id, aiConfig, { is_default: true });
@@ -176,6 +188,40 @@ test('authenticated submissions reject invalid assets before billing and preserv
     assert.equal(noVoiceSnapshot.input_validation.automatic_voice_url, null);
     assert.deepEqual(noVoiceSnapshot.storyboard_voices, []);
 
+    const tailId = addAsset('last.png', 'image', null);
+    for (const [id, name] of [[imageId, 'image.png'], [tailId, 'last.png']]) {
+      fs.writeFileSync(path.join(root, name), Buffer.from(name));
+      db.prepare('UPDATE assets SET local_path=? WHERE id=?').run(name, id);
+    }
+    const frame = { asset_id: imageId, usage: 'first_frame' };
+    const tail = { asset_id: tailId, usage: 'last_frame' };
+    const frameRequest = { ...input, drama_id: dramaId, creation_mode: 'first_last_frame', aspect_ratio: '9:16' };
+    const skippedFirst = await post('/api/v1/omni-video/jobs', {
+      ...frameRequest, idempotency_key: 'skipped-first', assets: [{ ...frame, send_to_model: false }, tail],
+    });
+    assert.equal(skippedFirst.status, 400);
+    assert.match(skippedFirst.json.error.message, /选中一张首帧/);
+    assert.equal(authorizationCalls, 4);
+    const frameJobs = [];
+    for (const [key, fields] of [
+      ['first-only', { assets: [frame] }],
+      ['first-and-last', { model: 'doubao-seedance-2-5-260628', assets: [tail, frame] }],
+      ['pre-fix-queue', { assets: [frame] }],
+    ]) {
+      const response = await post('/api/v1/omni-video/jobs', { ...frameRequest, ...fields, idempotency_key: key });
+      assert.equal(response.status, 201, JSON.stringify(response.json));
+      const job = response.json.data;
+      const saved = JSON.parse(db.prepare('SELECT request_snapshot_json FROM omni_video_jobs WHERE id=?').get(job.omni_job_id).request_snapshot_json);
+      assert.equal(saved.input_validation.automatic_voice_url, null);
+      assert.equal(saved.ark_frame_roles_version, 1);
+      if (key === 'pre-fix-queue') {
+        delete saved.ark_frame_roles_version;
+        db.prepare('UPDATE omni_video_jobs SET request_snapshot_json=? WHERE id=?').run(JSON.stringify(saved), job.omni_job_id);
+      }
+      frameJobs.push(job);
+    }
+    assert.equal(upstream.length, 0, 'Both quoting and queueing must leave provider submission to the worker');
+
     await new Promise((resolve) => server.close(resolve)); server = null; closeDb();
     db = getDb({ path: filename, type: 'sqlite' }); runMigrationsAndEnsure(db); base = await serve();
     const read = await fetch(`${base}/api/v1/omni-video/jobs/${jobId}`, { headers: { Authorization: `Bearer ${token}` } });
@@ -191,9 +237,27 @@ test('authenticated submissions reject invalid assets before billing and preserv
       .map(asset => [asset.alias, asset.send_to_model]), [['manual.wav', 1], ['小周 · 角色音色', 1], ['林老师 · 角色音色', 1]]);
     assert.deepEqual(restoredMulti.request_snapshot.storyboard_voice_bindings, bindings);
     assert.equal(db.prepare('SELECT request_snapshot_json FROM omni_video_jobs WHERE id=?').get(multiJobId).request_snapshot_json, multiSnapshot);
-    assert.equal(processed.length, 4);
+    assert.equal(processed.length, 7);
+    for (const { video_generation_id } of frameJobs) await originalProcess(db, log, video_generation_id);
+    assert.equal(upstream.length, 3);
+    for (const capture of upstream) assert.equal(capture.path, '/api/v3/contents/generations/tasks');
+    const media = ({ body }) => body.content.filter(item => item.type !== 'text').map(item => [
+      item.role, Buffer.from(item.image_url.url.split(',')[1], 'base64').toString('utf8'),
+    ]);
+    assert.deepEqual(media(upstream[0]), [['first_frame', 'image.png']]);
+    assert.equal(upstream[0].body.ratio, '9:16');
+    assert.deepEqual(media(upstream[1]), [['first_frame', 'image.png'], ['last_frame', 'last.png']]);
+    assert.equal(upstream[1].body.ratio, 'adaptive');
+    assert.deepEqual(media(upstream[2]), [['reference_image', 'image.png']]);
+    for (const { video_generation_id } of frameJobs) {
+      const row = db.prepare('SELECT status,billing_authorization_id FROM video_generations WHERE id=?').get(video_generation_id);
+      assert.equal(row.status, 'failed');
+      const transactions = db.prepare('SELECT type FROM billing_transactions WHERE authorization_id=? ORDER BY type').all(row.billing_authorization_id);
+      assert.deepEqual(transactions.map(transaction => transaction.type), ['authorization', 'void']);
+    }
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));
+    if (provider) await new Promise(resolve => provider.close(resolve));
     closeDb(); config.loadConfig = originalConfig; videoService.processVideoGeneration = originalProcess;
     billing.createAuthorization = originalAuthorization;
     fs.rmSync(root, { recursive: true, force: true });

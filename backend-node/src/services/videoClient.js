@@ -707,7 +707,9 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
   const url = buildVideoUrl(config, { defaultEndpoint: '/v1/videos/generations' });
   const model = getModelFromConfig(config, preferredModel);
   const finalModel = normalizeVolcModel(model);
-  const ratio = requireVolcengineVideoRatio(aspect_ratio);
+  const usesArkFrameRoles = opts.ark_frame_roles === true;
+  const isSeedance25 = /seedance[-_]?2[-_]?5|2[-_]?5[-_]?260628/i.test(finalModel);
+  const ratio = requireVolcengineVideoRatio(usesArkFrameRoles && isSeedance25 ? 'adaptive' : aspect_ratio);
   const effectiveDuration = normalizeVolcOmniDuration(finalModel, duration);
 
   const refList = Array.isArray(reference_urls) ? reference_urls.filter(Boolean) : [];
@@ -715,13 +717,23 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
   const orderedUrls = [...(primary ? [primary] : []), ...refList.filter((u) => u !== primary)];
   // Seedance 2.5 accepts a larger image-reference set. Legacy Seedance
   // requests keep their established nine-image transport limit.
-  const maxRef = /seedance[-_]?2[-_]?5|2[-_]?5[-_]?260628/i.test(finalModel) ? 30 : 9;
-  const urls = orderedUrls.slice(0, maxRef);
+  const maxRef = isSeedance25 ? 30 : 9;
+  const images = usesArkFrameRoles
+    ? [
+      { url: opts.first_frame_url, role: 'first_frame' },
+      ...(opts.last_frame_url ? [{ url: opts.last_frame_url, role: 'last_frame' }] : []),
+    ]
+    : orderedUrls.slice(0, maxRef).map(url => ({ url, role: 'reference_image' }));
   const referenceImageInputs = Array.isArray(opts.reference_image_inputs) ? opts.reference_image_inputs : [];
-  const maxVideoRef = /seedance[-_]?2[-_]?5|2[-_]?5[-_]?260628/i.test(finalModel) ? 10 : 3;
+  const maxVideoRef = isSeedance25 ? 10 : 3;
   const videoUrls = Array.isArray(reference_video_urls)
     ? reference_video_urls.map((value) => String(value || '').trim()).filter(Boolean).slice(0, maxVideoRef)
     : [];
+  const audioUrls = Array.isArray(opts.reference_audio_urls)
+    ? opts.reference_audio_urls : opts.voice_reference_url ? [opts.voice_reference_url] : [];
+  if (usesArkFrameRoles && (!opts.first_frame_url || orderedUrls.length || videoUrls.length || audioUrls.length)) {
+    throw new Error('Seedance 首尾帧模式需要首帧图片，且不能同时提交其他参考素材');
+  }
 
   const body = {
     model: finalModel,
@@ -736,25 +748,29 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
   // Seedance 2.0 Mini rejects camera_fixed for text-to-video. Omitting the
   // unsupported field is different from sending false; the latter is still
   // rejected by Ark parameter validation.
-  if (camera_fixed != null && !(/seedance[-_]?2[-_]?0[-_]?mini/i.test(finalModel) && urls.length === 0)) {
+  if (!usesArkFrameRoles && camera_fixed != null && !(/seedance[-_]?2[-_]?0[-_]?mini/i.test(finalModel) && images.length === 0)) {
     body.camera_fixed = Boolean(camera_fixed);
   }
 
-  if (urls.length) {
-    for (let i = 0; i < urls.length; i++) {
+  if (images.length) {
+    for (const [i, { url: imageUrl, role }] of images.entries()) {
+      const imageInput = usesArkFrameRoles ? referenceImageInputs.find(input => input.usage === role) : referenceImageInputs[i];
       let u = await resolveVolcOmniImageAsync(
-        urls[i],
+        imageUrl,
         files_base_url,
         storage_local_path,
         log,
         video_gen_id,
         i,
-        referenceImageInputs[i]
+        imageInput
       );
-      if (!u) continue;
+      if (!u) {
+        if (usesArkFrameRoles) throw new Error(role === 'first_frame' ? '无法读取首帧图片' : '无法读取尾帧图片');
+        continue;
+      }
       u = await normalizeSeedanceImageForModel(
         u,
-        referenceImageInputs[i],
+        imageInput,
         storage_local_path,
         log,
         video_gen_id,
@@ -782,7 +798,7 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
       const part = {
         type: 'image_url',
         image_url: { url: u },
-        role: 'reference_image',
+        role,
       };
       body.content.push(part);
     }
@@ -800,8 +816,6 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
     });
   }
 
-  const audioUrls = Array.isArray(opts.reference_audio_urls)
-    ? opts.reference_audio_urls : opts.voice_reference_url ? [opts.voice_reference_url] : [];
   for (const value of audioUrls) {
     const voiceUrl = resolveLocalAudioToBase64(String(value).trim(), files_base_url, storage_local_path, log, video_gen_id);
     if (voiceUrl) body.content.push({ type: 'audio_url', audio_url: { url: voiceUrl }, role: 'reference_audio' });
@@ -848,7 +862,7 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
     model: finalModel,
     ratio,
     duration: effectiveDuration,
-    image_count: urls.length,
+    image_count: images.length,
     video_count: videoUrls.length,
     has_voice_ref: !!voice_reference_url,
     video_gen_id,
@@ -857,7 +871,7 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
     model: finalModel,
     ratio,
     duration: effectiveDuration,
-    image_count: urls.length,
+    image_count: images.length,
     video_count: videoUrls.length,
     has_voice_ref: !!voice_reference_url,
   });
@@ -3960,6 +3974,9 @@ async function executeVideoApi(db, log, opts) {
   const model = getModelFromConfig(config, preferredModel);
   const provider = (config.provider || '').toLowerCase();
   const protocol = resolveVideoProtocol(config, preferredModel);
+  if (opts.ark_frame_roles && protocol !== 'volcengine_omni') {
+    throw new Error('火山首尾帧任务的模型配置已变更，请重新选择模型后提交');
+  }
   const draftMeta = require('./videoDraftService').record(db, opts.video_gen_id);
   if (draftMeta) {
     require('./videoDraftService').assertPinnedConfig(db, opts.video_gen_id, config, model);
@@ -3984,7 +4001,7 @@ async function executeVideoApi(db, log, opts) {
   }
 
   const isSeedance2 = isSeedance2FamilyModel(model) || protocol === 'volcengine_omni';
-  if (isSeedance2 && !opts.voice_reference_url && !Array.isArray(opts.reference_audio_urls)) {
+  if (isSeedance2 && !opts.ark_frame_roles && !opts.voice_reference_url && !Array.isArray(opts.reference_audio_urls)) {
     opts.voice_reference_url = selectCharacterVoiceReference(db, opts.drama_id, opts.storyboard_id);
   }
   log.info('[视频] 路由协议', {
@@ -4100,6 +4117,9 @@ async function executeVideoApi(db, log, opts) {
     return callVolcengineOmniVideoApi(config, log, {
       draft_mode: opts.draft_mode,
       draft_request_key: opts.draft_request_key,
+      ark_frame_roles: opts.ark_frame_roles,
+      first_frame_url: opts.first_frame_url,
+      last_frame_url: opts.last_frame_url,
       prompt,
       model,
       duration: opts.duration,
