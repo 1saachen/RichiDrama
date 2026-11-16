@@ -13,16 +13,16 @@ function element(tagName, childNodes = [], dataset = {}) {
   return { nodeType: 1, tagName, childNodes, dataset }
 }
 
-async function serializer(childNodes) {
+async function serializer(childNodes, maskAssetTokens = false) {
   const source = await readFile(componentFile, 'utf8')
-  const start = source.indexOf("const EDITOR_LINE_BLOCKS")
+  const start = source.indexOf('const ASSET_TAIL_PLACEHOLDER')
   const end = source.indexOf('// 记录上一次真正重建 DOM', start)
   assert.ok(start >= 0 && end > start, 'serializer implementation must remain discoverable')
   const context = {
     Node: { TEXT_NODE: 3, ELEMENT_NODE: 1 },
     editorRef: { value: { childNodes } },
   }
-  vm.runInNewContext(`${source.slice(start, end)}\nglobalThis.result = serializeEditor()`, context)
+  vm.runInNewContext(`${source.slice(start, end)}\nglobalThis.result = serializeNodes(editorRef.value.childNodes, ${maskAssetTokens})`, context)
   return context.result
 }
 
@@ -61,6 +61,23 @@ test('asset chips remain complete tokens across structural line boundaries', asy
     element('DIV', [text('前景 '), element('SPAN', [text('ignored label')], { token: '@图片12' })]),
     element('DIV', [text('后景')]),
   ]), '前景 @图片12\n后景')
+})
+
+test('terminal asset caret leaves saved prompts untouched and preserves the asset when users continue typing', async () => {
+  const chip = element('SPAN', [text('素材名')], { token: '@图片3' })
+  const tail = (value) => element('SPAN', [text(value)], { assetTail: 'true' })
+  assert.equal(await serializer([chip, tail('\u200b')]), '@图片3')
+  assert.equal(await serializer([chip, tail('1号继续\u200b')]), '@图片3 1号继续')
+  assert.equal(await serializer([chip, tail('\u200b 继续')]), '@图片3 继续')
+})
+
+test('resolved asset chips are masked when looking for a newly typed @ and keep the same text offsets', async () => {
+  const chip = element('SPAN', [text('素材名')], { token: '@图片3' })
+  const suffix = text(' 接着用 @新')
+  const plain = await serializer([chip, suffix])
+  const editable = await serializer([chip, suffix], true)
+  assert.equal(editable.length, plain.length)
+  assert.equal(editable.indexOf('@'), plain.lastIndexOf('@'))
 })
 
 test('caret restoration snaps non-text tokens to their boundary and restores editor scrolling', async () => {

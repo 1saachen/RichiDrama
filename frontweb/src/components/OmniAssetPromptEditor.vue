@@ -72,7 +72,12 @@ function endComposition() { composing = false; onInput(); emit('compositionend')
 // 只把 <br> 还原成 '\n'，导致句中回车在下次重绘/保存同步后丢换行（句末回车
 // 生成 <div><br></div> 所以能幸存）。改为显式插入 <br>，两条路径行为一致。
 function onKeydown(event) {
-  if (event.key !== 'Enter' || event.isComposing || composing || props.readonly || event.ctrlKey || event.metaKey || event.altKey) return
+  if (event.isComposing || composing || props.readonly) return
+  if (event.key === 'Delete' && assetTailCaret()?.atEnd) {
+    event.preventDefault()
+    return
+  }
+  if (event.key !== 'Enter' || event.ctrlKey || event.metaKey || event.altKey) return
   event.preventDefault()
   document.execCommand('insertLineBreak')
 }
@@ -132,22 +137,25 @@ function onInput() {
   nextTick(onCursorChange)
 }
 
-/**
- * `@` may be inserted anywhere in a sentence. Element Plus keeps the native
- * textarea under its component instance, so use its selection range instead
- * of treating only a trailing @ as an active mention.
- */
+// Only an @ typed in editable text starts a search. A chip already represents
+// a resolved reference even when it sits immediately before the caret.
 function activeMentionRange(value = text.value) {
   const cursor = lastCaretOffset.value
   const source = String(value || '')
   const before = source.slice(0, cursor)
   const at = before.lastIndexOf('@')
   if (at < 0 || /\s/.test(before.slice(at + 1))) return null
+  const prefix = editorPrefixAtSelection()
+  if (prefix && serializeNodes(prefix, true)[at] !== '@') return null
   // Only replace what was typed before the caret. Text on the right may be
   // ordinary sentence content, not part of the asset alias.
   return { start: at, end: cursor, query: source.slice(at + 1, cursor) }
 }
 function onCursorChange() {
+  if (!composing) {
+    const caret = assetTailCaret()
+    if (caret?.pastPlaceholder) caret.selection.collapse(caret.node, caret.offset)
+  }
   lastCaretOffset.value = caretOffset()
   showPicker.value = !!activeMentionRange()
   if (showPicker.value) nextTick(positionPickerAndMention)
@@ -272,6 +280,7 @@ function matchingAsset(alias, occurrence = 0) {
   const matches = (props.assets || []).filter((asset) => asset && assetMatchesAlias(asset, alias))
   return matches.length === 1 ? matches[0] : null
 }
+const ASSET_TAIL_PLACEHOLDER = '\u200b'
 const EDITOR_LINE_BLOCKS = new Set(['DIV', 'P'])
 function isEditorLineBlock(node) {
   return node?.nodeType === Node.ELEMENT_NODE && EDITOR_LINE_BLOCKS.has(node.tagName)
@@ -279,10 +288,10 @@ function isEditorLineBlock(node) {
 function isPlaceholderBreak(nodes) {
   return nodes.length === 1 && nodes[0]?.nodeType === Node.ELEMENT_NODE && nodes[0].tagName === 'BR'
 }
-function serializeNodes(nodes) {
+function serializeNodes(nodes, maskAssetTokens = false) {
   const parts = [...(nodes || [])].map((node) => ({
     lineBlock: isEditorLineBlock(node),
-    value: serializeNode(node),
+    value: serializeNode(node, maskAssetTokens),
   }))
   return parts.reduce((value, part, index) => {
     // contenteditable may represent a line either as a BR or as a DIV/P.
@@ -294,14 +303,19 @@ function serializeNodes(nodes) {
     return `${value}${needsBoundary ? '\n' : ''}${part.value}`
   }, '')
 }
-function serializeNode(node) {
+function serializeNode(node, maskAssetTokens = false) {
   if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || ''
   if (node.nodeType !== Node.ELEMENT_NODE) return ''
-  if (node.dataset?.token) return node.dataset.token
+  if (node.dataset?.token) return maskAssetTokens ? ' '.repeat(node.dataset.token.length) : node.dataset.token
   if (node.tagName === 'BR') return '\n'
   const children = [...node.childNodes]
   if (isEditorLineBlock(node) && isPlaceholderBreak(children)) return ''
-  return serializeNodes(children)
+  const content = serializeNodes(children, maskAssetTokens)
+  if (!node.dataset?.assetTail) return content
+  // Keep the editable placeholder out of the prompt. Separate new text from
+  // the alias so typing a digit cannot turn one asset reference into another.
+  const tail = content.replace(ASSET_TAIL_PLACEHOLDER, '')
+  return tail && !/^\s/.test(tail) ? ` ${tail}` : tail
 }
 function serializeEditor() { return serializeNodes(editorRef.value?.childNodes) }
 // 记录上一次真正重建 DOM 时的引用解析结果。references 事件会让父组件
@@ -342,15 +356,39 @@ function renderEditor(value, force = false) {
     last = mention.end
   }
   if (last < source.length) el.append(document.createTextNode(source.slice(last)))
+  else if (el.lastChild?.dataset?.token) {
+    const tail = document.createElement('span')
+    tail.dataset.assetTail = 'true'
+    tail.textContent = ASSET_TAIL_PLACEHOLDER
+    el.append(tail)
+  }
   if (caret != null) focusEditorAtOffset(caret, scrollPosition)
 }
 function iconForAsset(type) { return type === 'video' ? '🎬' : type === 'audio' ? '🎵' : '🖼️' }
-function caretOffset() {
+function assetTailCaret() {
+  const el = editorRef.value
+  const tail = el?.lastChild
+  if (!tail?.dataset?.assetTail) return null
+  const node = tail.lastChild
+  if (node?.nodeType !== Node.TEXT_NODE || !node.nodeValue.endsWith(ASSET_TAIL_PLACEHOLDER)) return null
+  const selection = window.getSelection()
+  if (!selection?.isCollapsed) return null
+  const offset = node.nodeValue.length - 1
+  const pastText = selection.anchorNode === node && selection.anchorOffset === offset + 1
+  const outsideTail = selection.anchorNode === el && selection.anchorOffset === el.childNodes.length
+  // End and clicks can land after the invisible character. Put the caret on
+  // the editable side so a single Backspace still removes the previous chip.
+  return { selection, node, offset, pastPlaceholder: pastText || outsideTail, atEnd: pastText || outsideTail || (selection.anchorNode === node && selection.anchorOffset === offset) }
+}
+function editorPrefixAtSelection() {
   const el = editorRef.value; const selection = window.getSelection()
-  if (!el || !selection?.rangeCount || !el.contains(selection.anchorNode)) return String(text.value || '').length
+  if (!el || !selection?.rangeCount || !el.contains(selection.anchorNode)) return null
   const range = selection.getRangeAt(0).cloneRange(); range.selectNodeContents(el); range.setEnd(selection.anchorNode, selection.anchorOffset)
-  const holder = document.createElement('div'); holder.append(range.cloneContents())
-  return serializeNodes(holder.childNodes).length
+  return range.cloneContents().childNodes
+}
+function caretOffset() {
+  const prefix = editorPrefixAtSelection()
+  return prefix ? serializeNodes(prefix).length : String(text.value || '').length
 }
 function focusEditorEnd() {
   const el = editorRef.value; if (!el) return; el.focus()
@@ -491,7 +529,9 @@ function focusEditorAtOffset(offset, scrollPosition) {
       if (node.nodeType === Node.TEXT_NODE) range.setStart(node, Math.max(0, Math.min(node.nodeValue?.length || 0, target - consumed)))
       else {
         const beforeToken = target === consumed
-        range.setStart(el, beforeToken ? index : index + 1)
+        const tail = node.nextSibling
+        if (!beforeToken && tail?.dataset?.assetTail) range.setStart(tail.firstChild, 0)
+        else range.setStart(el, beforeToken ? index : index + 1)
         placedOffset = beforeToken ? consumed : consumed + length
       }
       placed = true
