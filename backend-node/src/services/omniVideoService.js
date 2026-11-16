@@ -4,6 +4,7 @@ const taskService = require('./taskService');
 const videoService = require('./videoService');
 const capabilityService = require('./videoModelCapabilities');
 const videoTokenEstimate = require('./videoTokenEstimate');
+const { isSeedance2FamilyModel, resolveVideoProtocol } = require('./videoClient');
 // Seedance 2.0 publishes limits per media type. There is no separate
 // 12-item combined limit, so the combined ceiling is the sum of those limits.
 const SHOT_ASSET_LIMITS = { total: 15, image: 9, video: 3, audio: 3 };
@@ -192,11 +193,21 @@ function create(db, log, body, billingUser, savedVoices = null, savedResolutions
   const creationMode = body.creation_mode || body.settings?.creation_mode || 'multi_reference';
   validateCreationMode(creationMode, assets, capability);
   const routed = routeAssets(db, expandVideoReferences(db, log, assets, capability.supports), capability.supports, body.audio_strategy);
+  const aiConfigs = require('./aiConfigService');
+  const config = aiConfigs.getConfig(db, capability.config_id);
   // Recovery keeps the policy recorded at original submission. A manual retry
   // creates a new generation and receives the current validation policy.
   const waitingSnapshot = body.__sd2_waiting_generation_id
     ? parse(db.prepare('SELECT request_snapshot_json FROM omni_video_jobs WHERE video_generation_id=?').get(Number(body.__sd2_waiting_generation_id))?.request_snapshot_json)
     : null;
+  // Older queued jobs must keep the input contract they were created with.
+  const usesArkFrameRoles = body.__sd2_waiting_generation_id
+    ? waitingSnapshot?.ark_frame_roles_version === 1
+    : creationMode === 'first_last_frame' && config && isSeedance2FamilyModel(capability.model)
+      && resolveVideoProtocol(config, capability.model) === 'volcengine_omni';
+  const first = routed.find(asset => asset.usage === 'first_frame' && asset.send_to_model);
+  const last = routed.find(asset => asset.usage === 'last_frame' && asset.send_to_model);
+  if (usesArkFrameRoles && !first) throw new Error('请选中一张首帧图片发送给模型');
   const useStoryboardVoices = body.storyboard_voice_bindings !== undefined || savedVoices !== null;
   let storyboardVoices = null;
   let voicePrompt = '';
@@ -232,7 +243,7 @@ function create(db, log, body, billingUser, savedVoices = null, savedResolutions
   const inputValidation = !body.__sd2_waiting_generation_id || waitingSnapshot?.input_validation
     ? require('./seedanceInputValidation').validateSubmission(db, capability, routed, {
       ...body, prompt: prompt + voicePrompt, creation_mode: creationMode,
-    }, { skipLegacyVoice: useStoryboardVoices })
+    }, { skipLegacyVoice: useStoryboardVoices || usesArkFrameRoles })
     : null;
   const sd2 = sd2IdentityState(routed, capability);
   if (sd2.invalid.length) enforceSd2IdentityAssets(routed, capability, log);
@@ -241,9 +252,7 @@ function create(db, log, body, billingUser, savedVoices = null, savedResolutions
   const modelPrompt = bindPromptReferences(prompt, body.prompt_document, routed) + voicePrompt;
   const now = new Date().toISOString();
   const billing = require('./billingService');
-  const aiConfigs = require('./aiConfigService');
   const billingTarget = aiConfigs.resolveBillingTarget(db, 'video', capability.model, capability.config_id, tenantOptions);
-  const config = aiConfigs.getConfig(db, capability.config_id);
   let billingSettings = {}; try { billingSettings = JSON.parse(config?.settings || '{}'); } catch (_) {}
   const upscaleResolution = body.upscale_resolution;
   const targetFps = body.target_fps;
@@ -281,8 +290,6 @@ function create(db, log, body, billingUser, savedVoices = null, savedResolutions
     videoGenerationId = existingWaiting.id;
   } else task = taskService.createTask(db, log, 'video_generation', '', body.owner_user_id || payer.id, tenantId);
   const imageUrls = routed.filter((asset) => asset.send_to_model && asset.type === 'image').map((asset) => asset.model_url || asset.local_path || asset.url).filter(Boolean);
-  const first = routed.find((asset) => asset.usage === 'first_frame' && asset.send_to_model);
-  const last = routed.find((asset) => asset.usage === 'last_frame' && asset.send_to_model);
   if (existingWaitingId) {
     db.prepare(`UPDATE video_generations SET billing_authorization_id = ?, provider = ?, prompt = ?, model = ?, duration = ?, aspect_ratio = ?, resolution = ?, upscale_resolution = ?, target_fps = ?, seed = ?, camera_fixed = ?, watermark = ?, image_url = ?, first_frame_url = ?, last_frame_url = ?, reference_image_urls = ?, draft_node_id = ?, status = ?, error_msg = NULL, updated_at = ? WHERE id = ?`)
       .run(authorization.authorization_id, billingTarget.provider, modelPrompt, capability.model, Number(body.duration) || null, body.aspect_ratio || null, body.resolution || null, upscaleResolution, targetFps, body.seed != null ? Number(body.seed) : null, body.camera_fixed ? 1 : 0, body.watermark ? 1 : 0, imageUrls[0] || null, first?.model_url || first?.local_path || first?.url || null, last?.model_url || last?.local_path || last?.url || null, imageUrls.length ? JSON.stringify(imageUrls) : null, body.source_context === 'creative_board' && body.draft_node_id != null ? String(body.draft_node_id).slice(0, 200) : null, 'processing', now, videoGenerationId);
@@ -298,6 +305,7 @@ function create(db, log, body, billingUser, savedVoices = null, savedResolutions
   const postProcess = { keep_original_audio: !!body.keep_original_audio, audio_volume: clamp(body.audio_volume, 0, 2, 1), audio_fade_seconds: clamp(body.audio_fade_seconds, 0, 10, 0) };
   const requestSnapshot = { source_context: body.source_context || null, board_id: body.board_id || null, idempotency_key: idempotencyKey || String(body.idempotency_key || '').trim() || null, prompt: modelPrompt, original_prompt: prompt, prompt_document: body.prompt_document || null, asset_selection_policy: assetSelectionPolicy, negative_prompt: body.negative_prompt || '', creation_mode: creationMode, model: capability.model, aspect_ratio: body.aspect_ratio || null, duration: body.duration || null, resolution: body.resolution || null, upscale_resolution: upscaleResolution, target_fps: targetFps, audio_strategy: body.audio_strategy || 'reference_only', post_process: postProcess, assets: routed.map(publicAsset) };
   if (inputValidation) requestSnapshot.input_validation = inputValidation;
+  if (usesArkFrameRoles) requestSnapshot.ark_frame_roles_version = 1;
   if (useStoryboardVoices) {
     requestSnapshot.storyboard_voices = storyboardVoices;
     requestSnapshot.assets = requestSnapshot.assets.slice(0, routed.length - storyboardVoices.length);

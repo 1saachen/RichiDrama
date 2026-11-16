@@ -16,7 +16,10 @@
     <div class="tool-content">
       <section class="workflow-banner" aria-labelledby="tool-title">
         <div><span>AI 单项工具</span><h1 id="tool-title">{{ media === 'image' ? '生成单张图片' : '直接生成单个视频' }}</h1></div>
-        <ul v-if="media === 'video'" aria-label="工作流特点"><li>无需项目</li></ul>
+        <div v-if="media === 'video'" class="workflow-history-actions">
+          <ul aria-label="工作流特点"><li>无需项目</li></ul>
+          <button type="button" class="history-jump" aria-controls="tool-generation-history" :aria-expanded="historyExpanded" @click="showGenerationHistory">生成记录</button>
+        </div>
       </section>
 
       <section id="media-tool-input" class="control-panel" aria-label="创作输入与生成设置">
@@ -91,6 +94,8 @@
             <div><p>结果预览</p><h2>{{ featured ? `生成记录 #${displayId(featured)}` : '等待首次生成' }}</h2></div>
             <span class="status-pill" :class="featured?.status || 'draft'" role="status" aria-live="polite">{{ featured ? statusText(featured.status) : '尚未生成' }}</span>
           </div>
+          <VideoHistoryPrompt v-if="media === 'video' && featured?.video_generation_id"
+            :key="featured.video_generation_id" :generation-id="featured.video_generation_id" class="preview-history-prompt" />
           <div v-if="featured" class="featured">
             <img v-if="media === 'image' && featured.image_url" :src="featured.image_url" :alt="featured.prompt || '生成图片'" width="1280" height="720" />
             <video v-else-if="media === 'video' && mediaUrl(featured)" :src="mediaUrl(featured)" controls playsinline />
@@ -106,13 +111,16 @@
         </section>
       </section>
 
-      <aside class="generation-history" aria-label="生成历史">
-        <button type="button" class="history-toggle" :aria-expanded="String(historyExpanded)" @click="historyExpanded = !historyExpanded"><span>最近生成 <small>{{ items.length }}</small></span><b>{{ historyExpanded ? '收起' : '展开' }}</b></button>
+      <aside id="tool-generation-history" class="generation-history" aria-label="生成历史">
+        <button ref="historyToggle" type="button" class="history-toggle" :aria-expanded="String(historyExpanded)" @click="historyExpanded = !historyExpanded"><span>最近生成 <small>{{ items.length }}</small></span><b>{{ historyExpanded ? '收起' : '展开' }}</b></button>
         <div v-if="historyExpanded && items.length" class="history-list">
-          <button v-for="item in items" :key="historyKey(item)" type="button" class="history-card" :class="{ active: historyKey(featured) === historyKey(item) }" @click="featured = item">
-            <span class="history-preview"><img v-if="media === 'image' && item.image_url" :src="item.image_url" alt="" width="144" height="90" loading="lazy" /><video v-else-if="media === 'video' && (item.local_path || item.video_url)" :src="mediaUrl(item)" muted preload="metadata" /><span v-else aria-hidden="true">●</span></span>
-            <span class="history-copy"><b>{{ statusText(item.status) }} · #{{ displayId(item) }}</b><small>{{ item.prompt || '未命名生成' }}</small><em>{{ formatDate(item.updated_at || item.created_at) }}</em></span>
-          </button>
+          <article v-for="item in items" :key="historyKey(item)" class="history-entry">
+            <button type="button" class="history-card" :class="{ active: historyKey(featured) === historyKey(item) }" @click="featured = item">
+              <span class="history-preview"><img v-if="media === 'image' && item.image_url" :src="item.image_url" alt="" width="144" height="90" loading="lazy" /><video v-else-if="media === 'video' && (item.local_path || item.video_url)" :src="mediaUrl(item)" muted preload="metadata" /><span v-else aria-hidden="true">●</span></span>
+              <span class="history-copy"><b>{{ statusText(item.status) }} · #{{ displayId(item) }}</b><small>{{ item.prompt || '未命名生成' }}</small><em>{{ formatDate(item.updated_at || item.created_at) }}</em></span>
+            </button>
+            <VideoHistoryPrompt v-if="media === 'video' && item.video_generation_id" :generation-id="item.video_generation_id" />
+          </article>
         </div>
         <p v-else-if="historyExpanded" class="history-empty">还没有生成记录。首次提交后，任务会保存在这里。</p>
       </aside>
@@ -121,7 +129,7 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import request from '@/utils/request'
@@ -134,6 +142,7 @@ import OmniAssetPromptEditor from '@/components/OmniAssetPromptEditor.vue'
 import GenerationSettings from '@/components/GenerationSettings.vue'
 import AccountBalanceBadge from '@/components/AccountBalanceBadge.vue'
 import GenerationFailureDetails from '@/components/GenerationFailureDetails.vue'
+import VideoHistoryPrompt from '@/components/VideoHistoryPrompt.vue'
 import { formatChinaDateTime } from '@/utils/time'
 import { useModelOptions } from '@/composables/useModelOptions'
 import { isSeedanceOmniReferenceModel, materialRoutingPreview } from '@/utils/mediaRoutingPreview'
@@ -199,6 +208,14 @@ const applyLastFrame = (asset) => { lastFrameAsset.value = asset || null }
 const formatDate = (value) => formatChinaDateTime(value)
 const historyKey = (item) => item ? `${item.history_kind || props.media}:${item.id}` : ''
 const displayId = (item) => item?.video_generation_id || item?.id || ''
+const historyToggle = ref(null)
+
+async function showGenerationHistory() {
+  historyExpanded.value = true
+  await nextTick()
+  historyToggle.value?.focus({ preventScroll: true })
+  historyToggle.value?.scrollIntoView({ block: 'start' })
+}
 
 function mergeLibraryAssets(assets) {
   const merged = new Map(libraryAssets.value.map((asset) => [Number(asset.id), asset]))
@@ -426,6 +443,27 @@ onBeforeUnmount(clearPoll)
 .workflow-banner p { max-width: 72ch; margin: 0; color: var(--text-muted); line-height: 1.55; }
 .workflow-banner ul { display: flex; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin: 0; padding: 0; list-style: none; }
 .workflow-banner li { padding: 6px 9px; border-radius: 999px; background: var(--bg-raised); color: var(--text-regular); font-size: 11px; white-space: nowrap; }
+.workflow-history-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.stage-heading { flex-wrap: wrap; gap: 10px; }
+.history-jump {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-raised);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+  text-decoration: none;
+  cursor: pointer;
+}
+.history-jump:hover { background: var(--bg-hover); }
+.history-jump:focus-visible, .history-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .control-panel,
 .spec-panel,
 .preview-stage,
@@ -505,6 +543,7 @@ onBeforeUnmount(clearPoll)
 .submit-bar :deep(.el-button) { width: auto; min-width: 190px; }
 .preview-workspace { display: grid; gap: 12px; }
 .preview-stage { min-height: 0; padding: 22px 24px; }
+.preview-history-prompt { margin-top: 6px; }
 .featured,
 .empty-result { min-height: 420px; }
 .featured {
@@ -539,6 +578,7 @@ onBeforeUnmount(clearPoll)
 .history-toggle small { color: var(--text-muted); font-weight: 500; }
 .history-toggle b { color: var(--accent); font-size: 12px; }
 .history-list { grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 0; padding: 0 16px 16px; }
+.history-entry { display: grid; align-content: start; gap: 6px; min-width: 0; }
 .history-empty { margin: 0 16px 16px; }
 @media (max-width: 900px) {
   .tool-topbar-inner { padding: 10px 16px; }
@@ -553,12 +593,14 @@ onBeforeUnmount(clearPoll)
   .asset-section :deep(.asset-grid) { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .frame-selectors { grid-template-columns: 1fr; }
   .featured, .empty-result { min-height: 340px; }
+  .is-video .history-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 620px) {
   .page-title { display: none; }
   .topbar-actions { gap: 8px; }
   .input-section { padding: 18px 16px; }
   .asset-section :deep(.asset-grid), .history-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .is-video .history-list { grid-template-columns: 1fr; }
   .material-limit-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .material-routing-list li { align-items: flex-start; flex-direction: column; }
   .submit-bar { align-items: stretch; flex-direction: column; padding: 16px; }
