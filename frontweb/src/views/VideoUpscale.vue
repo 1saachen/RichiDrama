@@ -3,7 +3,7 @@
     <header class="page-heading">
       <RouterLink to="/ai-tools" class="back-link">← AI 工具箱</RouterLink>
       <h1>视频超分</h1>
-      <p>上传已有视频，提升分辨率，保留原画幅和帧率。</p>
+      <p>将最高 1080p 的原片超分至 2K 或 4K，保留原画幅和帧率。</p>
     </header>
 
     <div class="workbench">
@@ -23,7 +23,7 @@
             <button class="button primary" type="button" :disabled="uploading" @click="fileInput?.click()">
               {{ uploading ? '正在上传…' : '选择视频' }}
             </button>
-            <p>MP4 或 MOV，最大 30 MB</p>
+            <p>MP4 或 MOV，最大 2 GB</p>
           </div>
         </div>
         <div v-if="selected" class="media-info">
@@ -48,7 +48,7 @@
             <div class="target-options">
               <label v-for="option in selected.targets" :key="option">
                 <input v-model="target" type="radio" name="resolution" :value="option">
-                {{ option }}
+                {{ formatTarget(option) }}
               </label>
             </div>
           </fieldset>
@@ -68,7 +68,7 @@
         </form>
 
         <div v-else-if="selected" class="task-state" aria-live="polite">
-          <div class="price"><span>目标分辨率</span><strong>{{ selected.target_resolution }}</strong></div>
+          <div class="price"><span>目标分辨率</span><strong>{{ formatTarget(selected.target_resolution) }}</strong></div>
           <p>{{ statusLabel(selected.status) }}</p>
           <p v-if="selected.error">{{ selected.error }}</p>
           <p v-else-if="isActive(selected)">可以离开此页，处理结果会保存到超分记录。</p>
@@ -88,7 +88,7 @@
         <li v-for="job in records" :key="job.id">
           <button type="button" :aria-pressed="selected?.id === job.id" :disabled="submitting" @click="selectJob(job)">
             <span class="history-title"><strong>{{ job.name }}</strong><small>{{ formatChinaDateTime(job.created_at, '') }}</small></span>
-            <span class="history-resolution">{{ job.target_resolution || '—' }}</span>
+            <span class="history-resolution">{{ formatTarget(job.target_resolution) }}</span>
             <span class="status" :data-status="job.status">{{ statusLabel(job.status) }}</span>
           </button>
         </li>
@@ -105,9 +105,13 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { VideoCamera } from '@element-plus/icons-vue'
-import { videoUpscales } from '@/api/videoUpscales'
+import { MAX_UPSCALE_UPLOAD_BYTES, videoUpscales } from '@/api/videoUpscales'
 import { formatCredits } from '@/utils/billingPresentation'
 import { formatChinaDateTime } from '@/utils/time'
+
+function formatTarget(value) {
+  return value === '2k' || value === '4k' ? value.toUpperCase() : value || '—'
+}
 
 const route = useRoute()
 const router = useRouter()
@@ -149,7 +153,7 @@ function mediaLabel(media) {
 function selectJob(job) {
   selected.value = job
   previewKind.value = job.status === 'completed' ? 'result' : 'source'
-  target.value = job.status === 'ready' ? job.targets.at(-1) : ''
+  target.value = job.status === 'ready' ? (job.targets.includes('1080p') ? '1080p' : job.targets[0]) : ''
   error.value = ''
   if (route.query.job !== job.id) router.replace({ query: { ...route.query, job: job.id } })
 }
@@ -159,8 +163,8 @@ async function uploadVideo(event) {
   event.target.value = ''
   if (!file) return
   error.value = ''
-  if (!/\.(mp4|mov)$/i.test(file.name) || file.size > 30 * 1024 * 1024) {
-    error.value = '请选择 30 MB 以内的 MP4 或 MOV 视频'
+  if (!/\.(mp4|mov)$/i.test(file.name) || file.size > MAX_UPSCALE_UPLOAD_BYTES) {
+    error.value = '请选择 2 GB 以内的 MP4 或 MOV 视频'
     return
   }
   uploading.value = true

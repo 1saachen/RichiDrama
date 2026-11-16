@@ -2,6 +2,7 @@ import request from '@/utils/request'
 
 const endpoint = '/video-upscales'
 const options = { errorHandledLocally: true }
+export const MAX_UPSCALE_UPLOAD_BYTES = 2 * 1024 ** 3
 
 export const videoUpscales = {
   list(before) { return request.get(endpoint, { ...options, params: { before } }) },
@@ -11,7 +12,7 @@ export const videoUpscales = {
     data.append('file', file)
     data.append('name', file.name)
     return request.post(endpoint, data, {
-      ...options, headers: { 'Content-Type': 'multipart/form-data' }, onUploadProgress,
+      ...options, timeout: 60 * 60 * 1000, headers: { 'Content-Type': 'multipart/form-data' }, onUploadProgress,
     })
   },
   quote(id, target) {

@@ -54,7 +54,7 @@ const audioUpload = multer({
 // 媒体上传（视频/音频/图片混合入口）流式写入 storage/.tmp-uploads，
 // 上限与去重口径共用 mediaAssetService.LIMITS，不再各自硬编码；
 // 内存暂存版本会在 2GB 文件下打爆进程，diskStorage 后内存占用与文件大小无关。
-function createMediaUpload(cfg, maxSizeMb = mediaAsset.LIMITS.video) {
+function createMediaUpload(cfg, maxSizeMb = mediaAsset.LIMITS.video, { inclusive = false } = {}) {
   const tempDir = mediaAsset.uploadTempDir(mediaAsset.resolveStoragePath(cfg));
   const storage = multer.diskStorage({
     destination(_req, _file, cb) { require('node:fs').mkdirSync(tempDir, { recursive: true }); cb(null, tempDir); },
@@ -63,7 +63,8 @@ function createMediaUpload(cfg, maxSizeMb = mediaAsset.LIMITS.video) {
       cb(null, `${Date.now()}-${randomUUID()}${ext}`);
     },
   });
-  return multer({ storage, limits: { fileSize: maxSizeMb * 1024 * 1024 } });
+  // Busboy signals truncation as soon as its byte limit is reached.
+  return multer({ storage, limits: { fileSize: maxSizeMb * 1024 * 1024 + Number(inclusive) } });
 }
 
 function routes(cfg, log, db) {

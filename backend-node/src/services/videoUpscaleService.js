@@ -98,6 +98,8 @@ async function downloadResult(url, storagePath, row, job) {
 
 function targetSatisfied(probe, target) {
   const shortEdge = Math.min(probe.width, probe.height);
+  if (target === '4k') return shortEdge > 1440 && shortEdge <= 2160;
+  if (target === '2k') return shortEdge > 1080 && shortEdge <= 1440;
   if (target === '1080p') return shortEdge >= 1040;
   return shortEdge >= 700;
 }

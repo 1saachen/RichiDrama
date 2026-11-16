@@ -40,6 +40,22 @@ test('release fails closed when a required lifecycle table cannot be read', t =>
   const f = fixture(t); const db = new Database(f.file); db.exec('DROP TABLE async_tasks'); db.close();
   assert.throws(() => f.run(), /Required table missing/);
 });
+test('standalone upscales must drain before release while drafts and completed results stay readable', t => {
+  const f = fixture(t);
+  const db = new Database(f.file);
+  db.exec(`CREATE TABLE standalone_video_upscale_jobs(status TEXT);
+    INSERT INTO standalone_video_upscale_jobs VALUES ('ready'), ('queued'), ('submitting'), ('processing'), ('completed'), ('reconciliation')`);
+  db.close();
+  const before = fs.readFileSync(f.file);
+  const busy = f.run();
+  assert.equal(busy.code, 75);
+  assert.equal(busy.output[0].active.standalone_video_upscale_jobs, 3);
+  assert.deepEqual(fs.readFileSync(f.file), before);
+  const settled = new Database(f.file);
+  settled.exec("UPDATE standalone_video_upscale_jobs SET status='completed' WHERE status IN ('queued','submitting','processing')");
+  settled.close();
+  assert.equal(f.run().code, 0);
+});
 test('new relay image and understanding jobs block release until inactive without changing historical rows', t => {
   const f=fixture(t),db=new Database(f.file);
   db.exec("CREATE TABLE relay_model_jobs(state TEXT); INSERT INTO relay_model_jobs VALUES ('completed'),('reconciliation'),('submitting')");
