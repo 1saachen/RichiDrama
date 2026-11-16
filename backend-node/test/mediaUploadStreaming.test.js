@@ -113,5 +113,5 @@ test('media limits stay single-sourced for multer and validation', () => {
   const maxSizeMb = mediaAsset.limits().files.video.max_mb
   assert.equal(maxSizeMb, 2048)
   assert.equal(createMediaUpload({}).limits.fileSize, maxSizeMb * 1024 * 1024)
-  assert.equal(createMediaUpload({}, 30).limits.fileSize, 30 * 1024 * 1024)
+  assert.equal(createMediaUpload({}, maxSizeMb, { inclusive: true }).limits.fileSize, 2 * 1024 ** 3 + 1)
 })

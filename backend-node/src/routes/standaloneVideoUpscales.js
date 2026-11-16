@@ -1,13 +1,13 @@
 const response = require('../response');
 const jobs = require('../services/standaloneVideoUpscaleService');
-const { resolveStoragePath } = require('../services/mediaAssetService');
+const { LIMITS, resolveStoragePath } = require('../services/mediaAssetService');
 const { resolveStorageFile } = require('../utils/storagePath');
 const { createMediaUpload } = require('./upload');
 const uploadTempBackstop = require('../middleware/uploadTempBackstop');
 
 module.exports = (router, cfg, db) => {
   const endpoint = '/video-upscales';
-  const upload = createMediaUpload(cfg, 30).single('file');
+  const upload = createMediaUpload(cfg, LIMITS.video, { inclusive: true }).single('file');
   const withJob = (handler) => (req, res, next) => {
     const job = jobs.owned(db, req.auth, req.params.id);
     if (!job) return response.notFound(res, '视频超分记录不存在');

@@ -20,11 +20,20 @@ const SOURCE = 'standalone_video_upscale';
 const PROVIDER = 'volcengine_mediakit';
 const TABLE = 'standalone_video_upscale_jobs';
 const TARGETS = ['720p', '1080p'];
+const HIGH_TARGETS = {
+  '2k': { width: 2560, height: 1440, previousShort: 1080 },
+  '4k': { width: 3840, height: 2160, previousShort: 1440 },
+};
 const POLL_MS = 5000;
 const LEASE_MS = 180_000;
+const SMALL_UPLOAD_BYTES = 30 * 1024 ** 2;
+const LARGE_TRANSFER_MS = 45 * 60 * 1000;
 const TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const now = () => new Date().toISOString();
 const shortEdge = ({ width, height }) => Math.min(width, height);
+const longEdge = ({ width, height }) => Math.max(width, height);
+const highTarget = (target) => Object.hasOwn(HIGH_TARGETS, target) ? HIGH_TARGETS[target] : null;
+const fittedShortEdge = (source, spec) => Math.min(spec.height, spec.width * shortEdge(source) / longEdge(source));
 
 async function probe(file) {
   const { stdout } = await runMediaProcess(getFfprobePath(), [
@@ -50,7 +59,14 @@ async function probe(file) {
 }
 
 function targets(media) {
-  return TARGETS.filter((target) => shortEdge(media) < Number.parseInt(target, 10));
+  const choices = TARGETS.filter((target) => shortEdge(media) < Number.parseInt(target, 10));
+  if (media.upscale_targets_version === 1) {
+    for (const [target, spec] of Object.entries(HIGH_TARGETS)) {
+      // A wide source must still fit the billed short-edge tier without cropping.
+      if (fittedShortEdge(media, spec) >= spec.previousShort + 2) choices.push(target);
+    }
+  }
+  return choices;
 }
 
 function owned(db, actor, id) {
@@ -85,10 +101,12 @@ async function importVideo(db, cfg, actor, file, originalName) {
   let media;
   try { media = await probe(file.path); }
   catch (_) { throw new Error('无法读取视频，请重新导出为 MP4 或 MOV 后上传'); }
-  if (shortEdge(media) < 360 || Math.max(media.width, media.height) > 1920 || !targets(media).length) {
-    throw new Error('视频短边需为 360–1079 像素，长边不能超过 1920 像素');
+  if (shortEdge(media) < 360 || shortEdge(media) > 1080 || longEdge(media) > 1920) {
+    throw new Error('视频短边需为 360–1080 像素，长边不能超过 1920 像素');
   }
   if (media.hdr || media.fps > 120) throw new Error('请选择 SDR 视频，帧率最高为 120 fps');
+  media.size_bytes = file.size;
+  media.upscale_targets_version = 1;
 
   const id = randomUUID();
   const relative = `standalone-upscale/${id}/source${ext}`;
@@ -132,10 +150,22 @@ function priceInput(row, target, config) {
   };
 }
 
+function requireHighTargetPrice(input, snapshot) {
+  const expected = input.pricing_context;
+  if (!highTarget(expected.resolution_tier)) return;
+  const rate = snapshot.rates.find((entry) => entry.meter === 'millisecond');
+  const rule = rate?.conditions?.rates?.find((entry) => entry.id === rate.rate_id);
+  if (rule?.when?.resolution_tier !== expected.resolution_tier || rule?.when?.fps_tier !== expected.fps_tier) {
+    throw new Error(`当前价目未配置 ${expected.resolution_tier.toUpperCase()} 的对应帧率，请联系管理员`);
+  }
+}
+
 function quote(db, actor, row, target) {
   if (row.status !== 'ready') throw new Error('该视频已提交超分');
   const config = providerConfig(db, actor);
-  const priced = billing.quote(db, actor, priceInput(row, target, config));
+  const input = priceInput(row, target, config);
+  const priced = billing.quote(db, actor, input);
+  requireHighTargetPrice(input, priced);
   return { amount: priced.amount, amount_micro: priced.amount_micro };
 }
 
@@ -150,6 +180,7 @@ function submit(db, cfg, actor, row, body) {
     const config = providerConfig(db, actor);
     const input = priceInput(current, body.target_resolution, config);
     const authorization = billing.createAuthorization(db, actor, input);
+    requireHighTargetPrice(input, authorization.snapshot);
     if (authorization.amount_micro !== body.amount_micro) throw new Error('积分报价已更新，请重新获取报价后确认');
     db.prepare(`UPDATE ${TABLE} SET status='queued', target_resolution=?, authorization_id=?, config_id=?, config_fingerprint=?, updated_at=?
       WHERE id=?`).run(body.target_resolution, authorization.authorization_id, config.id, fingerprint(config), now(), current.id);
@@ -173,28 +204,35 @@ function fail(db, row, message) {
   })();
 }
 
-async function archive(cfg, row, url) {
+async function checkedOutput(row, file) {
+  const source = JSON.parse(row.source_media_json);
+  try {
+    const output = await probe(file);
+    validateOutput(source, output, row.target_resolution);
+    const spec = highTarget(row.target_resolution);
+    if ((spec && shortEdge(output) < fittedShortEdge(source, spec) * 0.98)
+        || shortEdge(output) <= shortEdge(source) || fpsTier(output.fps) !== fpsTier(source.fps)
+        || (source.audio && !output.audio) || Math.abs(output.duration_ms - source.duration_ms) > Math.max(500, source.duration_ms * 0.02)) {
+      throw new Error('成片的分辨率、帧率、音轨或时长未通过校验');
+    }
+    return output;
+  } catch (error) {
+    error.code = 'INVALID_UPSCALE_OUTPUT';
+    throw error;
+  }
+}
+
+async function archive(cfg, row, url, signal) {
   const relative = `standalone-upscale/${row.id}/result.mp4`;
   const root = resolveStoragePath(cfg);
   const absolute = path.join(root, relative);
   const temp = `${absolute}.part`;
-  const response = await fetch(url, { signal: AbortSignal.timeout(90_000) });
+  const response = await fetch(url, { signal });
   if (!response.ok || !response.body) throw new Error(`超分结果下载失败（HTTP ${response.status}）`);
   try {
-    await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(temp));
-    const source = JSON.parse(row.source_media_json);
-    let output;
-    try {
-      output = await probe(temp);
-      validateOutput(source, output, row.target_resolution);
-      if (shortEdge(output) <= shortEdge(source) || fpsTier(output.fps) !== fpsTier(source.fps)
-          || (source.audio && !output.audio) || Math.abs(output.duration_ms - source.duration_ms) > Math.max(500, source.duration_ms * 0.02)) {
-        throw new Error('成片的分辨率、帧率、音轨或时长未通过校验');
-      }
-    } catch (error) {
-      error.code = 'INVALID_UPSCALE_OUTPUT';
-      throw error;
-    }
+    await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(temp), { signal });
+    const output = await checkedOutput(row, temp);
+    signal.throwIfAborted();
     fs.renameSync(temp, absolute);
     return { relative, output };
   } finally {
@@ -229,18 +267,33 @@ function syncReconciled(db) {
 }
 
 async function processJob(db, log, cfg, id) {
-  const lease = new Date(Date.now() + LEASE_MS).toISOString();
+  const nextLease = () => new Date(Date.now() + LEASE_MS).toISOString();
+  let lease = nextLease();
   if (!db.prepare(`UPDATE ${TABLE} SET lease_until=? WHERE id=? AND status IN ('queued','submitting','processing')
       AND (lease_until IS NULL OR lease_until<?)`).run(lease, id, now()).changes) return;
+  const ownership = new AbortController();
+  const deadline = (milliseconds) => AbortSignal.any([ownership.signal, AbortSignal.timeout(milliseconds)]);
+  const extendLease = db.prepare(`UPDATE ${TABLE} SET lease_until=? WHERE id=? AND lease_until=? AND lease_until>?`);
+  const heartbeat = setInterval(() => {
+    try {
+      const next = nextLease();
+      if (!extendLease.run(next, id, lease, now()).changes) ownership.abort();
+      else lease = next;
+    } catch (_) { ownership.abort(); }
+  }, LEASE_MS / 3);
+  heartbeat.unref();
   let row;
   try {
     row = db.prepare(`SELECT * FROM ${TABLE} WHERE id=?`).get(id);
+    const large = Number(JSON.parse(row.source_media_json).size_bytes) > SMALL_UPLOAD_BYTES;
     if (row.status === 'submitting') return reconcile(db, row, '超分提交结果待核实，请等待管理员对账');
     if (row.status === 'processing') {
       const relative = `standalone-upscale/${id}/result.mp4`;
       const root = resolveStoragePath(cfg);
       if (fs.existsSync(path.join(root, relative))) {
-        const output = await probe(resolveStorageFile(root, relative));
+        const file = resolveStorageFile(root, relative);
+        const output = highTarget(row.target_resolution) ? await checkedOutput(row, file) : await probe(file);
+        ownership.signal.throwIfAborted();
         return complete(db, row, { relative, output }, row.provider_request_id || row.provider_task_id);
       }
     }
@@ -255,7 +308,8 @@ async function processJob(db, log, cfg, id) {
       require('./modelCatalogService').assertAvailable(db, TYPE, BILLING_MODEL);
       const authorization = billing.getAuthorization(db, row.authorization_id);
       const file = resolveStorageFile(resolveStoragePath(cfg), row.source_path);
-      const uploaded = await client.uploadLocalVideo(db, file, config, AbortSignal.timeout(75_000));
+      const uploaded = await client.uploadLocalVideo(db, file, config, deadline(large ? LARGE_TRANSFER_MS : 75_000));
+      ownership.signal.throwIfAborted();
       db.prepare(`UPDATE ${TABLE} SET status='submitting', provider_request_id=?, updated_at=? WHERE id=?`).run(uploaded.request_id, now(), id);
       row.status = 'submitting';
       row.provider_request_id = uploaded.request_id;
@@ -265,15 +319,17 @@ async function processJob(db, log, cfg, id) {
         user_id: actor.id, pricing_context: { resolution: row.target_resolution, ...input.pricing_context },
       }, () => client.submit(db, {
         video_url: uploaded.file_id, resolution: row.target_resolution, client_token: `standalone-up-${id}`,
-      }, config, AbortSignal.timeout(20_000)), (accepted) => ({
+      }, config, deadline(20_000)), (accepted) => ({
         status: 'processing', provider_task_id: accepted.task_id, provider_request_id: accepted.request_id, usage: { request: 1 },
       }));
+      ownership.signal.throwIfAborted();
       const at = now();
       db.prepare(`UPDATE ${TABLE} SET status='processing', provider_task_id=?, provider_request_id=COALESCE(?,provider_request_id),
         submitted_at=?, updated_at=? WHERE id=?`).run(result.task_id, result.request_id, at, at, id);
       return;
     }
-    const result = await client.retrieve(db, row.provider_task_id, config, AbortSignal.timeout(15_000));
+    const result = await client.retrieve(db, row.provider_task_id, config, deadline(15_000));
+    ownership.signal.throwIfAborted();
     if (result.status === 'failed') return fail(db, row, '超分服务处理失败，已释放预授权');
     if (result.status !== 'completed' || !result.result?.video_url) {
       db.prepare(`UPDATE ${TABLE} SET updated_at=?, error_msg=NULL WHERE id=?`).run(now(), id);
@@ -282,8 +338,11 @@ async function processJob(db, log, cfg, id) {
     const providerRequestId = result.request_id || row.provider_request_id || row.provider_task_id;
     db.prepare(`UPDATE ${TABLE} SET provider_request_id=? WHERE id=?`).run(providerRequestId, id);
     row.provider_request_id = providerRequestId;
-    complete(db, row, await archive(cfg, row, result.result.video_url), providerRequestId);
+    const archived = await archive(cfg, row, result.result.video_url, deadline(large || highTarget(row.target_resolution) ? LARGE_TRANSFER_MS : 90_000));
+    ownership.signal.throwIfAborted();
+    complete(db, row, archived, providerRequestId);
   } catch (error) {
+    if (ownership.signal.aborted) return;
     log.warn('Standalone video upscale step failed', { id, status: row?.status, error_code: error.code || error.name });
     if (row?.status === 'queued') fail(db, row, '超分未提交，已释放预授权');
     else if (row?.status === 'submitting') reconcile(db, row, '超分提交结果待核实，请等待管理员对账');
@@ -292,28 +351,38 @@ async function processJob(db, log, cfg, id) {
       db.prepare(`UPDATE ${TABLE} SET error_msg=?, updated_at=? WHERE id=?`).run('正在重新查询或归档超分结果', now(), id);
     }
   } finally {
+    clearInterval(heartbeat);
     db.prepare(`UPDATE ${TABLE} SET lease_until=NULL WHERE id=? AND lease_until=?`).run(id, lease);
   }
 }
 
 function resume(db, log, cfg) {
-  let busy = false;
+  const small = new Map();
+  const large = new Map();
+  const nextJobs = db.prepare(`SELECT id FROM ${TABLE} WHERE status IN ('queued','submitting','processing')
+    AND (lease_until IS NULL OR lease_until<?)
+    AND (COALESCE(json_extract(source_media_json, '$.size_bytes'), 0) > ?
+      OR COALESCE(target_resolution, '') IN ('2k', '4k')) = ?
+    ORDER BY updated_at, created_at LIMIT ?`);
   let stopped = false;
-  async function sweep() {
-    if (busy || stopped) return;
-    busy = true;
+  function dispatch(active, isLarge, limit) {
+    for (const { id } of nextJobs.all(now(), SMALL_UPLOAD_BYTES, isLarge, limit - active.size)) {
+      if (active.has(id)) continue;
+      active.set(id, processJob(db, log, cfg, id)
+        .catch((error) => log.error('Standalone video upscale recovery failed', { error_code: error.code }))
+        .finally(() => active.delete(id)));
+    }
+  }
+  function sweep() {
+    if (stopped) return;
     try {
       syncReconciled(db);
-      const jobs = db.prepare(`SELECT id FROM ${TABLE} WHERE status IN ('queued','submitting','processing')
-        AND (lease_until IS NULL OR lease_until<?) ORDER BY updated_at, created_at LIMIT 12`).all(now());
-      await Promise.allSettled(jobs.map(({ id }) => processJob(db, log, cfg, id))).then((results) => {
-        for (const result of results) {
-          if (result.status === 'rejected') log.error('Standalone video upscale recovery failed', { error_code: result.reason?.code });
-        }
-      });
+      // Reserve worker capacity for ordinary jobs while large transfers are in flight.
+      dispatch(small, 0, 12);
+      dispatch(large, 1, 2);
     } catch (error) {
       log.error('Standalone video upscale sweep failed', { error_code: error.code });
-    } finally { busy = false; }
+    }
   }
   const timer = setInterval(sweep, POLL_MS);
   timer.unref();
@@ -321,7 +390,7 @@ function resume(db, log, cfg) {
   return async () => {
     stopped = true;
     clearInterval(timer);
-    while (busy) await new Promise((resolve) => setTimeout(resolve, 20));
+    await Promise.allSettled([...small.values(), ...large.values()]);
   };
 }
 
