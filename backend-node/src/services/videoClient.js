@@ -709,6 +709,8 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
   const finalModel = normalizeVolcModel(model);
   const usesArkFrameRoles = opts.ark_frame_roles === true;
   const isSeedance25 = /seedance[-_]?2[-_]?5|2[-_]?5[-_]?260628/i.test(finalModel);
+  const referenceRules = require('./seedanceInputValidation').rulesForModel(finalModel);
+  const isSeedance25Flash = /seedance[-_.]?2[-_.]?5[-_.]?flash(?=$|[-_.])/i.test(finalModel);
   const ratio = requireVolcengineVideoRatio(usesArkFrameRoles && isSeedance25 ? 'adaptive' : aspect_ratio);
   const effectiveDuration = normalizeVolcOmniDuration(finalModel, duration);
 
@@ -717,7 +719,7 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
   const orderedUrls = [...(primary ? [primary] : []), ...refList.filter((u) => u !== primary)];
   // Seedance 2.5 accepts a larger image-reference set. Legacy Seedance
   // requests keep their established nine-image transport limit.
-  const maxRef = isSeedance25 ? 30 : 9;
+  const maxRef = isSeedance25Flash ? referenceRules.image : isSeedance25 ? 30 : 9;
   const images = usesArkFrameRoles
     ? [
       { url: opts.first_frame_url, role: 'first_frame' },
@@ -725,12 +727,19 @@ async function callVolcengineOmniVideoApi(config, log, opts) {
     ]
     : orderedUrls.slice(0, maxRef).map(url => ({ url, role: 'reference_image' }));
   const referenceImageInputs = Array.isArray(opts.reference_image_inputs) ? opts.reference_image_inputs : [];
-  const maxVideoRef = isSeedance25 ? 10 : 3;
+  const maxVideoRef = isSeedance25Flash ? referenceRules.video : isSeedance25 ? 10 : 3;
   const videoUrls = Array.isArray(reference_video_urls)
     ? reference_video_urls.map((value) => String(value || '').trim()).filter(Boolean).slice(0, maxVideoRef)
     : [];
   const audioUrls = Array.isArray(opts.reference_audio_urls)
     ? opts.reference_audio_urls : opts.voice_reference_url ? [opts.voice_reference_url] : [];
+  if (isSeedance25Flash) {
+    const counts = { image: orderedUrls.length, video: Array.isArray(reference_video_urls) ? reference_video_urls.filter(Boolean).length : 0, audio: audioUrls.length };
+    for (const type of ['image', 'video', 'audio']) {
+      if (counts[type] > referenceRules[type]) throw new Error(`Seedance 2.5 Flash 最多支持 ${referenceRules[type]} 个${{ image: '图片', video: '视频', audio: '音频' }[type]}参考素材`);
+    }
+    if (opts.draft_mode === true) throw new Error('Seedance 2.5 Flash 不支持样片模式');
+  }
   if (usesArkFrameRoles && (!opts.first_frame_url || orderedUrls.length || videoUrls.length || audioUrls.length)) {
     throw new Error('Seedance 首尾帧模式需要首帧图片，且不能同时提交其他参考素材');
   }

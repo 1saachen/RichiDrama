@@ -1,0 +1,140 @@
+{
+  "at": "2026-11-18T07:05:07.439Z",
+  "status": 200,
+  "supplier_requests": [
+    {
+      "status": 200,
+      "request_id": "20261118150506F0D6AA738ED6D47A3405"
+    },
+    {
+      "status": 200,
+      "request_id": "20261118150507D62D07F802E0D42C3282"
+    }
+  ],
+  "source": {
+    "FoundationModelName": "doubao-seedance-2-5-flash",
+    "State": "Available",
+    "VendorName": "字节跳动",
+    "DisplayName": "Doubao-Seedance-2.5-flash",
+    "ChargeItems": [
+      {
+        "Price": 0.046,
+        "UnitCode": "千tokens",
+        "Type": "NV2VCompletion",
+        "OriginalPrice": 0.046
+      },
+      {
+        "Price": 0.028,
+        "UnitCode": "千tokens",
+        "Type": "V2VCompletion",
+        "OriginalPrice": 0.028
+      }
+    ],
+    "MultiChargeItems": [
+      {
+        "ChargeItems": [
+          {
+            "Price": 0.046,
+            "UnitCode": "千tokens",
+            "Type": "NV2VCompletion",
+            "OriginalPrice": 0.046
+          },
+          {
+            "Price": 0.028,
+            "UnitCode": "千tokens",
+            "Type": "V2VCompletion",
+            "OriginalPrice": 0.028
+          }
+        ]
+      }
+    ],
+    "FreeResourcePackItems": [],
+    "SubServices": [
+      {
+        "SubService": "base",
+        "Status": "Available"
+      }
+    ],
+    "Instruction": "https://www.volcengine.com/docs/82379/1520757",
+    "IsOverdue": false,
+    "IsLimitedActivation": false,
+    "IsDeprecated": false
+  },
+  "candidates": [
+    {
+      "id": 1,
+      "sync_id": "83bf3043-c3f9-4dca-ad68-7a7bdaa0cf21",
+      "provider": "volcengine",
+      "provider_model": "doubao-seedance-2-5-flash",
+      "display_name": "Doubao-Seedance-2.5-flash",
+      "charge_type": "VerifiedVideoInputResolutionRates",
+      "unit_code": "千tokens",
+      "currency": "CNY",
+      "provider_unit_price": "V2VCompletion=0.028; NV2VCompletion=0.046",
+      "service_type": "video",
+      "billing_key": "doubao-seedance-2-5-flash-261115",
+      "meter": "output_token",
+      "unit_size": 1000000,
+      "new_unit_price_micro": 46000000,
+      "current_unit_price_micro": null,
+      "current_price_book_item_id": null,
+      "change_ratio": null,
+      "mapping_status": "mapped",
+      "review_status": "pending",
+      "error_summary": null,
+      "raw_item_json": "{\"mapping_rule\":\"verified-platform-models-v10-seedance25-flash\",\"source\":[{\"ChargeItems\":[{\"Price\":0.046,\"UnitCode\":\"千tokens\",\"Type\":\"NV2VCompletion\",\"OriginalPrice\":0.046},{\"Price\":0.028,\"UnitCode\":\"千tokens\",\"Type\":\"V2VCompletion\",\"OriginalPrice\":0.028}]}]}",
+      "created_at": "2026-11-18T07:05:06.369Z",
+      "updated_at": "2026-11-18T07:05:06.369Z",
+      "new_conditions_json": "{\"unit_size\":1000000,\"default_rate_id\":\"no_video_input\",\"rates\":[{\"id\":\"with_video_input\",\"when\":{\"has_video_input\":true},\"unit_price_points\":2800,\"unit_size\":1000000},{\"id\":\"no_video_input\",\"when\":{\"has_video_input\":false},\"unit_price_points\":4600,\"unit_size\":1000000}]}",
+      "conditions_changed": true,
+      "excluded_from_sync": false,
+      "is_unchanged": false,
+      "current_conditions": null,
+      "new_conditions": {
+        "unit_size": 1000000,
+        "default_rate_id": "no_video_input",
+        "rates": [
+          {
+            "id": "with_video_input",
+            "when": {
+              "has_video_input": true
+            },
+            "unit_price_points": 2800,
+            "unit_size": 1000000
+          },
+          {
+            "id": "no_video_input",
+            "when": {
+              "has_video_input": false
+            },
+            "unit_price_points": 4600,
+            "unit_size": 1000000
+          }
+        ]
+      },
+      "raw_item": {
+        "mapping_rule": "verified-platform-models-v10-seedance25-flash",
+        "source": [
+          {
+            "ChargeItems": [
+              {
+                "Price": 0.046,
+                "UnitCode": "千tokens",
+                "Type": "NV2VCompletion",
+                "OriginalPrice": 0.046
+              },
+              {
+                "Price": 0.028,
+                "UnitCode": "千tokens",
+                "Type": "V2VCompletion",
+                "OriginalPrice": 0.028
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "production_configuration_changed": false,
+  "inference_calls": 0
+}

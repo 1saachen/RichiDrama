@@ -1,0 +1,274 @@
+{
+  "at": "2026-11-18T07:29:52.306Z",
+  "status": 200,
+  "supplier_requests": [
+    {
+      "status": 200,
+      "request_id": "202611181529497630045182BA09A11415"
+    },
+    {
+      "status": 200,
+      "request_id": "20261118152951D8E37BB4F62199F15F5E"
+    }
+  ],
+  "source": {
+    "FoundationModelName": "doubao-seedance-2-5",
+    "State": "Available",
+    "VendorName": "字节跳动",
+    "DisplayName": "Doubao-Seedance-2.5",
+    "ChargeItems": [
+      {
+        "Price": 0.042,
+        "UnitCode": "千tokens",
+        "Type": "V2VCompletion",
+        "OriginalPrice": 0.042
+      },
+      {
+        "Price": 0.07,
+        "UnitCode": "千tokens",
+        "Type": "NV2VCompletion",
+        "OriginalPrice": 0.07
+      },
+      {
+        "Price": 0.077,
+        "UnitCode": "千tokens",
+        "Type": "NV2V1080Completion",
+        "OriginalPrice": 0.077
+      },
+      {
+        "Price": 0.019,
+        "UnitCode": "千tokens",
+        "Type": "V2V4KCompletion",
+        "OriginalPrice": 0.019
+      },
+      {
+        "Price": 0.046,
+        "UnitCode": "千tokens",
+        "Type": "V2V1080Completion",
+        "OriginalPrice": 0.046
+      },
+      {
+        "Price": 0.031,
+        "UnitCode": "千tokens",
+        "Type": "NV2V4KCompletion",
+        "OriginalPrice": 0.031
+      }
+    ],
+    "MultiChargeItems": [
+      {
+        "ChargeItems": [
+          {
+            "Price": 0.07,
+            "UnitCode": "千tokens",
+            "Type": "NV2VCompletion",
+            "OriginalPrice": 0.07
+          },
+          {
+            "Price": 0.077,
+            "UnitCode": "千tokens",
+            "Type": "NV2V1080Completion",
+            "OriginalPrice": 0.077
+          },
+          {
+            "Price": 0.042,
+            "UnitCode": "千tokens",
+            "Type": "V2VCompletion",
+            "OriginalPrice": 0.042
+          },
+          {
+            "Price": 0.031,
+            "UnitCode": "千tokens",
+            "Type": "NV2V4KCompletion",
+            "OriginalPrice": 0.031
+          },
+          {
+            "Price": 0.046,
+            "UnitCode": "千tokens",
+            "Type": "V2V1080Completion",
+            "OriginalPrice": 0.046
+          },
+          {
+            "Price": 0.019,
+            "UnitCode": "千tokens",
+            "Type": "V2V4KCompletion",
+            "OriginalPrice": 0.019
+          }
+        ]
+      }
+    ],
+    "FreeResourcePackItems": [],
+    "SubServices": [
+      {
+        "SubService": "base",
+        "Status": "Available"
+      }
+    ],
+    "Instruction": "https://www.volcengine.com/docs/82379/1520757",
+    "IsOverdue": false,
+    "IsLimitedActivation": false,
+    "IsDeprecated": false
+  },
+  "candidates": [
+    {
+      "id": 1,
+      "sync_id": "255ac6ba-36e6-4ecd-9bf6-d5959c2a947f",
+      "provider": "volcengine",
+      "provider_model": "doubao-seedance-2-5",
+      "display_name": "Doubao-Seedance-2.5",
+      "charge_type": "VerifiedVideoInputResolutionRates",
+      "unit_code": "千tokens",
+      "currency": "CNY",
+      "provider_unit_price": "V2V4KCompletion=0.019; NV2V4KCompletion=0.031; V2V1080Completion=0.046; NV2V1080Completion=0.077; V2VCompletion=0.042; NV2VCompletion=0.07",
+      "service_type": "video",
+      "billing_key": "doubao-seedance-2-5-260628",
+      "meter": "output_token",
+      "unit_size": 1000000,
+      "new_unit_price_micro": 70000000,
+      "current_unit_price_micro": 700000000000,
+      "current_price_book_item_id": 14,
+      "change_ratio": -0.9999,
+      "mapping_status": "mapped",
+      "review_status": "pending",
+      "error_summary": null,
+      "raw_item_json": "{\"mapping_rule\":\"verified-platform-models-v11-seedance25-4k\",\"source\":[{\"ChargeItems\":[{\"Price\":0.07,\"UnitCode\":\"千tokens\",\"Type\":\"NV2VCompletion\",\"OriginalPrice\":0.07},{\"Price\":0.077,\"UnitCode\":\"千tokens\",\"Type\":\"NV2V1080Completion\",\"OriginalPrice\":0.077},{\"Price\":0.042,\"UnitCode\":\"千tokens\",\"Type\":\"V2VCompletion\",\"OriginalPrice\":0.042},{\"Price\":0.031,\"UnitCode\":\"千tokens\",\"Type\":\"NV2V4KCompletion\",\"OriginalPrice\":0.031},{\"Price\":0.046,\"UnitCode\":\"千tokens\",\"Type\":\"V2V1080Completion\",\"OriginalPrice\":0.046},{\"Price\":0.019,\"UnitCode\":\"千tokens\",\"Type\":\"V2V4KCompletion\",\"OriginalPrice\":0.019}]}]}",
+      "created_at": "2026-11-18T07:29:49.052Z",
+      "updated_at": "2026-11-18T07:29:49.052Z",
+      "new_conditions_json": "{\"unit_size\":1000000,\"default_rate_id\":\"no_video_input\",\"rates\":[{\"id\":\"with_video_input_4k\",\"when\":{\"has_video_input\":true,\"resolution\":\"4k\"},\"unit_price_points\":1900,\"unit_size\":1000000},{\"id\":\"no_video_input_4k\",\"when\":{\"has_video_input\":false,\"resolution\":\"4k\"},\"unit_price_points\":3100,\"unit_size\":1000000},{\"id\":\"with_video_input_1080p\",\"when\":{\"has_video_input\":true,\"resolution\":\"1080p\"},\"unit_price_points\":4600,\"unit_size\":1000000},{\"id\":\"no_video_input_1080p\",\"when\":{\"has_video_input\":false,\"resolution\":\"1080p\"},\"unit_price_points\":7700,\"unit_size\":1000000},{\"id\":\"with_video_input\",\"when\":{\"has_video_input\":true},\"unit_price_points\":4200,\"unit_size\":1000000},{\"id\":\"no_video_input\",\"when\":{\"has_video_input\":false},\"unit_price_points\":7000,\"unit_size\":1000000}]}",
+      "conditions_changed": true,
+      "excluded_from_sync": false,
+      "is_unchanged": false,
+      "current_conditions": {
+        "currency": "CNY",
+        "unit_size": 1000000,
+        "source": "Volcengine ModelArk console",
+        "verified_on": "2026-08-12",
+        "provider": "volcengine",
+        "default_rate_id": "no_video_input",
+        "rates": [
+          {
+            "id": "with_video_input",
+            "when": {
+              "has_video_input": true
+            },
+            "unit_price_points": 4200,
+            "unit_size": 1000000
+          },
+          {
+            "id": "no_video_input",
+            "when": {
+              "has_video_input": false
+            },
+            "unit_price_points": 7000,
+            "unit_size": 1000000
+          }
+        ],
+        "pricing_note": "Official public pay-as-you-go rates for Doubao-Seedance-2.5"
+      },
+      "new_conditions": {
+        "unit_size": 1000000,
+        "default_rate_id": "no_video_input",
+        "rates": [
+          {
+            "id": "with_video_input_4k",
+            "when": {
+              "has_video_input": true,
+              "resolution": "4k"
+            },
+            "unit_price_points": 1900,
+            "unit_size": 1000000
+          },
+          {
+            "id": "no_video_input_4k",
+            "when": {
+              "has_video_input": false,
+              "resolution": "4k"
+            },
+            "unit_price_points": 3100,
+            "unit_size": 1000000
+          },
+          {
+            "id": "with_video_input_1080p",
+            "when": {
+              "has_video_input": true,
+              "resolution": "1080p"
+            },
+            "unit_price_points": 4600,
+            "unit_size": 1000000
+          },
+          {
+            "id": "no_video_input_1080p",
+            "when": {
+              "has_video_input": false,
+              "resolution": "1080p"
+            },
+            "unit_price_points": 7700,
+            "unit_size": 1000000
+          },
+          {
+            "id": "with_video_input",
+            "when": {
+              "has_video_input": true
+            },
+            "unit_price_points": 4200,
+            "unit_size": 1000000
+          },
+          {
+            "id": "no_video_input",
+            "when": {
+              "has_video_input": false
+            },
+            "unit_price_points": 7000,
+            "unit_size": 1000000
+          }
+        ]
+      },
+      "raw_item": {
+        "mapping_rule": "verified-platform-models-v11-seedance25-4k",
+        "source": [
+          {
+            "ChargeItems": [
+              {
+                "Price": 0.07,
+                "UnitCode": "千tokens",
+                "Type": "NV2VCompletion",
+                "OriginalPrice": 0.07
+              },
+              {
+                "Price": 0.077,
+                "UnitCode": "千tokens",
+                "Type": "NV2V1080Completion",
+                "OriginalPrice": 0.077
+              },
+              {
+                "Price": 0.042,
+                "UnitCode": "千tokens",
+                "Type": "V2VCompletion",
+                "OriginalPrice": 0.042
+              },
+              {
+                "Price": 0.031,
+                "UnitCode": "千tokens",
+                "Type": "NV2V4KCompletion",
+                "OriginalPrice": 0.031
+              },
+              {
+                "Price": 0.046,
+                "UnitCode": "千tokens",
+                "Type": "V2V1080Completion",
+                "OriginalPrice": 0.046
+              },
+              {
+                "Price": 0.019,
+                "UnitCode": "千tokens",
+                "Type": "V2V4KCompletion",
+                "OriginalPrice": 0.019
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "production_configuration_changed": false,
+  "inference_calls": 0
+}

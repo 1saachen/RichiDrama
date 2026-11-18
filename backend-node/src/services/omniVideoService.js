@@ -507,13 +507,14 @@ function validateCreationMode(mode, assets, capability) {
 }
 
 function assetLimitsForCapability(capability) {
-  if (!/seedance[-_]?2[-_]?5|2[-_]?5[-_]?260628/i.test(String(capability?.model || ''))) return SHOT_ASSET_LIMITS;
+  const defaults = require('./videoModelCapabilities').seedance25Limits(capability?.model);
+  if (!defaults.total_reference) return SHOT_ASSET_LIMITS;
   const limits = capability?.limits || {};
   return {
-    total: Number(limits.total_reference?.max || 50),
-    image: Number(limits.image_reference?.max || 30),
-    video: Number(limits.video_reference?.max || 10),
-    audio: Number(limits.audio_reference?.max || 10),
+    total: Number(limits.total_reference?.max || defaults.total_reference.max),
+    image: Number(limits.image_reference?.max || defaults.image_reference.max),
+    video: Number(limits.video_reference?.max || defaults.video_reference.max),
+    audio: Number(limits.audio_reference?.max || defaults.audio_reference.max),
   };
 }
 

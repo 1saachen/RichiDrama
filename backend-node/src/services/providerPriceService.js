@@ -11,7 +11,7 @@ const BILLING_VERSION = '2022-01-01';
 const POINTS_PER_CNY = 100;
 const MICRO_PER_POINT = 10000;
 const LOCK_MS = 10 * 60 * 1000;
-const MAPPING_RULE_VERSION = 'verified-platform-models-v9-seedream-flash';
+const MAPPING_RULE_VERSION = 'verified-platform-models-v11-seedance25-4k';
 
 function now() { return new Date().toISOString(); }
 function parse(value, fallback = {}) { try { return value ? JSON.parse(value) : fallback; } catch (_) { return fallback; } }
@@ -550,7 +550,7 @@ function verifiedMultiChargeSpecs(item, groups) {
     specs = [compoundSpec(groups, 'output_token', 'VerifiedVideoAudioRates', [chargeIn(groups, 'ToVSilentCompletion'), chargeIn(groups, 'ToVCompletion')], [
       { id: 'silent_video', when: { has_audio: false } }, { id: 'audio_video', when: { has_audio: true } },
     ], 'silent_video')];
-  } else if (['doubao-seedance-2-0', 'doubao-seedance-2-0-fast', 'doubao-seedance-2-0-mini', 'doubao-seedance-2-5'].includes(model)) {
+  } else if (['doubao-seedance-2-0', 'doubao-seedance-2-0-fast', 'doubao-seedance-2-0-mini', 'doubao-seedance-2-5', 'doubao-seedance-2-5-flash'].includes(model)) {
     serviceTypes = ['video'];
     const types = ['V2VCompletion', 'NV2VCompletion'];
     const rates = [{ id: 'with_video_input', when: { has_video_input: true } }, { id: 'no_video_input', when: { has_video_input: false } }];
@@ -559,7 +559,8 @@ function verifiedMultiChargeSpecs(item, groups) {
       rates.unshift({ id: 'no_video_input_1080p', when: { has_video_input: false, resolution: '1080p' } });
       rates.unshift({ id: 'with_video_input_1080p', when: { has_video_input: true, resolution: '1080p' } });
     }
-    if (model === 'doubao-seedance-2-0') {
+    if (model === 'doubao-seedance-2-0' || (model === 'doubao-seedance-2-5'
+      && (chargeIn(groups, 'V2V4KCompletion') || chargeIn(groups, 'NV2V4KCompletion')))) {
       types.unshift('NV2V4KCompletion'); types.unshift('V2V4KCompletion');
       rates.unshift({ id: 'no_video_input_4k', when: { has_video_input: false, resolution: '4k' } });
       rates.unshift({ id: 'with_video_input_4k', when: { has_video_input: true, resolution: '4k' } });

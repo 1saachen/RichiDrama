@@ -1,0 +1,58 @@
+name: Seedance 2.5 Release 2026-11-18
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    environment: production
+    steps:
+      - name: Require successful Validation for this exact main revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')" = "$EXPECTED_SHA"
+          conclusion="$(gh api "repos/$GH_REPO/actions/workflows/validation.yml/runs?head_sha=$EXPECTED_SHA&event=push&per_page=10" --jq '[.workflow_runs[] | select(.head_sha == env.EXPECTED_SHA and .status == "completed")][0].conclusion')"
+          test "$conclusion" = success
+      - name: Deploy after server-side idle checks and verify readiness
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: root
+          key: ${{ secrets.SERVER_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          command_timeout: 45m
+          script: |
+            set -euo pipefail
+            sha='${{ github.sha }}'
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+            repo='/data/apps/LocalMiniDrama'
+            timeout 300s git -C "$repo" fetch origin main --no-tags
+            test "$(git -C "$repo" rev-parse FETCH_HEAD)" = "$sha"
+            incoming="/data/minidrama-incoming/${sha}.tar.gz"
+            mkdir -p /data/minidrama-incoming /data/minidrama-bootstrap
+            bootstrap="$(mktemp -d "/data/minidrama-bootstrap/${sha}-seedance25-XXXXXX")"
+            git -C "$repo" archive --format=tar.gz --output="$incoming" "$sha"
+            tar -xzf "$incoming" -C "$bootstrap"
+            bash "$bootstrap/deploy/release-deploy" "$sha"
+            test -f "/data/minidrama-releases/$sha/succeeded"
+            curl -fsS --max-time 15 -H 'Host: drama.richbest.cn' http://127.0.0.1/ready |
+              docker exec -i local-minidrama node -e 'let b="";process.stdin.on("data",c=>b+=c);process.stdin.on("end",()=>{const r=JSON.parse(b);if(r.revision!==process.argv[1]||r.status!=="ready"||!r.checks?.database||!r.checks?.frontend)process.exit(1);console.log(JSON.stringify(r))})' "$sha"
+            rm -f -- "$incoming"
+            rm -rf -- "$bootstrap"

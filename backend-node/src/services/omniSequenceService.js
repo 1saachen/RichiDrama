@@ -150,7 +150,7 @@ function updateShot(db, sequenceId, shotId, body) {
   // route applies the selected model's capability limit before submission.
   if (settings.duration != null) settings.duration = Math.min(30, Math.max(4, Math.round(Number(settings.duration) || 15)));
   if (settings.model === 'auto') settings.model = '';
-  if (settings.resolution != null && !['480p', '720p', '1080p'].includes(String(settings.resolution))) settings.resolution = '720p';
+  if (settings.resolution != null && !['480p', '720p', '1080p', '4k'].includes(String(settings.resolution))) settings.resolution = '720p';
   db.prepare(`UPDATE omni_video_sequence_shots SET title = ?, prompt = ?, prompt_document_json = ?, assets_json = ?, settings_json = ?, updated_at = ? WHERE id = ?`).run(
     body.title ?? shot.title, body.prompt ?? shot.prompt, body.prompt_document !== undefined ? JSON.stringify(body.prompt_document) : shot.prompt_document_json,
     body.assets !== undefined ? JSON.stringify(body.assets) : shot.assets_json, JSON.stringify(settings), now(), shot.id);

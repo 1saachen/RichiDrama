@@ -14,6 +14,7 @@ const billing = require('../src/services/billingService');
 const videoService = require('../src/services/videoService');
 const config = require('../src/config');
 const MODEL = 'doubao-seedance-2-0-fast-260128';
+const FLASH = 'doubao-seedance-2-5-flash-261115';
 const log = { info() {}, warn() {}, error() {} };
 
 test('authenticated submissions reject invalid assets before billing and preserve history across restart', async () => {
@@ -51,12 +52,18 @@ test('authenticated submissions reject invalid assets before billing and preserv
     const aiConfig = aiConfigs.createConfig(db, log, {
       service_type: 'video', provider: 'volcengine', api_protocol: 'volcengine_omni', name: 'input-validation-test',
       base_url: `http://127.0.0.1:${provider.address().port}/api/v3`, endpoint: '/contents/generations/tasks',
-      api_key: 'dummy-key', model: [MODEL, 'doubao-seedance-2-5-260628'], default_model: MODEL, is_default: true,
+      api_key: 'dummy-key', model: [MODEL, 'doubao-seedance-2-5-260628', FLASH], default_model: MODEL, is_default: true,
       settings: JSON.stringify({ billing_reserve_output_tokens: 1000000 }), owner_tenant_id: tenant.id,
     });
     tenants.bindOwnedConfig(db, tenant.id, aiConfig, { is_default: true });
     billing.adjustBalance(db, admin.id, user.id, 100000, 'test balance');
     const now = new Date().toISOString();
+    db.prepare(`INSERT INTO billing_price_book_items (price_book_id,service_type,model,meter,unit_price_micro,is_free,conditions_json,created_at,updated_at)
+      SELECT price_book_id,'video',?,'output_token',46000000,0,?,?,? FROM billing_price_book_items WHERE service_type='video' AND model=? AND meter='output_token'`)
+      .run(FLASH, JSON.stringify({ unit_size: 1000000, default_rate_id: 'no_video_input', rates: [
+        { id: 'with_video_input', when: { has_video_input: true }, unit_price_points: 2800, unit_size: 1000000 },
+        { id: 'no_video_input', when: { has_video_input: false }, unit_price_points: 4600, unit_size: 1000000 },
+      ] }), now, now, MODEL);
     const dramaId = Number(db.prepare('INSERT INTO dramas (title,owner_user_id,created_at,updated_at) VALUES (?,?,?,?)')
       .run('输入校验测试', user.id, now, now).lastInsertRowid);
     const addAsset = (name, type, duration, size = 1000) => Number(db.prepare(`INSERT INTO assets
@@ -102,6 +109,16 @@ test('authenticated submissions reject invalid assets before billing and preserv
       account: billing.account(db, user.id),
     });
     const before = baseline();
+    for (const [type, max, name] of [['image', 10, 'png'], ['audio', 5, 'wav']]) {
+      const assets = Array.from({ length: max + 1 }, (_, index) => ({ asset_id: addAsset(`flash-${type}-${index}.${name}`, type, type === 'audio' ? 2 : null) }));
+      const invalid = await post('/api/v1/omni-video/jobs', { ...input, model: FLASH, assets });
+      assert.equal(invalid.status, 400, JSON.stringify(invalid.json));
+      assert.equal(authorizationCalls, 0);
+      assert.deepEqual(baseline(), before, 'Flash over-limit assets must fail before queueing and billing');
+    }
+    const invalidResolution = await post('/api/v1/omni-video/jobs', { ...input, model: FLASH, assets: [], resolution: '1080p' });
+    assert.equal(invalidResolution.status, 400);
+    assert.deepEqual(baseline(), before);
     assert.equal((await post('/api/v1/omni-video/jobs', input, false)).status, 401);
     const failed = await post('/api/v1/omni-video/jobs', input);
     assert.equal(failed.status, 400); assert.match(failed.json.error.message, /西西.wav.*1.416417.*2–15/);
@@ -207,6 +224,7 @@ test('authenticated submissions reject invalid assets before billing and preserv
       ['first-only', { assets: [frame] }],
       ['first-and-last', { model: 'doubao-seedance-2-5-260628', assets: [tail, frame] }],
       ['pre-fix-queue', { assets: [frame] }],
+      ['flash-first-and-last', { model: FLASH, duration: 30, assets: [tail, frame] }],
     ]) {
       const response = await post('/api/v1/omni-video/jobs', { ...frameRequest, ...fields, idempotency_key: key });
       assert.equal(response.status, 201, JSON.stringify(response.json));
@@ -237,9 +255,9 @@ test('authenticated submissions reject invalid assets before billing and preserv
       .map(asset => [asset.alias, asset.send_to_model]), [['manual.wav', 1], ['小周 · 角色音色', 1], ['林老师 · 角色音色', 1]]);
     assert.deepEqual(restoredMulti.request_snapshot.storyboard_voice_bindings, bindings);
     assert.equal(db.prepare('SELECT request_snapshot_json FROM omni_video_jobs WHERE id=?').get(multiJobId).request_snapshot_json, multiSnapshot);
-    assert.equal(processed.length, 7);
+    assert.equal(processed.length, 8);
     for (const { video_generation_id } of frameJobs) await originalProcess(db, log, video_generation_id);
-    assert.equal(upstream.length, 3);
+    assert.equal(upstream.length, 4);
     for (const capture of upstream) assert.equal(capture.path, '/api/v3/contents/generations/tasks');
     const media = ({ body }) => body.content.filter(item => item.type !== 'text').map(item => [
       item.role, Buffer.from(item.image_url.url.split(',')[1], 'base64').toString('utf8'),
@@ -249,6 +267,10 @@ test('authenticated submissions reject invalid assets before billing and preserv
     assert.deepEqual(media(upstream[1]), [['first_frame', 'image.png'], ['last_frame', 'last.png']]);
     assert.equal(upstream[1].body.ratio, 'adaptive');
     assert.deepEqual(media(upstream[2]), [['reference_image', 'image.png']]);
+    assert.deepEqual(media(upstream[3]), [['first_frame', 'image.png'], ['last_frame', 'last.png']]);
+    assert.equal(upstream[3].body.model, FLASH);
+    assert.equal(upstream[3].body.duration, 30);
+    assert.equal(upstream[3].body.ratio, 'adaptive');
     for (const { video_generation_id } of frameJobs) {
       const row = db.prepare('SELECT status,billing_authorization_id FROM video_generations WHERE id=?').get(video_generation_id);
       assert.equal(row.status, 'failed');

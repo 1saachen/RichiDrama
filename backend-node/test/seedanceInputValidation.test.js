@@ -6,6 +6,7 @@ const path = require('node:path');
 const { validateAssets, rulesForModel, assertRequestSize, describeAsset } = require('../src/services/seedanceInputValidation');
 const MODEL = 'doubao-seedance-2-0-fast-260128';
 const MODEL25 = 'doubao-seedance-2-5-260628';
+const FLASH = 'doubao-seedance-2-5-flash-261115';
 const MB = 1024 * 1024;
 const image = (extra = {}) => ({ type: 'image', url: 'https://example.test/image.png', width: 1280, height: 720, file_size: 1000, ...extra });
 const audio = (extra = {}) => ({ type: 'audio', name: '西西.wav', id: 956, url: 'https://example.test/voice.wav', duration: 2, file_size: 249934, ...extra });
@@ -41,6 +42,15 @@ test('reference counts and modes reject incompatible combinations', () => {
   assert.throws(() => validateAssets(MODEL, [image({ usage: 'first_frame' }), audio()], 'first_last_frame'), /不能混用/);
   assert.doesNotThrow(() => validateAssets(MODEL, [image(), audio({ duration: 1, send_to_model: false })]));
   assert.doesNotThrow(() => validateAssets('kling-v3', [audio({ duration: 1 })]));
+});
+
+test('Flash validates 10 images, 5 videos and 5 audios independently before submission', () => {
+  for (const [make, max] of [[image, 10], [video, 5], [audio, 5]]) {
+    assert.doesNotThrow(() => validateAssets(FLASH, Array.from({ length: max }, () => make())));
+    assert.throws(() => validateAssets(FLASH, Array.from({ length: max + 1 }, () => make())), /最多支持/);
+  }
+  assert.doesNotThrow(() => validateAssets(FLASH, [audio({ duration: 30 })]));
+  assert.throws(() => validateAssets(FLASH, [audio({ duration: 30.1 })]), /2–30/);
 });
 
 test('image dimensions, ratio, format and exclusive byte limit', () => {

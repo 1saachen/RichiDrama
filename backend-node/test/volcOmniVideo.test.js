@@ -8,6 +8,36 @@ const { callVolcengineOmniVideoApi, seedanceImageNeedsNormalization } = require(
 
 const log = { info() {}, warn() {}, error() {} };
 
+test('Flash transports all 20 allowed references and rejects excess or draft before provider submission', async () => {
+  const originalFetch = global.fetch;
+  const calls = [];
+  global.fetch = async (url, init) => {
+    calls.push({ url, body: JSON.parse(init.body) });
+    return { ok: true, text: async () => JSON.stringify({ id: 'mock-flash-task' }) };
+  };
+  try {
+    const model = 'doubao-seedance-2-5-flash-261115';
+    const config = { base_url: 'https://video.example.test', api_key: 'fixture-only', model: [model], default_model: model };
+    const urls = (kind, count) => Array.from({ length: count }, (_, i) => `https://assets.example.test/${kind}-${i}`);
+    const input = { model, prompt: 'Flash 全参考测试', duration: 30, resolution: '720p', aspect_ratio: '16:9',
+      reference_urls: urls('image.png', 10), reference_video_urls: urls('video.mp4', 5), reference_audio_urls: urls('voice.wav', 5),
+      reference_image_inputs: Array.from({ length: 10 }, () => ({ width: 1280, height: 720, file_size: 1000 })),
+    };
+    assert.equal((await callVolcengineOmniVideoApi(config, log, input)).task_id, 'mock-flash-task');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].body.model, model);
+    assert.equal(calls[0].body.duration, 30);
+    for (const [type, count] of [['image_url', 10], ['video_url', 5], ['audio_url', 5]]) {
+      assert.equal(calls[0].body.content.filter(x => x.type === type).length, count);
+    }
+    for (const [key, kind, count] of [['reference_urls', 'image.png', 11], ['reference_video_urls', 'video.mp4', 6], ['reference_audio_urls', 'voice.wav', 6]]) {
+      await assert.rejects(() => callVolcengineOmniVideoApi(config, log, { ...input, [key]: urls(kind, count) }), /最多支持/);
+    }
+    await assert.rejects(() => callVolcengineOmniVideoApi(config, log, { ...input, draft_mode: true }), /不支持样片/);
+    assert.equal(calls.length, 1, 'Invalid inputs cannot reach the provider');
+  } finally { global.fetch = originalFetch; }
+});
+
 test('Seedance image normalization uses provider dimension and byte limits', () => {
   assert.equal(seedanceImageNeedsNormalization({ width: 6000, height: 6000, file_size: 30_000_000 }), false);
   assert.equal(seedanceImageNeedsNormalization({ width: 6001, height: 4000, file_size: 1 }), true);

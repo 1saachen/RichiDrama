@@ -57,7 +57,7 @@ function localFile(row) {
 function summary(db, row) {
   const meta = record(db, row.id);
   if (!meta) return {};
-  const final = db.prepare('SELECT d.generation_id,v.status,v.local_path,v.provider_task_id FROM video_draft_tasks d JOIN video_generations v ON v.id=d.generation_id WHERE d.source_generation_id=?').get(row.id);
+  const final = db.prepare('SELECT d.generation_id,v.status,v.local_path,v.provider_task_id,v.resolution FROM video_draft_tasks d JOIN video_generations v ON v.id=d.generation_id WHERE d.source_generation_id=?').get(row.id);
   let points = null;
   try { points = db.prepare('SELECT charged_micro / 10000.0 amount FROM billing_usage_logs WHERE authorization_id=?').get(row.billing_authorization_id)?.amount ?? null; } catch (_) {}
   const expired = meta.stage === 'draft' && (!meta.expires_at || Date.now() >= Date.parse(meta.expires_at));
@@ -65,7 +65,7 @@ function summary(db, row) {
     draft_expires_at: meta.expires_at, draft_expired: expired, final_generation_id: final?.generation_id || null,
     draft_can_finalize: meta.stage === 'draft' && !expired && meta.provider_draft !== 0 && !final && localFile(row),
     draft_can_recover: !!row.provider_task_id && (row.status === 'failed' || (row.status === 'completed' && !localFile(row))),
-    final_status: final?.status || null, final_can_recover: !!final?.provider_task_id && final.status === 'failed',
+    final_status: final?.status || null, final_resolution: final?.resolution || null, final_can_recover: !!final?.provider_task_id && final.status === 'failed',
     actual_points: points, archive_status: row.archive_status || (row.local_path ? 'local' : null) };
 }
 function capture(db, id, data) {
@@ -130,7 +130,13 @@ function source(db, id, actor) {
   if (row.drama_id && !require('./projectAccessService').access(db, row.drama_id, actor.id)?.can_edit) throw new Error('没有项目编辑权限');
   return { row, meta };
 }
-function promotion(db, id, actor) {
+function finalResolution(value) {
+  const resolution = String(value || '1080p').trim().toLowerCase();
+  if (!['1080p', '4k'].includes(resolution)) throw new Error('样片成片仅支持 1080p 或 4K');
+  return resolution;
+}
+function promotion(db, id, actor, input = {}) {
+  const resolution = finalResolution(input.resolution);
   const { row, meta } = source(db, id, actor);
   if (!localFile(row) || !row.provider_task_id) throw new Error('样片尚未完成本地归档');
   if (meta.provider_draft === 0) throw new Error('供应商明确返回非样片结果，不能升级');
@@ -142,13 +148,13 @@ function promotion(db, id, actor) {
   const target = require('./aiConfigService').resolveBillingTarget(db, 'video', row.model, config.id, row.tenant_id ? { tenant_id: row.tenant_id } : {});
   const meters = billing.activeMeters(db, actor, 'video', target.billing_key, target.provider);
   const usage = require('./omniVideoService').buildAuthorizationUsage(meters, parse(config.settings), row.duration,
-    { model: target.provider_model, resolution: '1080p', aspect_ratio: row.aspect_ratio, has_video_input: !!meta.has_video_input, requested_duration: row.duration });
+    { model: target.provider_model, resolution, aspect_ratio: row.aspect_ratio, has_video_input: !!meta.has_video_input, requested_duration: row.duration });
   if (!Object.keys(usage).length) throw new Error('正式视频没有可用价目');
-  const context = { has_video_input: !!meta.has_video_input, has_audio: !!meta.has_audio_input, resolution: '1080p', generation_mode: 'draft_final' };
-  return { row, meta, config, target, usage, context };
+  const context = { has_video_input: !!meta.has_video_input, has_audio: !!meta.has_audio_input, resolution, generation_mode: 'draft_final' };
+  return { row, meta, config, target, usage, context, resolution };
 }
-function quoteFinal(db, id, actor) {
-  const p = promotion(db, id, actor);
+function quoteFinal(db, id, actor, input = {}) {
+  const p = promotion(db, id, actor, input);
   return require('./billingService').quote(db, actor, { service_type: 'video', model: p.target.billing_key,
     provider_model: p.target.provider_model, provider: p.target.provider, usage: p.usage, pricing_context: p.context });
 }
@@ -158,11 +164,16 @@ function result(db, id, actor) {
   const job = db.prepare('SELECT id FROM omni_video_jobs WHERE video_generation_id=? ORDER BY id DESC LIMIT 1').get(row.id);
   return { ...require('./videoService').getById(db, id), ...summary(db, row), omni_job_id: job?.id || null, video_generation_id: row.id };
 }
-function finalize(db, log, id, actor) {
+function finalize(db, log, id, actor, input = {}) {
+  const resolution = finalResolution(input.resolution);
   const { row: original } = source(db, id, actor);
   const existing = db.prepare('SELECT generation_id FROM video_draft_tasks WHERE source_generation_id=?').get(original.id);
-  if (existing) return result(db, existing.generation_id, actor);
-  const p = promotion(db, id, actor);
+  if (existing) {
+    const saved = result(db, existing.generation_id, actor);
+    if (input.resolution && saved.resolution !== resolution) throw new Error('该样片已创建其他分辨率的成片，请查看已关联的正式任务');
+    return saved;
+  }
+  const p = promotion(db, id, actor, { resolution });
   const sourceJob = db.prepare('SELECT sequence_id,shot_id FROM omni_video_jobs WHERE video_generation_id=? ORDER BY id DESC LIMIT 1').get(p.row.id);
   if (require('./generationSubmissionGuard').findActiveVideoForTarget(db, { ownerUserId: actor.id, storyboardId: p.row.storyboard_id, sequenceId: sourceJob?.sequence_id, shotId: sourceJob?.shot_id })) throw new Error('当前镜头已有生成任务');
   return db.transaction(() => {
@@ -178,11 +189,11 @@ function finalize(db, log, id, actor) {
     const task = require('./taskService').createTask(db, log, 'video_generation', String(p.row.drama_id || ''), actor.id, p.row.tenant_id);
     const newId = Number(db.prepare(`INSERT INTO video_generations
       (drama_id,storyboard_id,owner_user_id,tenant_id,billing_authorization_id,provider,prompt,model,duration,aspect_ratio,resolution,watermark,ai_config_id,status,task_id,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,'1080p',?,?,'processing',?,?,?)`).run(p.row.drama_id, p.row.storyboard_id, actor.id, p.row.tenant_id,
-      auth.authorization_id, p.row.provider, p.row.prompt, p.row.model, p.row.duration, p.row.aspect_ratio, p.row.watermark,
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'processing',?,?,?)`).run(p.row.drama_id, p.row.storyboard_id, actor.id, p.row.tenant_id,
+      auth.authorization_id, p.row.provider, p.row.prompt, p.row.model, p.row.duration, p.row.aspect_ratio, p.resolution, p.row.watermark,
       p.config.id, task.id, at, at).lastInsertRowid);
     const job = db.prepare('SELECT * FROM omni_video_jobs WHERE video_generation_id=? ORDER BY id DESC LIMIT 1').get(p.row.id);
-    const snapshot = { ...parse(job?.request_snapshot_json), assets: [], draft_source_generation_id: p.row.id, resolution: '1080p', upscale_resolution: null, target_fps: null };
+    const snapshot = { ...parse(job?.request_snapshot_json), assets: [], draft_source_generation_id: p.row.id, resolution: p.resolution, upscale_resolution: null, target_fps: null };
     db.prepare(`INSERT INTO omni_video_jobs (video_generation_id,owner_user_id,prompt,model_requested,model_resolved,request_snapshot_json,sequence_id,shot_id,storyboard_id,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(newId, actor.id, p.row.prompt, p.row.model, p.row.model, JSON.stringify(snapshot), job?.sequence_id || null, job?.shot_id || null, p.row.storyboard_id, at, at);
     db.prepare(`INSERT INTO video_draft_tasks (generation_id,stage,source_generation_id,request_key,config_id,config_fingerprint,has_video_input,has_audio_input,created_at)
@@ -223,6 +234,7 @@ function providerFinalBody(db, id, model, watermark) {
   if (meta?.stage !== 'final') return null;
   const source = db.prepare('SELECT provider_task_id FROM video_generations WHERE id=?').get(meta.source_generation_id);
   if (!source?.provider_task_id) throw new Error('原样片供应商任务缺失');
-  return { model, content: [{ type: 'draft_task', draft_task: { id: source.provider_task_id } }], resolution: '1080p', watermark: !!watermark };
+  const output = db.prepare('SELECT resolution FROM video_generations WHERE id=?').get(Number(id));
+  return { model, content: [{ type: 'draft_task', draft_task: { id: source.provider_task_id } }], resolution: finalResolution(output?.resolution), watermark: !!watermark };
 }
 module.exports = { MODEL, installed, record, isDraft, normalPredicate, expiry, capture, summary, create, quote, quoteFinal, finalize, list, recover, resolveArchiveReconciliation, providerFinalBody, assertConfig, assertPinnedConfig };

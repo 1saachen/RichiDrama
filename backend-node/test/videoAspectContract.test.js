@@ -14,6 +14,8 @@ const log = { info() {}, warn() {}, error() {} };
 test('aspect contract derives exact canvases from the selected short-edge tier', () => {
   assert.deepEqual(videoService.targetVideoPixelsForAspect('16:9', '1080p'), { w: 1920, h: 1080, aspect_ratio: '16:9', short_edge: 1080 });
   assert.deepEqual(videoService.targetVideoPixelsForAspect('9:16', '1080p'), { w: 1080, h: 1920, aspect_ratio: '9:16', short_edge: 1080 });
+  assert.deepEqual(videoService.targetVideoPixelsForAspect('16:9', '4k'), { w: 3840, h: 2160, aspect_ratio: '16:9', short_edge: 2160 });
+  assert.deepEqual(videoService.targetVideoPixelsForAspect('9:16', '4k'), { w: 2160, h: 3840, aspect_ratio: '9:16', short_edge: 2160 });
   assert.deepEqual(videoService.targetVideoPixelsForAspect('1:1', '720p'), { w: 720, h: 720, aspect_ratio: '1:1', short_edge: 720 });
   assert.deepEqual(videoService.targetVideoPixelsForAspect('3:4', '480p'), { w: 480, h: 640, aspect_ratio: '3:4', short_edge: 480 });
   assert.deepEqual(videoService.targetVideoPixelsForAspect('21:9', '1080p'), { w: 2520, h: 1080, aspect_ratio: '21:9', short_edge: 1080 });

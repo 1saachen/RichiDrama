@@ -10,6 +10,7 @@ const MB = 1024 * 1024;
 const VERSION = 1;
 function rulesForModel(model) {
   const name = String(model || '');
+  if (/seedance[-_.]?2[-_.]?5[-_.]?flash(?=$|[-_.])/i.test(name)) return { image: 10, video: 5, audio: 5, seconds: 30, audioOnly: true };
   if (/seedance[-_.]?2[-_.]?5/i.test(name)) return { image: 30, video: 10, audio: 10, seconds: 30, audioOnly: true };
   if (/seedance[-_.]?2[-_.]?0|(^|[-_./])sd2($|[-_./])/i.test(name)) return { image: 9, video: 3, audio: 3, seconds: 15, audioOnly: false };
   return null;

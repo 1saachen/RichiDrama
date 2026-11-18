@@ -298,6 +298,47 @@ test('verified platform models map complex account prices and exclude dated disc
   } finally { teardown(dbPath); }
 });
 
+test('Seedance 2.5 Flash prices match only Flash and retain distinct video-input rates', () => {
+  const { db, dbPath, log } = setup();
+  try {
+    for (const model of ['doubao-seedance-2-5-flash-261115', 'doubao-seedance-2-5-260628']) {
+      configs.createConfig(db, log, { service_type: 'video', provider: 'volcengine', name: model, model });
+    }
+    const item = { FoundationModelName: 'doubao-seedance-2-5-flash', MultiChargeItems: [{ ChargeItems: [
+      { Type: 'V2VCompletion', UnitCode: '千tokens', Price: 0.028 },
+      { Type: 'NV2VCompletion', UnitCode: '千tokens', Price: 0.046 },
+    ] }] };
+    const rows = prices.buildCandidateRows(db, item);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].billing_key, 'doubao-seedance-2-5-flash-261115');
+    assert.equal(rows[0].mapping_status, 'mapped');
+    const conditions = JSON.parse(rows[0].new_conditions_json);
+    assert.deepEqual(conditions.rates.map(x => [x.id, x.unit_price_points]), [['with_video_input', 2800], ['no_video_input', 4600]]);
+    assert.equal(conditions.unit_size, 1000000);
+    item.MultiChargeItems[0].ChargeItems.pop();
+    assert.ok(prices.buildCandidateRows(db, item).every(row => row.mapping_status !== 'mapped'), 'Incomplete supplier prices must not become usable');
+  } finally { teardown(dbPath); }
+});
+
+test('regular Seedance 2.5 maps both 4K prices, preserves old provider responses and rejects an incomplete 4K pair', () => {
+  const { db, dbPath, log } = setup();
+  try {
+    const model = 'doubao-seedance-2-5-260628';
+    configs.createConfig(db, log, { service_type: 'video', provider: 'volcengine', name: model, model });
+    const charges = Object.entries({ V2VCompletion: 0.042, NV2VCompletion: 0.07, V2V1080Completion: 0.046, NV2V1080Completion: 0.077 })
+      .map(([Type, Price]) => ({ Type, Price, UnitCode: '千tokens' }));
+    const item = { FoundationModelName: 'doubao-seedance-2-5', MultiChargeItems: [{ ChargeItems: charges }] };
+    assert.equal(prices.buildCandidateRows(db, item)[0].mapping_status, 'mapped');
+    charges.push({ Type: 'V2V4KCompletion', Price: 0.019, UnitCode: '千tokens' });
+    assert.ok(prices.buildCandidateRows(db, item).every(x => x.mapping_status !== 'mapped'));
+    charges.push({ Type: 'NV2V4KCompletion', Price: 0.031, UnitCode: '千tokens' });
+    const row = prices.buildCandidateRows(db, item)[0];
+    assert.equal(row.mapping_status, 'mapped');
+    const conditions = JSON.parse(row.new_conditions_json);
+    assert.deepEqual(conditions.rates.slice(0, 2).map(x => [x.id, x.unit_price_points]), [['with_video_input_4k', 1900], ['no_video_input_4k', 3100]]);
+  } finally { teardown(dbPath); }
+});
+
 test('image rate uses explicit image-input context', () => {
   const { db, dbPath, admin } = setup();
   try {

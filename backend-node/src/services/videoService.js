@@ -343,14 +343,27 @@ async function archiveCompletedVideo(db, log, videoGenId, cfg = null) {
   }
 }
 
-/** Resolve an exact aspect canvas from the requested short-edge tier. This
- * preserves 16:9/9:16/etc. without the former unconditional 2K enlargement. */
+/** Resolve the native 4K canvas or the existing short-edge tier. Seedance
+ * keeps roughly 8.3M pixels at 4K across its documented aspect ratios. */
 function targetVideoPixelsForAspect(aspectRatio, resolution, sourceProbe = null) {
-  const normalized = videoClient.normalizeAspectRatioForApi(aspectRatio) || '16:9';
+  const requested = String(resolution || '').toLowerCase();
+  const normalized = requested === '4k' && String(aspectRatio || '').trim().toLowerCase() === 'adaptive'
+    ? 'adaptive' : videoClient.normalizeAspectRatioForApi(aspectRatio) || '16:9';
+  if (requested === '4k') {
+    // https://docs.volcengine.com/docs/ark/seedance-2-5 — checked 2026-11-18.
+    const canvases = { '16:9': [3840, 2160], '4:3': [3326, 2494], '1:1': [2880, 2880],
+      '3:4': [2494, 3326], '9:16': [2160, 3840], '21:9': [4398, 1886] };
+    if (normalized === 'adaptive' && sourceProbe?.width > 0 && sourceProbe?.height > 0) {
+      const w = Number(sourceProbe.width), h = Number(sourceProbe.height);
+      if (Math.abs(w * h / (3840 * 2160) - 1) > 0.02) throw new Error('供应商自适应成片未满足原生 4K 像素规格');
+      return { w, h, aspect_ratio: normalized, short_edge: Math.min(w, h) };
+    }
+    const [w, h] = canvases[normalized] || canvases['16:9'];
+    return { w, h, aspect_ratio: normalized, short_edge: Math.min(w, h) };
+  }
   const match = normalized.match(/^(\d+)\s*:\s*(\d+)$/);
   const a = Number(match?.[1] || 16);
   const b = Number(match?.[2] || 9);
-  const requested = String(resolution || '').toLowerCase();
   const shortEdge = requested.includes('1080') ? 1080
     : requested.includes('720') ? 720
       : requested.includes('480') ? 480

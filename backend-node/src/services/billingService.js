@@ -218,6 +218,19 @@ function quote(db, user, input) {
   const usage = normalizeUsage(input.usage);
   const rows = activePriceItems(db, user.id, serviceType, model, input.provider || null);
   const byMeter = new Map(); for (const row of rows) if (!byMeter.has(row.meter)) byMeter.set(row.meter, row);
+  let pricingContext = input.pricing_context || {};
+  // 4K is a newly selectable native Seedance 2.5 output. Older published
+  // price books must not silently reuse their 480p/720p fallback rate.
+  if (serviceType === 'video'
+    && /^doubao-seedance-2-5(?:-\d{6})?$/.test(input.provider_model || model)
+    && String(pricingContext.resolution || '').toLowerCase() === '4k') {
+    pricingContext = { ...pricingContext, resolution: '4k' };
+    const conditions = parseConditions(byMeter.get('output_token')?.conditions_json);
+    const matching4k = (Array.isArray(conditions.rates) ? conditions.rates : []).some(rate => rate.when?.resolution === '4k'
+      && typeof rate.when?.has_video_input === 'boolean'
+      && Object.entries(rate.when).every(([key, value]) => pricingContext[key] === value));
+    if (!matching4k) throw new Error('Seedance 2.5 的 4K 价目缺失，请先同步并发布对应素材条件的 4K 价格');
+  }
   const imageConditions = parseConditions(byMeter.get('image')?.conditions_json);
   if (seedreamPricing.enabled(imageConditions)) {
     const count = input.pricing_context?.input_image_count;
@@ -235,7 +248,7 @@ function quote(db, user, input) {
   for (const [meter, qty] of Object.entries(usage)) {
     const price = byMeter.get(meter);
     if (!price) throw new Error(`模型 ${model} 的 ${meter} 未定价，已拒绝调用`);
-    const rate = rateFor(price, input.pricing_context || {}, usage);
+    const rate = rateFor(price, pricingContext, usage);
     const subtotal = price.is_free ? 0 : proratedPoints(seedreamPricing.billableQuantity(rate.conditions, qty), rate.unit_price_micro, rate.unit_size);
     amountMicro += subtotal;
     if (!Number.isSafeInteger(amountMicro)) throw new Error('计费金额超出安全范围');
@@ -247,13 +260,13 @@ function quote(db, user, input) {
   // amount. The ordinary input reservation remains the conservative ceiling.
   if (usage.input_token != null && !Object.prototype.hasOwnProperty.call(usage, 'cache_token') && byMeter.has('cache_token')) {
     const price = byMeter.get('cache_token');
-    const rate = rateFor(price, input.pricing_context || {}, { ...usage, cache_token: 0 });
+    const rate = rateFor(price, pricingContext, { ...usage, cache_token: 0 });
     usage.cache_token = 0;
     rates.push({ meter: 'cache_token', quantity: 0, unit_price_micro: rate.unit_price_micro, unit_size: rate.unit_size, rate_id: rate.rate_id, conditions: rate.conditions, is_free: !!price.is_free, subtotal_micro: 0, price_book_id: price.price_book_id, price_book_name: price.price_book_name });
   }
   if (serviceType === 'video' && require('./relayVideoBillingService').modelProfile(input.provider_model || model)
       && !rates.some(rate => rate.conditions?.relay_video_billing_version === 1)) throw new Error('Vega 新调用需要已核实的视频秒计费规则，请先同步并发布中转站价格');
-  return { user_id: user.id, service_type: serviceType, model, provider_model: input.provider_model || model, usage, pricing_context: input.pricing_context || {}, amount_micro: amountMicro, amount: microToCredits(amountMicro), rates, quoted_at: now() };
+  return { user_id: user.id, service_type: serviceType, model, provider_model: input.provider_model || model, usage, pricing_context: pricingContext, amount_micro: amountMicro, amount: microToCredits(amountMicro), rates, quoted_at: now() };
 }
 
 function projectSnapshot(db, userId, input = {}) {

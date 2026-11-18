@@ -50,9 +50,11 @@ function list(db, options = {}) {
 // A provider setting is only a declaration; native routing needs a matching
 // request adapter. Keep unsupported modes on their explicit fallback paths.
 function seedance25Limits(model) {
-  return /seedance[-_]?2[-_]?5|2[-_]?5[-_]?260628/i.test(String(model || ''))
-    ? { duration: { min: 4, max: 30, step: 1 }, image_reference: { max: 30 }, video_reference: { max: 10 }, audio_reference: { max: 10 }, total_reference: { max: 50 }, resolutions: ['480p', '720p'] }
-    : {};
+  const name = String(model || '');
+  if (!/seedance[-_]?2[-_]?5|2[-_]?5[-_]?260628/i.test(name)
+    && !/seedance[-_.]?2[-_.]?5[-_.]?flash(?=$|[-_.])/i.test(name)) return {};
+  const rules = require('./seedanceInputValidation').rulesForModel(model) || { image: 30, video: 10, audio: 10 };
+  return { duration: { min: 4, max: 30, step: 1 }, image_reference: { max: rules.image }, video_reference: { max: rules.video }, audio_reference: { max: rules.audio }, total_reference: { max: rules.image + rules.video + rules.audio }, resolutions: ['480p', '720p'] };
 }
 
 function seedance20FastLimits(model) {
@@ -72,6 +74,10 @@ function configuredModelLimits(settings, model) {
 }
 
 function modelLimits(settings, declared, model, config = null) {
+  const protocol = String(config?.api_protocol || '').trim().toLowerCase();
+  const provider = String(config?.provider || '').trim().toLowerCase();
+  const usesVolcengineApi = protocol === 'volcengine' || protocol === 'volcengine_omni'
+    || (!protocol && ['volces', 'volcengine', 'volc'].includes(provider));
   const relayProfile = String(config?.provider).toLowerCase() === 'richbest' ? require('./richbestProvider').videoProfile(model) : null;
   if (relayProfile?.key === 'vega') return {
     duration: { min: 4, max: relayProfile.durationMax, step: 1 },
@@ -84,11 +90,22 @@ function modelLimits(settings, declared, model, config = null) {
     ...DEFAULT_LIMITS,
     ...shared,
     ...seedance25Limits(model),
+    ...(usesVolcengineApi && ['volcengine', 'volces', 'volc'].includes(provider)
+      && /^doubao-seedance-2-5(?:-\d{6})?$/i.test(String(model || ''))
+      ? { resolutions: ['480p', '720p', '1080p', '4k'] } : {}),
     ...fastLimits,
     ...configuredModelLimits(settings, model),
   };
   const isMini = /seedance[-_.]?2[-_.]?0[-_.]?mini(?=$|[-_.])/i.test(String(model || '').trim());
-  if (fastLimits.resolutions || isMini) {
+  const isFlash = /seedance[-_.]?2[-_.]?5[-_.]?flash(?=$|[-_.])/i.test(String(model || ''));
+  if (isFlash) {
+    const defaults = seedance25Limits(model);
+    for (const key of ['image_reference', 'video_reference', 'audio_reference', 'total_reference']) {
+      const configured = Number(limits[key]?.max);
+      limits[key] = { max: configured > 0 ? Math.min(configured, defaults[key].max) : defaults[key].max };
+    }
+  }
+  if (fastLimits.resolutions || isMini || isFlash) {
     const configured = Array.isArray(limits.resolutions)
       ? limits.resolutions.map((value) => String(value).trim().toLowerCase())
       : [];
@@ -96,10 +113,6 @@ function modelLimits(settings, declared, model, config = null) {
     limits.resolutions = available.length ? available : [...SEEDANCE20_FAST_MINI_RESOLUTIONS];
   }
   if (Array.isArray(limits.aspect_ratios) && limits.aspect_ratios.length) return limits;
-  const protocol = String(config?.api_protocol || '').trim().toLowerCase();
-  const provider = String(config?.provider || '').trim().toLowerCase();
-  const usesVolcengineApi = protocol === 'volcengine' || protocol === 'volcengine_omni'
-    || (!protocol && ['volces', 'volcengine', 'volc'].includes(provider));
   return usesVolcengineApi
     ? { ...limits, aspect_ratios: [...VOLCENGINE_VIDEO_ASPECT_RATIOS] }
     : limits;

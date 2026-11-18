@@ -19,7 +19,7 @@ export const videosAPI = {
     return request.post('/videos/postprocess-quote', body)
   },
   drafts(params) { return request.get('/video-drafts', { params }) },
-  draftFinalQuote(id) { return request.post(`/video-drafts/${id}/final-quote`, {}) },
+  draftFinalQuote(id, options = {}) { return request.post(`/video-drafts/${id}/final-quote`, options) },
   recoverDraft(id) { return request.post(`/video-drafts/${id}/recover`, {}) },
-  finalizeDraft(id) { return request.post(`/video-drafts/${id}/finalize`, { idempotency_key: createClientRequestId() }) }
+  finalizeDraft(id, options = {}) { return request.post(`/video-drafts/${id}/finalize`, { ...options, idempotency_key: createClientRequestId() }) }
 }

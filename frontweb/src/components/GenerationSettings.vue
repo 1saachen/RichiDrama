@@ -43,7 +43,8 @@ let modelOptionsPromise = null
 const value = computed(() => props.modelValue || {})
 const textModelOptions = computed(() => [{ label: '自动选择', description: '使用当前默认文本模型', value: 'auto' }, ...textModels.value.map((item) => ({ label: displayModelName(item), value: item }))])
 const videoModelOptions = computed(() => videoModels.value.map((item) => ({ label: displayModelName(item.model), description: item.is_default ? '默认模型' : '', value: item.model })))
-const allResolutionOptions = [{ label: '480p', value: '480p' }, { label: '720p', value: '720p' }, { label: '1080p', value: '1080p' }]
+const defaultResolutionOptions = [{ label: '480p', value: '480p' }, { label: '720p', value: '720p' }, { label: '1080p', value: '1080p' }]
+const allResolutionOptions = [...defaultResolutionOptions, { label: '4K', value: '4k' }]
 function modelKey(model) { return String(model || '').trim().toLowerCase() }
 function isSeedance25Model(model) { return /seedance[-_]?2[-_]?5|2[-_]?5[-_]?260628/i.test(modelKey(model)) }
 const selectedVideoCapability = computed(() => videoModels.value.find((item) => modelKey(item.model) === modelKey(value.value.video_model)) || null)
@@ -58,7 +59,7 @@ const allowedResolutions = computed(() => {
   const configured = selectedVideoCapability.value?.limits?.resolutions
   return Array.isArray(configured) && configured.length
     ? configured.map((item) => String(item || '').trim().toLowerCase()).filter(Boolean)
-    : allResolutionOptions.map((item) => item.value)
+    : defaultResolutionOptions.map((item) => item.value)
 })
 const resolutionOptions = computed(() => allResolutionOptions.filter((item) => allowedResolutions.value.includes(item.value)))
 const resolutionInvalid = computed(() => !!selectedVideoCapability.value && !allowedResolutions.value.includes(String(value.value.resolution || '720p').toLowerCase()))
@@ -97,7 +98,7 @@ function set(key, next) {
     const durationLimit = Number.isFinite(nextMaxDuration) && nextMaxDuration > 0 ? nextMaxDuration : isSeedance25Model(next) ? 30 : props.maxDuration
     nextValue.duration = Math.min(durationLimit, Math.max(4, Number(nextValue.duration) || 15))
     const configured = capability?.limits?.resolutions
-    const allowed = Array.isArray(configured) && configured.length ? configured.map((item) => String(item).toLowerCase()) : allResolutionOptions.map((item) => item.value)
+    const allowed = Array.isArray(configured) && configured.length ? configured.map((item) => String(item).toLowerCase()) : defaultResolutionOptions.map((item) => item.value)
     const current = String(nextValue.resolution || '720p').toLowerCase()
     if (!allowed.includes(current)) {
       nextValue.resolution = allowed.includes('720p') ? '720p' : allowed[0]
@@ -138,6 +139,7 @@ function scheduleQuote() {
         model: value.value.video_model,
         duration: duration.value,
         resolution: value.value.resolution || '720p',
+        aspect_ratio: value.value.aspect_ratio || '16:9',
         has_video_input: props.hasVideoInput,
         has_audio: props.hasAudioInput,
       }).then((result) => ({ kind: 'generation', points: Number(result?.amount || 0) })))

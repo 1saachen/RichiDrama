@@ -1,0 +1,42 @@
+{
+  "revision": "f53867558c9926f1448acfa652e40bf24ed9d908",
+  "preexisting": "Local Seedance 2.5 Flash adaptation retained; not released",
+  "files": [
+    {
+      "path": "backend-node/src/services/videoModelCapabilities.js",
+      "sha256": "6d23d5c3d549f2892ce42d2fc9cba57cef62921df5cc506605a827d0459f3149"
+    },
+    {
+      "path": "backend-node/src/services/providerPriceService.js",
+      "sha256": "55253abafb1ffcf0839299ee05bcd51025bbaee42293bd709edb422618734b72"
+    },
+    {
+      "path": "backend-node/src/services/billingService.js",
+      "sha256": "3bb52b8bc0a1d72e739ccf0f072f4984354211d4acca7ce676c9dc84a3a2555f"
+    },
+    {
+      "path": "backend-node/src/services/videoService.js",
+      "sha256": "6f5379d4615158fa85fa908fc47a327291cb532bc7faeb56a067274672840a68"
+    },
+    {
+      "path": "backend-node/src/services/videoDraftService.js",
+      "sha256": "b74b5fa7c189faf470b56b95f31b745f53b1f0c3ac0db4faec3e19e9e528da17"
+    },
+    {
+      "path": "backend-node/src/routes/videoDrafts.js",
+      "sha256": "331d4ca9c2b779a5644fd10d33a7375bd4e67b5f17cc88c795367cb5dc4dffbc"
+    },
+    {
+      "path": "frontweb/src/components/GenerationSettings.vue",
+      "sha256": "4478f3aa633fda166351528696270de63a248225fd8b8db5f94d29e265517740"
+    },
+    {
+      "path": "frontweb/src/components/SeedanceDraftPanel.vue",
+      "sha256": "d4a286d3b7f9b1ad55a81336d18a4dc72146069d745255c325cc118439fc017a"
+    },
+    {
+      "path": "frontweb/src/api/videos.js",
+      "sha256": "5ed137ac640c06cb6822c8a6c755642c11eb8c9e92fd04e1b07c5ae61330671e"
+    }
+  ]
+}

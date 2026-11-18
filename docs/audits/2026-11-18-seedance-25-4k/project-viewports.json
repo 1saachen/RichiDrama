@@ -1,0 +1,26 @@
+[
+  {
+    "documentWidth": 1280,
+    "height": 720,
+    "visible": true,
+    "width": 1280
+  },
+  {
+    "documentWidth": 1440,
+    "height": 900,
+    "visible": true,
+    "width": 1440
+  },
+  {
+    "documentWidth": 1920,
+    "height": 1080,
+    "visible": true,
+    "width": 1920
+  },
+  {
+    "documentWidth": 390,
+    "height": 844,
+    "visible": true,
+    "width": 390
+  }
+]
