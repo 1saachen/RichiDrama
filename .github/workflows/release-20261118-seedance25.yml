@@ -28,7 +28,8 @@ jobs:
           set -euo pipefail
           [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')" = "$EXPECTED_SHA"
-          conclusion="$(gh api "repos/$GH_REPO/actions/workflows/validation.yml/runs?head_sha=$EXPECTED_SHA&event=push&per_page=10" --jq '[.workflow_runs[] | select(.head_sha == env.EXPECTED_SHA and .status == "completed")][0].conclusion')"
+          gh api "repos/$GH_REPO/actions/workflows/validation.yml/runs?head_sha=$EXPECTED_SHA&event=push&per_page=10" > /tmp/seedance25-validation.json
+          conclusion="$(node -e 'const r=require("/tmp/seedance25-validation.json");const v=r.workflow_runs.find(x=>x.head_sha===process.env.EXPECTED_SHA&&x.status==="completed");process.stdout.write(v?.conclusion||"missing")')"
           test "$conclusion" = success
       - name: Deploy after server-side idle checks and verify readiness
         uses: appleboy/ssh-action@v1.2.0
