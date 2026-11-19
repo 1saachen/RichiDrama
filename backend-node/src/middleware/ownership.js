@@ -27,7 +27,8 @@ function ownershipGuard(db) {
     // Console ledger queries use drama_id as an audit filter, not as permission
     // to use the project's creative resources. The admin router still checks access.
     if (req.method === 'GET' && req.auth?.role === 'admin' && req.auth?.console_access
-      && ['/admin/usage', '/admin/usage-summary', '/admin/transactions'].includes(req.path)) {
+      && (['/admin/usage', '/admin/usage-summary', '/admin/transactions'].includes(req.path)
+        || /^\/admin\/project-usage(?:\/(?:unassigned|\d+(?:\/(?:timeline|breakdown|workflows|members))?))?\/?$/.test(req.path))) {
       return next();
     }
     if (req.auth?.role === 'admin' && req.auth?.console_access && /^\/admin\/costs(?:\/|$)/.test(req.path)) return next();

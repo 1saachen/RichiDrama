@@ -39,6 +39,9 @@ test('console project ledger filters read other owners without granting creative
       fixture.db.prepare("UPDATE users SET role='admin',console_access=0,account_kind='creator' WHERE id=?").run(roleOnly.id);
       const overview = await fixture.request('GET', '/admin/project-usage/73', undefined, adminCookie);
       assert.equal(overview.status, 200);
+      const selectedProjects = await fixture.request('GET', '/admin/project-usage?drama_id=73', undefined, adminCookie);
+      assert.equal(selectedProjects.status, 200, JSON.stringify(selectedProjects.body));
+      assert.deepEqual(selectedProjects.body.data.items.map(row => row.drama_id), [73]);
       const usage = await fixture.request('GET', '/admin/usage?drama_id=73&page=1&page_size=20', undefined, adminCookie);
       assert.equal(usage.status, 200, JSON.stringify(usage.body));
       assert.equal(usage.body.data.total, 1);
@@ -52,7 +55,7 @@ test('console project ledger filters read other owners without granting creative
       assert.equal(transactions.body.data.total, 2);
       assert.ok(transactions.body.data.items.every(row => row.drama_id === 73));
       for (const cookie of [ownerCookie, roleOnlyCookie]) {
-        for (const route of ['/admin/usage', '/admin/usage-summary', '/admin/transactions']) {
+        for (const route of ['/admin/usage', '/admin/usage-summary', '/admin/transactions', '/admin/project-usage', '/admin/project-usage/73']) {
           const denied = await fixture.request('GET', `${route}?drama_id=73`, undefined, cookie);
           assert.ok([403, 404].includes(denied.status), `${route}: ${denied.status} ${JSON.stringify(denied.body)}`);
         }

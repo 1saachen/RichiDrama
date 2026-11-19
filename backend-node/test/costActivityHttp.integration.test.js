@@ -6,13 +6,26 @@ const ledger = require('../src/services/costLedgerService');
 const prices = require('../src/services/providerPriceService');
 const ai = require('../src/services/aiConfigService');
 
-test('cost filter options include current and historical projects and survive restart without changing usage', async () => {
+test('cost filter options include current and historical projects and models without changing usage', async () => {
   const f = await modelCatalogFixture();
   try {
     seedCostActivity(f.db, f.admin.id);
     const member = require('../src/services/authService').createUser(f.db, { username: 'filter-user', password: 'fixture-password' }, f.admin.id);
     f.db.prepare("INSERT INTO dramas(id,title,owner_user_id,created_at,updated_at) VALUES(74,'另一用户的项目',?,'2026-09-01','2026-09-01')").run(member.id);
+    require('../src/services/operationsOwnershipService').setProject(f.db, f.admin.id, 73, { scope: 'internal' });
     f.db.prepare("UPDATE dramas SET title='',deleted_at='2026-09-09' WHERE id=73").run();
+    f.db.prepare("UPDATE billing_usage_logs SET snapshot_json=json_set(snapshot_json,'$.provider_model','历史供应商模型') WHERE id='legacy-0'").run();
+    f.db.prepare("UPDATE billing_transactions SET snapshot_json=json_set(snapshot_json,'$.provider_model','shadowed-authorization-model') WHERE id='legacy-auth-0'").run();
+    f.db.prepare("UPDATE billing_usage_logs SET snapshot_json=json_remove(snapshot_json,'$.provider_model') WHERE id='legacy-1'").run();
+    f.db.prepare("UPDATE billing_transactions SET snapshot_json=json_set(snapshot_json,'$.provider_model','历史授权模型') WHERE id='legacy-auth-1'").run();
+    f.db.prepare("UPDATE billing_usage_logs SET model='legacy-billing-model',snapshot_json='{' WHERE id='legacy-2'").run();
+    f.db.prepare("UPDATE billing_transactions SET snapshot_json=json_remove(snapshot_json,'$.provider_model') WHERE id='legacy-auth-2'").run();
+    f.db.prepare(`INSERT INTO billing_transactions(id,user_id,type,amount_micro,balance_after_micro,frozen_after_micro,snapshot_json,created_at)
+      VALUES('filter-options-pending',?,'authorization',0,0,0,?,'2026-09-08T04:00:00.000Z')`).run(
+      f.admin.id, JSON.stringify({ service_type: 'text', model: 'pending-billing-model', provider_model: 'pending-provider-model' }));
+    const liveId = ledger.begin(f.db, { config: f.config, service_type: 'text', model: 'standalone-live-model' });
+    const linkedId = ledger.begin(f.db, { config: f.config, authorization_id: 'legacy-auth-0', service_type: 'text', model: 'linked-attempt-model' });
+    assert.ok(liveId && linkedId);
     const original = JSON.stringify(f.db.prepare('SELECT * FROM billing_usage_logs ORDER BY id').all());
     const path = '/admin/costs/filter-options';
     assert.equal((await f.request('GET', path)).status, 401);
@@ -21,11 +34,48 @@ test('cost filter options include current and historical projects and survive re
     const cookie = (await f.request('POST', '/auth/login', { username: f.admin.username, password: 'fixture-password' })).cookie;
     const result = await f.request('GET', path, undefined, cookie);
     assert.equal(result.status, 200);
+    const scoped = await f.request('GET', `${path}?ops_scope=internal`, undefined, cookie);
+    assert.equal(scoped.status, 200);
+    assert.deepEqual(scoped.body.data, { ...result.body.data, projects: [{ id: 73, title: '历史项目名称' }] });
     assert.deepEqual(result.body.data.projects.find(p => p.id === 73), { id: 73, title: '历史项目名称' });
     assert.deepEqual(result.body.data.projects.find(p => p.id === 74), { id: 74, title: '另一用户的项目' });
     assert.deepEqual(result.body.data.users.find(u => u.id === member.id), { id: member.id, username: 'filter-user' });
+    assert.equal(Object.hasOwn(result.body.data, 'has_unknown_user'), false);
+    const historicalPath = `${path}?scoped_usage=1&ops_scope=internal&drama_id=73`;
+    const historicalOptions = await f.request('GET', historicalPath, undefined, cookie);
+    assert.equal(historicalOptions.status, 200);
+    assert.deepEqual(historicalOptions.body.data.projects, [{ id: 73, title: '历史项目名称' }]);
+    assert.ok(historicalOptions.body.data.models.includes('历史供应商模型'));
+    assert.ok(historicalOptions.body.data.models.includes('历史授权模型'));
+    assert.equal(historicalOptions.body.data.has_unknown_user, false);
+    const standalonePath = `${path}?scoped_usage=1&drama_id=0`;
+    const standalone = await f.request('GET', standalonePath, undefined, cookie);
+    assert.equal(standalone.status, 200);
+    assert.equal(standalone.body.data.has_unknown_user, true);
+    assert.deepEqual(standalone.body.data.users.map(row => row.id), [f.admin.id]);
+    assert.deepEqual(standalone.body.data.models, ['pending-provider-model', 'standalone-live-model']);
+    const { models } = result.body.data;
+    assert.equal(models.length, new Set(models).size);
+    for (const [model, id] of [
+      ['历史供应商模型', 'usage:legacy-0'],
+      ['历史授权模型', 'usage:legacy-1'],
+      ['legacy-billing-model', 'usage:legacy-2'],
+      ['pending-provider-model', 'authorization:filter-options-pending'],
+      ['standalone-live-model', `attempt:${liveId}`],
+    ]) {
+      assert.ok(models.includes(model));
+      const filtered = await f.request('GET', '/admin/costs/activity?model=' + encodeURIComponent(model), undefined, cookie);
+      assert.equal(filtered.status, 200, JSON.stringify(filtered.body));
+      assert.deepEqual(filtered.body.data.calls.items.map(row => row.id), [id]);
+    }
+    for (const model of ['shadowed-authorization-model', 'pending-billing-model', 'linked-attempt-model', 'other-image']) {
+      assert.ok(!models.includes(model));
+    }
     await f.restart();
     assert.deepEqual((await f.request('GET', path, undefined, cookie)).body.data, result.body.data);
+    assert.deepEqual((await f.request('GET', `${path}?ops_scope=internal`, undefined, cookie)).body.data, scoped.body.data);
+    assert.deepEqual((await f.request('GET', historicalPath, undefined, cookie)).body.data, historicalOptions.body.data);
+    assert.deepEqual((await f.request('GET', standalonePath, undefined, cookie)).body.data, standalone.body.data);
     assert.equal(JSON.stringify(f.db.prepare('SELECT * FROM billing_usage_logs ORDER BY id').all()), original);
   } finally { await f.close(); }
 });

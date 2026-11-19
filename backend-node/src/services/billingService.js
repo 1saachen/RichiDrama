@@ -1,5 +1,6 @@
 const { randomUUID: uuid } = require('node:crypto');
 const seedreamPricing = require('./seedreamProPricing');
+const { InvalidOperationsUsageScope, operationsUsageFilter } = require('./operationsUsageScope');
 
 function now() { return new Date().toISOString(); }
 function json(v) { return JSON.stringify(v == null ? {} : v); }
@@ -1376,12 +1377,26 @@ function listUsage(db, filters = {}) {
     .map((r) => ({ ...r, status: 'settled', charged: microToCredits(r.charged_micro), usage: parse(r.usage_json), snapshot: parse(r.snapshot_json) }));
 }
 
-function pagedUsage(db, filters = {}) {
+function usageLedgerWhere(db, filters, { operationsScope = false } = {}) {
   let where = 'WHERE 1=1', params = [];
   if (filters.user_id) { where += ' AND l.user_id = ?'; params.push(Number(filters.user_id)); }
   where = appendLedgerFilters(where, params, 'l', 'u', filters);
   if (filters.service_type) { where += ' AND l.service_type=?'; params.push(String(filters.service_type)); }
   if (filters.model) { where += ' AND l.model=?'; params.push(String(filters.model)); }
+  if (operationsScope) {
+    const attribution = operationsUsageFilter(db, filters);
+    where += attribution.where;
+    params.push(...attribution.params);
+    if (attribution.enabled && filters.source_kind) {
+      where += " AND COALESCE(l.source_kind,'other')=?";
+      params.push(String(filters.source_kind));
+    }
+  }
+  return { where, params };
+}
+
+function pagedUsage(db, filters = {}, options) {
+  const { where, params } = usageLedgerWhere(db, filters, options);
   const meta = pagination(filters);
   const total = Number(db.prepare(`SELECT COUNT(*) total FROM billing_usage_logs l JOIN users u ON u.id = l.user_id ${where}`).get(...params)?.total || 0);
   const rows = db.prepare(`SELECT l.*, u.username, u.display_name, u.role, tn.name AS tenant_name, org.name AS organization_name FROM billing_usage_logs l JOIN users u ON u.id = l.user_id LEFT JOIN tenants tn ON tn.id = l.tenant_id LEFT JOIN customer_organizations org ON org.id=l.organization_id ${where} ORDER BY l.created_at DESC, l.rowid DESC LIMIT ? OFFSET ?`).all(...params, meta.page_size, meta.offset);
@@ -1435,12 +1450,8 @@ function backfillProjectSnapshots(db, actorId, idempotencyKey = null) {
   return summary;
 }
 
-function usageSummary(db, filters = {}) {
-  let where = 'WHERE 1=1', params = [];
-  if (filters.user_id) { where += ' AND l.user_id=?'; params.push(Number(filters.user_id)); }
-  where = appendLedgerFilters(where, params, 'l', 'u', filters);
-  if (filters.service_type) { where += ' AND l.service_type=?'; params.push(String(filters.service_type)); }
-  if (filters.model) { where += ' AND l.model=?'; params.push(String(filters.model)); }
+function usageSummary(db, filters = {}, options) {
+  const { where, params } = usageLedgerWhere(db, filters, options);
   const totals = db.prepare(`SELECT COALESCE(SUM(l.charged_micro),0) charged_micro, COUNT(*) calls, COUNT(DISTINCT l.user_id) users, COUNT(DISTINCT l.drama_id) projects FROM billing_usage_logs l JOIN users u ON u.id=l.user_id ${where}`).get(...params);
   const timeSeries = db.prepare(`SELECT substr(datetime(l.created_at, '+8 hours'), 1, 10) day, COALESCE(SUM(l.charged_micro),0) charged_micro, COUNT(*) calls FROM billing_usage_logs l JOIN users u ON u.id=l.user_id ${where} GROUP BY day ORDER BY day`).all(...params);
   const breakdown = db.prepare(`SELECT l.user_id, u.username, u.display_name, l.drama_id, COALESCE(l.project_title_snapshot, CASE WHEN l.drama_id IS NULL THEN '未关联项目（历史/全局）' ELSE '项目名称快照缺失' END) project_title, COALESCE(SUM(l.charged_micro),0) charged_micro, COUNT(*) calls FROM billing_usage_logs l JOIN users u ON u.id=l.user_id ${where} GROUP BY l.user_id, u.username, u.display_name, l.drama_id, project_title ORDER BY charged_micro DESC, l.user_id`).all(...params);
@@ -1455,23 +1466,43 @@ function usageSummary(db, filters = {}) {
 
 // Project usage is deliberately derived from settled usage logs plus still-open
 // authorization rows. It never infers a project from the user's recent work.
-function projectUsageWhere(filters = {}) {
+const PROJECT_USAGE_SOURCE = 'FROM billing_usage_logs l JOIN dramas d ON d.id=l.drama_id LEFT JOIN users owner ON owner.id=d.owner_user_id';
+const OPEN_PROJECT_AUTHORIZATION = `a.type='authorization' AND NOT EXISTS (
+  SELECT 1 FROM billing_transactions done WHERE done.authorization_id=a.id AND done.type IN ('void','charge','settlement')
+)`;
+
+function projectUsageDramaId(filters) {
+  const value = filters.drama_id;
+  if (value == null || value === '') return null;
+  const id = ['string', 'number'].includes(typeof value) && String(value).trim() ? Number(value) : NaN;
+  if (!Number.isSafeInteger(id) || id < 0) {
+    throw new InvalidOperationsUsageScope('项目筛选无效');
+  }
+  return id;
+}
+
+function projectUsageWhere(db, filters) {
   let where = 'WHERE l.drama_id IS NOT NULL', params = [];
+  const dramaId = projectUsageDramaId(filters);
+  if (dramaId === 0) where += ' AND 0=1';
+  else if (dramaId != null) { where += ' AND l.drama_id=?'; params.push(dramaId); }
   if (filters.owner_user_id) { where += ' AND d.owner_user_id=?'; params.push(Number(filters.owner_user_id)); }
   if (filters.tenant_id !== undefined && filters.tenant_id !== null && String(filters.tenant_id) !== '') { where += ' AND l.tenant_id=?'; params.push(Number(filters.tenant_id)); }
   if (filters.service_type) { where += ' AND l.service_type=?'; params.push(String(filters.service_type)); }
   if (filters.model) { where += ' AND l.model=?'; params.push(String(filters.model)); }
   if (filters.source_kind) { where += ' AND COALESCE(l.source_kind, "other")=?'; params.push(String(filters.source_kind)); }
   const keyword = String(filters.keyword || '').trim();
-  if (keyword) { where += ' AND (d.title LIKE ? OR u.username LIKE ? OR u.display_name LIKE ?)'; const term = `%${keyword}%`; params.push(term, term, term); }
+  if (keyword) { where += ' AND (d.title LIKE ? OR owner.username LIKE ? OR owner.display_name LIKE ?)'; const term = `%${keyword}%`; params.push(term, term, term); }
   const from = shanghaiDayBoundary(filters.date_from), to = shanghaiDayBoundary(filters.date_to, true);
   if (from) { where += ' AND l.created_at>=?'; params.push(from); }
   if (to) { where += ' AND l.created_at<=?'; params.push(to); }
-  return { where, params };
+  const attribution = operationsUsageFilter(db, filters, { kind: 'project' });
+  return { where: where + attribution.where, params: [...params, ...attribution.params], hasAttribution: attribution.enabled };
 }
 
-function unassignedProjectUsageWhere(filters = {}) {
+function unassignedProjectUsageWhere(db, filters) {
   let where = 'WHERE l.drama_id IS NULL', params = [];
+  if (projectUsageDramaId(filters) > 0) where += ' AND 0=1';
   if (filters.tenant_id !== undefined && filters.tenant_id !== null && String(filters.tenant_id) !== '') { where += ' AND l.tenant_id=?'; params.push(Number(filters.tenant_id)); }
   if (filters.service_type) { where += ' AND l.service_type=?'; params.push(String(filters.service_type)); }
   if (filters.model) { where += ' AND l.model=?'; params.push(String(filters.model)); }
@@ -1480,11 +1511,12 @@ function unassignedProjectUsageWhere(filters = {}) {
   const from = shanghaiDayBoundary(filters.date_from), to = shanghaiDayBoundary(filters.date_to, true);
   if (from) { where += ' AND l.created_at>=?'; params.push(from); }
   if (to) { where += ' AND l.created_at<=?'; params.push(to); }
-  return { where, params };
+  const attribution = operationsUsageFilter(db, filters, { kind: 'unassigned' });
+  if (attribution.enabled && filters.source_kind) { where += " AND COALESCE(l.source_kind,'other')=?"; params.push(String(filters.source_kind)); }
+  return { where: where + attribution.where, params: [...params, ...attribution.params] };
 }
 
-function unassignedProjectUsageSummary(db, filters = {}) {
-  const { where, params } = unassignedProjectUsageWhere(filters);
+function unassignedProjectUsageSummary(db, { where, params }) {
   const summary = db.prepare(`SELECT COUNT(*) records, COUNT(DISTINCT l.user_id) users, COALESCE(SUM(l.charged_micro),0) charged_micro, MAX(l.created_at) last_activity_at FROM billing_usage_logs l JOIN users u ON u.id=l.user_id ${where}`).get(...params);
   const byUser = db.prepare(`SELECT l.user_id,u.username,u.display_name,COALESCE(SUM(l.charged_micro),0) charged_micro,MAX(l.created_at) last_activity_at FROM billing_usage_logs l JOIN users u ON u.id=l.user_id ${where} GROUP BY l.user_id,u.username,u.display_name ORDER BY charged_micro DESC,l.user_id LIMIT 8`).all(...params);
   const bySource = db.prepare(`SELECT COALESCE(l.source_kind,'other') source_kind,l.service_type,COALESCE(SUM(l.charged_micro),0) charged_micro FROM billing_usage_logs l JOIN users u ON u.id=l.user_id ${where} GROUP BY source_kind,l.service_type ORDER BY charged_micro DESC,source_kind LIMIT 8`).all(...params);
@@ -1550,8 +1582,8 @@ function projectProfileSql() {
 }
 
 function projectUsage(db, filters = {}) {
-  const { where, params } = projectUsageWhere(filters); const meta = pagination(filters);
-  const total = Number(db.prepare(`SELECT COUNT(DISTINCT l.drama_id) total FROM billing_usage_logs l JOIN dramas d ON d.id=l.drama_id JOIN users u ON u.id=d.owner_user_id ${where}`).get(...params)?.total || 0);
+  const { where, params, hasAttribution } = projectUsageWhere(db, filters);
+  const meta = pagination(filters);
   const items = db.prepare(`SELECT l.drama_id, COALESCE(d.title, l.project_title_snapshot, '项目 #' || l.drama_id) title,
     d.owner_user_id, owner.username owner_username, owner.display_name owner_display_name,
     MAX(l.created_at) last_activity_at, MIN(d.created_at) created_at, ${projectProfileSql()}, COUNT(*) calls,
@@ -1560,42 +1592,53 @@ function projectUsage(db, filters = {}) {
     SUM(CASE WHEN COALESCE(l.source_kind,'other')='omni_video' THEN l.charged_micro ELSE 0 END) omni_micro,
     SUM(CASE WHEN COALESCE(l.source_kind,'other') IN ('video_generation','image_generation') THEN l.charged_micro ELSE 0 END) workflow_micro,
     SUM(CASE WHEN COALESCE(l.source_kind,'other')='tool_run' THEN l.charged_micro ELSE 0 END) tool_micro,
-    COALESCE((SELECT SUM(a.amount_micro) FROM billing_transactions a WHERE a.drama_id=l.drama_id AND a.type='authorization' AND NOT EXISTS (SELECT 1 FROM billing_transactions done WHERE done.authorization_id=a.id AND done.type IN ('void','charge','settlement'))),0) frozen_micro
-    FROM billing_usage_logs l JOIN dramas d ON d.id=l.drama_id LEFT JOIN users u ON u.id=l.user_id LEFT JOIN users owner ON owner.id=d.owner_user_id ${where}
+    COALESCE((SELECT SUM(a.amount_micro) FROM billing_transactions a WHERE a.drama_id=l.drama_id AND ${OPEN_PROJECT_AUTHORIZATION}),0) frozen_micro
+    ${PROJECT_USAGE_SOURCE} ${where}
     GROUP BY l.drama_id, title, d.owner_user_id, owner.username, owner.display_name, d.description, d.style, d.status, d.metadata, d.updated_at
     ORDER BY charged_micro DESC, last_activity_at DESC LIMIT ? OFFSET ?`).all(...params, meta.page_size, meta.offset)
     .map((row) => ({ ...projectProfile(row), charged: microToCredits(row.charged_micro), frozen: microToCredits(row.frozen_micro), average: microToCredits(Math.round(Number(row.charged_micro || 0) / Math.max(1, Number(row.calls || 0)))), source_breakdown: { workflow: microToCredits(row.workflow_micro), omni: microToCredits(row.omni_micro), tools: microToCredits(row.tool_micro) } }));
-  const summary = db.prepare(`SELECT COUNT(DISTINCT l.drama_id) projects, COUNT(*) calls, COALESCE(SUM(l.charged_micro),0) charged_micro FROM billing_usage_logs l JOIN dramas d ON d.id=l.drama_id JOIN users u ON u.id=l.user_id ${where}`).get(...params);
-  const unassigned = unassignedProjectUsageSummary(db, filters).summary;
-  return { items, total, page: meta.page, page_size: meta.page_size, summary: { ...summary, charged: microToCredits(summary.charged_micro) }, historical_unassigned: unassigned };
+  const summary = db.prepare(`SELECT COUNT(DISTINCT l.drama_id) projects, COUNT(*) calls, COALESCE(SUM(l.charged_micro),0) charged_micro ${PROJECT_USAGE_SOURCE} ${where}`).get(...params);
+  if (hasAttribution) {
+    const { frozen_micro } = db.prepare(`SELECT COALESCE(SUM(a.amount_micro),0) frozen_micro FROM billing_transactions a
+      WHERE ${OPEN_PROJECT_AUTHORIZATION} AND a.drama_id IN (SELECT l.drama_id ${PROJECT_USAGE_SOURCE} ${where})`).get(...params);
+    Object.assign(summary, { frozen_micro, frozen: microToCredits(frozen_micro) });
+  }
+  const unassigned = unassignedProjectUsageSummary(db, unassignedProjectUsageWhere(db, filters)).summary;
+  return { items, total: summary.projects, page: meta.page, page_size: meta.page_size, summary: { ...summary, charged: microToCredits(summary.charged_micro) }, historical_unassigned: unassigned };
 }
 
 function projectUsageDetail(db, dramaId, filters = {}) {
-  const id = Number(dramaId); const rawProject = db.prepare(`SELECT d.id, d.title, d.created_at, d.updated_at, d.owner_user_id, u.username owner_username, u.display_name owner_display_name, ${projectProfileSql()} FROM dramas d LEFT JOIN users u ON u.id=d.owner_user_id WHERE d.id=? AND d.deleted_at IS NULL`).get(id);
+  const id = Number(dramaId);
+  const requestedId = projectUsageDramaId(filters);
+  const attribution = operationsUsageFilter(db, filters, { kind: 'project', projectId: 'd.id' });
+  if (requestedId != null && requestedId !== id) return null;
+  const rawProject = db.prepare(`SELECT d.id, d.title, d.created_at, d.updated_at, d.owner_user_id, u.username owner_username, u.display_name owner_display_name, ${projectProfileSql()} FROM dramas d LEFT JOIN users u ON u.id=d.owner_user_id WHERE d.id=? AND d.deleted_at IS NULL ${attribution.where}`).get(id, ...attribution.params);
   const project = rawProject ? projectProfile(rawProject) : null;
   if (!project) return null;
-  const scoped = projectUsageWhere({ ...filters }); let where = scoped.where + ' AND l.drama_id=?', params = [...scoped.params, id];
-  const summary = db.prepare(`SELECT COUNT(*) calls, COALESCE(SUM(l.charged_micro),0) charged_micro, COUNT(DISTINCT l.model) model_count, MAX(l.created_at) last_activity_at FROM billing_usage_logs l JOIN dramas d ON d.id=l.drama_id JOIN users u ON u.id=l.user_id ${where}`).get(...params);
-  const breakdown = db.prepare(`SELECT COALESCE(l.source_kind,'other') source_kind, l.service_type, l.model, COUNT(*) calls, COALESCE(SUM(l.charged_micro),0) charged_micro, MAX(l.created_at) last_activity_at FROM billing_usage_logs l JOIN dramas d ON d.id=l.drama_id JOIN users u ON u.id=l.user_id ${where} GROUP BY source_kind,l.service_type,l.model ORDER BY charged_micro DESC`).all(...params).map((r) => ({ ...r, charged: microToCredits(r.charged_micro) }));
-  const members = db.prepare(`SELECT l.user_id, u.username, u.display_name, u.role, COUNT(*) calls, COALESCE(SUM(l.charged_micro),0) charged_micro, MAX(l.created_at) last_activity_at FROM billing_usage_logs l JOIN dramas d ON d.id=l.drama_id JOIN users u ON u.id=l.user_id ${where} GROUP BY l.user_id,u.username,u.display_name,u.role ORDER BY charged_micro DESC LIMIT 5`).all(...params).map((r) => ({ ...r, charged: microToCredits(r.charged_micro) }));
-  const recent = db.prepare(`SELECT l.id,l.created_at,l.service_type,l.model,l.source_kind,l.source_id,l.charged_micro,u.username,u.display_name FROM billing_usage_logs l JOIN dramas d ON d.id=l.drama_id JOIN users u ON u.id=l.user_id ${where} ORDER BY l.created_at DESC LIMIT 5`).all(...params).map((r) => ({ ...r, charged: microToCredits(r.charged_micro) }));
+  const scoped = projectUsageWhere(db, filters);
+  const where = scoped.where + ' AND l.drama_id=?', params = [...scoped.params, id];
+  const source = `${PROJECT_USAGE_SOURCE} JOIN users u ON u.id=l.user_id ${where}`;
+  const summary = db.prepare(`SELECT COUNT(*) calls, COALESCE(SUM(l.charged_micro),0) charged_micro, COUNT(DISTINCT l.model) model_count, MAX(l.created_at) last_activity_at ${source}`).get(...params);
+  const breakdown = db.prepare(`SELECT COALESCE(l.source_kind,'other') source_kind, l.service_type, l.model, COUNT(*) calls, COALESCE(SUM(l.charged_micro),0) charged_micro, MAX(l.created_at) last_activity_at ${source} GROUP BY source_kind,l.service_type,l.model ORDER BY charged_micro DESC`).all(...params).map((r) => ({ ...r, charged: microToCredits(r.charged_micro) }));
+  const members = db.prepare(`SELECT l.user_id, u.username, u.display_name, u.role, COUNT(*) calls, COALESCE(SUM(l.charged_micro),0) charged_micro, MAX(l.created_at) last_activity_at ${source} GROUP BY l.user_id,u.username,u.display_name,u.role ORDER BY charged_micro DESC LIMIT 5`).all(...params).map((r) => ({ ...r, charged: microToCredits(r.charged_micro) }));
+  const recent = db.prepare(`SELECT l.id,l.created_at,l.service_type,l.model,l.source_kind,l.source_id,l.charged_micro,u.username,u.display_name ${source} ORDER BY l.created_at DESC LIMIT 5`).all(...params).map((r) => ({ ...r, charged: microToCredits(r.charged_micro) }));
   return { project, summary: { ...summary, charged: microToCredits(summary.charged_micro) }, breakdown, members, recent };
 }
 
 function unassignedProjectUsage(db, filters = {}) {
-  const { where, params } = unassignedProjectUsageWhere(filters);
-  const overview = unassignedProjectUsageSummary(db, filters);
+  const { where, params } = unassignedProjectUsageWhere(db, filters);
+  const overview = unassignedProjectUsageSummary(db, { where, params });
   const rows = db.prepare(`SELECT l.id,l.created_at,l.service_type,l.model,l.source_kind,l.source_id,l.charged_micro,u.username,u.display_name FROM billing_usage_logs l JOIN users u ON u.id=l.user_id ${where} ORDER BY l.created_at DESC LIMIT 100`).all(...params).map((r) => ({ ...r, charged: microToCredits(r.charged_micro), category: r.source_kind ? '历史待治理' : '全局/历史操作' }));
   return { ...overview, items: rows, total: overview.summary.records };
 }
 
-function projectUsageSection(db, dramaId, filters, section) {
+function projectUsageSection(db, dramaId, filters = {}, section) {
   const detail = projectUsageDetail(db, dramaId, filters); if (!detail) return null;
   if (section === 'breakdown') return { items: detail.breakdown };
   if (section === 'members') return { items: detail.members };
   if (section === 'workflows') return { items: detail.recent };
-  const scoped = projectUsageWhere(filters); const where = scoped.where + ' AND l.drama_id=?';
-  const items = db.prepare(`SELECT substr(datetime(l.created_at, '+8 hours'),1,10) day, COUNT(*) calls, COALESCE(SUM(l.charged_micro),0) charged_micro FROM billing_usage_logs l JOIN dramas d ON d.id=l.drama_id JOIN users u ON u.id=l.user_id ${where} GROUP BY day ORDER BY day`).all(...scoped.params, Number(dramaId)).map((row) => ({ ...row, charged: microToCredits(row.charged_micro) }));
+  const scoped = projectUsageWhere(db, filters); const where = scoped.where + ' AND l.drama_id=?';
+  const items = db.prepare(`SELECT substr(datetime(l.created_at, '+8 hours'),1,10) day, COUNT(*) calls, COALESCE(SUM(l.charged_micro),0) charged_micro ${PROJECT_USAGE_SOURCE} JOIN users u ON u.id=l.user_id ${where} GROUP BY day ORDER BY day`).all(...scoped.params, Number(dramaId)).map((row) => ({ ...row, charged: microToCredits(row.charged_micro) }));
   return { items };
 }
 

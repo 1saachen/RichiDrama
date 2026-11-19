@@ -1,134 +1,886 @@
 <template>
-  <main class="cost-workspace" :aria-busy="busy">
-    <header class="page-heading"><div><p class="eyebrow">瑞池传媒 · 运营核算</p><h1>消耗与成本</h1><p>按每日供应商价格和实际用量估算业务成本。全部时间为北京时间。</p></div><router-link class="button" to="/admin">运营工作台与模型定价</router-link></header>
-    <nav class="tabs" aria-label="成本工作区"><button v-for="t in tabs" :key="t.key" :aria-current="tab === t.key ? 'page' : undefined" @click="tab = t.key">{{ t.label }}</button></nav>
-    <p v-if="error" ref="errorPanel" tabindex="-1" class="feedback error" role="alert">{{ error }}</p><p v-if="notice" class="feedback" role="status">{{ notice }}</p>
-    <template v-if="tab === 'query'">
-      <section class="panel price-status" aria-label="供应商价格状态"><div class="section-heading"><div><h2>每日供应商价格</h2><p v-if="supplierPrices?.latest">最近成功：{{ supplierPrices.latest.day }} · {{ supplierPrices.latest.models }} 个型号<span v-if="supplierPrices.latest.day !== today" class="warning"> · 今日价格尚未获取</span></p><p v-else>尚无供应商价格快照。未计价用量会明确列出。</p></div><button :disabled="busy || priceRefreshing || supplierPrices?.status === 'completed'" @click="syncPrices">{{ priceRefreshing ? '正在获取价格…' : supplierPrices?.status === 'completed' ? '今日价格已获取' : '获取今日价格' }}</button></div><p>每天自动获取，直接用于成本估算。平台积分价目和人工审核不影响这里的价格。</p><p>账单固定费率：插帧 ¥0.60/分钟 · 画质增强 ¥2.50/分钟。按实际处理时长折算，不参与价格同步或审核。</p><p v-if="supplierPrices?.error" class="warning" role="status">{{ supplierPrices.error }}。仍可使用最近成功的价格估算。</p></section>
-      <form class="panel filters" @submit.prevent="refresh(true)">
-        <label>开始日期<input v-model="filters.date_from" type="date" required></label><label>结束日期<input v-model="filters.date_to" type="date" required></label>
-        <label>客户账户<select v-model="filters.organization_id" @change="filters.customer_kind = ''"><option value="">全部客户与个人</option><option v-for="c in customers" :key="c.id" :value="String(c.id)">{{ c.name }} #{{ c.id }}</option></select></label>
-        <label>项目<select v-model="filters.drama_id"><option value="">全部项目及非项目操作</option><option value="0">非项目操作</option><option v-for="p in filterOptions.projects" :key="p.id" :value="String(p.id)">{{ p.id }} · {{ p.title || '项目名称不可用' }}</option><option v-if="filters.drama_id && filters.drama_id !== '0' && !filterOptions.projects.some(p => String(p.id) === filters.drama_id)" :value="filters.drama_id">{{ filters.drama_id }} · 项目名称不可用</option></select></label>
-        <label>执行用户<select v-model="filters.user_id"><option value="">全部用户</option><option value="0">0 · 未知用户</option><option v-for="u in filterOptions.users" :key="u.id" :value="String(u.id)">{{ u.id }} · {{ u.username || '用户名不可用' }}</option><option v-if="filters.user_id && filters.user_id !== '0' && !filterOptions.users.some(u => String(u.id) === filters.user_id)" :value="filters.user_id">{{ filters.user_id }} · 用户名不可用</option></select></label>
-        <label>模型<input v-model="filters.model" placeholder="完整模型名"></label><label>功能来源代码<input v-model="filters.source_kind" placeholder="全部来源；0 表示未记录"><small v-if="filters.source_kind === '0'">正在筛选来源未记录</small></label>
-        <label>计价状态<select v-model="filters.cost_status"><option value="">全部状态</option><option v-for="(label,key) in costStatuses" :key="key" :value="key">{{ label }}</option></select></label>
-        <div class="form-actions"><button class="primary" :disabled="busy">查询</button><button type="button" :disabled="busy" @click="reset">重置筛选</button></div><p v-if="filters.customer_kind" class="full">归属：{{ customerLabel(filters.customer_kind) }}</p>
-      </form>
-      <template v-if="summary">
-        <section class="metrics" aria-label="消耗汇总">
-          <article><span>供应商成本估算</span><strong>{{ costMoney(summary.supplier_priced_calls ? summary.supplier_amount_micro : null) }}</strong><small>非供应商实付账单；不含未计价部分</small></article>
-          <article><span>成本计价覆盖</span><strong>{{ summary.supplier_priced_calls }} / {{ summary.calls - summary.released_calls }}</strong><small>沿用旧价格 {{ summary.supplier_stale_calls }} 条 · 固定费率 {{ summary.supplier_fixed_calls }} 条</small></article>
-          <article><span>原平台扣费</span><strong>{{ number(summary.charged_micro / 10000) }} 积分</strong><small>项目 {{ number(summary.project_charged_micro / 10000) }} · 非项目操作 {{ number(summary.non_project_charged_micro / 10000) }}</small><small>含同笔业务已记录的关联补扣</small></article>
-          <article><span>实际 Token</span><strong>{{ number(summary.total_tokens) }}</strong><small>{{ summary.calls }} 条业务记录 · {{ summary.processing_calls }} 条进行中</small></article>
-        </section>
-        <section class="panel coverage"><p>成本使用调用当日首次成功获取的供应商价格；当日缺失时沿用此前最近价格，并标明日期。历史记录没有更早价格时不套用当前价。原平台扣费独立展示，不用于推算成本。</p><p>功能来源来自账单记录，不代表精确页面地址；历史来源缺失时会显示“来源未记录”。</p><p>已释放且无用量记录 {{ summary.released_calls }} 条 · 缺用量 {{ summary.missing_usage_calls }} 条 · 缺供应商价格或规格 {{ summary.missing_price_calls }} 条 · 待核实 {{ summary.unverified_calls }} 条。</p><p>已结算按结算日期归属，未结算按预授权日期归属。所有汇总使用相同筛选，重试与历史补录不重复累计；未结算记录结算后可能移至另一日期。</p><p>输入 {{ number(summary.input_token) }} · 缓存 {{ number(summary.cache_token) }} · 输出 {{ number(summary.output_token) }} Token（含视频 {{ number(summary.video_output_token) }}）</p><p>图片 {{ number(summary.image) }} 张 · 处理时长 {{ number(summary.millisecond / 1000 + summary.second) }} 秒 · 字符 {{ number(summary.character) }}</p></section>
-      </template>
-      <section class="panel"><div class="section-heading"><h2>消耗构成</h2><label>分组<select v-model="groupBy" :disabled="busy" @change="groupPage = 1; load()"><option v-for="g in groups" :key="g.key" :value="g.key">{{ g.label }}</option></select></label></div>
-        <p class="muted">项目分组显示项目当前所有者；非项目操作及其他分组显示执行用户。</p>
-        <div class="table-scroll" tabindex="0" aria-label="消耗构成表">
-          <table><thead><tr><th>分组</th><th>{{ groupBy === 'project' ? '项目所有者 / 执行用户' : '执行用户' }}</th><th>业务记录</th><th>供应商成本估算</th><th>原扣费（积分）</th><th>操作</th></tr></thead>
-            <tbody><tr v-for="row in breakdown.items" :key="row.key"><td>{{ groupDisplay(row) }}<small v-if="groupBy === 'project' && row.key === 'unknown'">未绑定短剧项目，按来源查看具体用途</small></td>
-              <td><div v-for="person in groupPeople(row).slice(0, 2)" :key="person.id" class="cost-owner"><strong v-if="person.display_name">{{ person.display_name }}</strong><small v-if="person.display_name">{{ person.username || `用户 #${person.id}（用户名不可用）` }}</small><span v-else>{{ person.username || `用户 #${person.id}（用户名不可用）` }}</span></div><small v-if="groupPeople(row).length > 2">另有 {{ groupPeople(row).length - 2 }} 位{{ groupUsesProjectOwner(row) ? '项目所有者' : '执行用户' }}</small><span v-if="groupHasUnknownPerson(row) || !groupPeople(row).length" class="muted">{{ groupUsesProjectOwner(row) ? '未知项目所有者' : '未知执行用户' }}</span></td>
-              <td>{{ row.calls }}</td><td>{{ costMoney(row.supplier_priced_calls ? row.supplier_amount_micro : null) }}<small>{{ row.supplier_priced_calls }} 条已计价</small></td><td>{{ number(row.charged_micro / 10000) }}</td>
-              <td><div class="group-actions"><button v-if="['customer','project','user','model','operation'].includes(groupBy)" @click="drill(row)">{{ groupBy === 'project' && row.key === 'unknown' ? '按来源查看' : '查看调用' }}</button><button v-if="['customer','project','model','operation'].includes(groupBy)" @click="drillUsers(row)">按用户拆分</button></div></td>
-            </tr></tbody></table>
-        </div><p v-if="!breakdown.total">当前范围内无记录</p>
-        <div class="pagination"><button :disabled="busy || groupPage <= 1" @click="groupPage--; load()">上一组页</button><span>第 {{ groupPage }} 页 · {{ breakdown.total }} 组</span><button :disabled="busy || groupPage * 20 >= breakdown.total" @click="groupPage++; load()">下一组页</button></div>
+  <main class="cost-workspace">
+    <header class="page-heading">
+      <h1>消耗与成本</h1>
+      <div class="actions">
+        <router-link class="button" :to="{ path: '/admin/ownership', query: linkedRange }">客户与项目</router-link>
+        <router-link class="button" :to="{ path: '/admin', query: { tab: 'projectUsage', ...linkedRange } }">项目用量</router-link>
+      </div>
+    </header>
+    <nav class="tabs" aria-label="成本工作区">
+      <button :aria-current="tab === 'query' ? 'page' : undefined" @click="showOverview">消耗概览</button>
+      <button :aria-current="tab === 'reports' ? 'page' : undefined" @click="showReports">客户月报</button>
+    </nav>
+
+    <p v-if="error" class="feedback error" role="alert">{{ error }}</p>
+    <p v-if="notice" class="feedback" role="status">{{ notice }}</p>
+
+    <div v-show="tab === 'query' && !callGroup">
+      <section class="panel filters" aria-label="消耗筛选">
+        <div class="filter-grid">
+          <UsageDateRange class="filter-date-range" :key="dateInputKey"
+            :date-from="filters.date_from" :date-to="filters.date_to"
+            :disabled="filtersDisabled" @change="changeDates" />
+          <UsageOwnershipFilters :range="filters" :customers="customers" :individual-customers="individualCustomers"
+            :projects="projectOptions" :projects-loading="projectsLoading" :disabled="filtersDisabled" @change="chooseOwnership" />
+          <label>执行用户
+            <select :value="filters.user_id" aria-label="执行用户" :disabled="filtersDisabled || !currentOptions"
+              @change="changeFilters({ user_id: $event.target.value })">
+              <option value="">全部用户</option>
+              <option v-if="currentOptions?.has_unknown_user" value="0">未知用户</option>
+              <option v-for="user in userOptions" :key="user.id" :value="String(user.id)">{{ userLabel(user) }}</option>
+              <option v-if="missingUser" :value="filters.user_id" disabled>{{ groupLabel('user', filters.user_id) }}</option>
+            </select>
+          </label>
+          <label>模型
+            <select :value="filters.model" :disabled="filtersDisabled || !currentOptions"
+              @change="changeFilters({ model: $event.target.value })">
+              <option value="">全部模型</option>
+              <option v-for="model in modelOptions" :key="model" :value="model">{{ model }}</option>
+              <option v-if="filters.model && !modelOptions.includes(filters.model)" :value="filters.model" disabled>{{ filters.model }}</option>
+            </select>
+          </label>
+        </div>
+        <div class="filter-footer">
+          <div class="filter-notes">
+            <p v-if="optionsLoading" class="muted" role="status">正在更新执行用户和模型…</p>
+            <div v-else-if="optionsFailed" class="actions">
+              <p role="alert">未能读取筛选选项。</p>
+              <button type="button" @click="loadFilterOptions">重试</button>
+            </div>
+            <div v-if="filterNavigationError" class="actions">
+              <p role="alert">未能应用筛选。</p>
+              <button type="button" :disabled="filtersDisabled" @click="applyPendingFilters">重试</button>
+            </div>
+            <div v-if="filters.organization_id || filters.customer_kind" class="actions">
+              <p>扣费账户 · {{ groupLabel('customer', filters.customer_kind || filters.organization_id) }}</p>
+              <button type="button" :disabled="filtersDisabled" @click="changeFilters({ organization_id: '', customer_kind: '' })">清除扣费账户条件</button>
+            </div>
+            <div v-if="filters.drama_id && !projectOptionsScope" class="actions">
+              <p>{{ groupLabel('project', filters.drama_id) }}</p>
+              <button type="button" :disabled="filtersDisabled" @click="changeFilters({ drama_id: '' })">清除项目条件</button>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button type="button" :disabled="filtersDisabled" :aria-pressed="!filters.date_from && !filters.date_to" @click="changeDates()">全部日期</button>
+            <button type="button" :disabled="filtersDisabled" @click="reset">重置</button>
+          </div>
+        </div>
       </section>
-      <section class="panel"><h2>调用明细</h2><div class="table-scroll" tabindex="0" aria-label="调用明细表"><table><thead><tr><th>时间 / 状态</th><th>客户 / 项目</th><th>用户 / 模型</th><th>实际用量</th><th>供应商成本估算</th><th>原扣费（积分）</th><th>操作</th></tr></thead><tbody><tr v-for="call in calls.items" :key="call.id"><td>{{ chinaTime(call.occurred_at) }}<small>{{ timeBasis[call.time_basis] }} · {{ statuses[call.status] || call.status }}</small></td><td>{{ call.organization_name || (call.organization_id ? `客户 #${call.organization_id}` : customerLabel(call.customer_kind)) }}<small>{{ call.project_title || '非项目操作' }}</small><small>{{ sourceKindLabel(call.source_kind) }} · {{ serviceTypeLabel(call.service_type) }}</small></td><td>{{ call.user_name }}<small>{{ call.model }}</small></td><td class="usage-cell">{{ usageText(call.usage) }}</td><td>{{ costMoney(call.supplier_amount_micro) }}<small>{{ call.reason }}</small></td><td>{{ call.charged_micro == null ? (call.status === 'released' ? '已释放' : '未结算') : number(call.charged_micro / 10000) }}</td><td><button @click="openCall(call.id)">查看依据</button></td></tr></tbody></table></div><p v-if="!calls.total">当前范围内无记录</p><div class="pagination"><button :disabled="busy || page <= 1" @click="page--; load()">上一页</button><span>第 {{ page }} 页 · {{ calls.total }} 条</span><button :disabled="busy || page * 20 >= calls.total" @click="page++; load()">下一页</button></div></section>
-      <section v-if="detail" ref="detailPanel" class="panel" tabindex="-1"><div class="section-heading"><h2>调用依据</h2><button @click="detail = null">关闭详情</button></div><p>{{ detail.project_title || '非项目操作' }} · {{ detail.model }} · {{ detail.reason }}</p>
-        <dl><dt>业务记录</dt><dd>{{ detail.id }}</dd><dt>功能 / 操作来源</dt><dd>{{ sourceKindLabel(detail.source_kind) }}<small v-if="detail.source_id">来源记录 ID：{{ detail.source_id }}</small></dd><dt>服务</dt><dd>{{ serviceTypeLabel(detail.service_type) }}</dd><dt>已有 AI 连接</dt><dd>{{ detail.config_name || '历史记录未保存连接归属' }}<small v-if="detail.config_id">配置 #{{ detail.config_id }} · 共享连接 {{ detail.connection_id || '未使用' }} · {{ detail.provider || '未知供应商' }}</small></dd><dt>供应商请求</dt><dd>{{ detail.provider_request_id || '未保存' }}</dd><dt>价格适用时间</dt><dd>{{ chinaTime(detail.price_at) }}</dd><dt>供应商成本估算</dt><dd>{{ costMoney(detail.supplier_amount_micro) }}（非实付账单）</dd><dt>原扣费 / 关联补扣</dt><dd>{{ detail.original_charged_micro == null ? '未结算' : number(detail.original_charged_micro / 10000) }} / {{ number(detail.supplement_micro / 10000) }} 积分</dd><dt>供应商价格依据</dt><dd>{{ detail.supplier?.source_label || '尚无可用价格' }}<small>{{ detail.supplier?.price_day || '' }}{{ detail.supplier?.stale ? ' · 沿用此前价格' : '' }}</small></dd></dl>
-        <h3>供应商价格与实际用量</h3><p v-if="!detail.supplier?.rates?.length">{{ detail.reason }}</p><div v-else class="table-scroll" tabindex="0" aria-label="供应商计费明细"><table><thead><tr><th>计量</th><th>实际 / 计费数量</th><th>供应商单价（元） / 单位数量</th><th>规格</th><th>估算小计（元）</th></tr></thead><tbody><tr v-for="r in detail.supplier.rates" :key="r.meter"><td>{{ meterNames[r.meter] || r.meter }}</td><td>{{ number(r.quantity) }} / {{ number(r.billable_quantity) }}</td><td>{{ number(r.unit_price_cny) }} / {{ r.unit_size }}</td><td>{{ r.rate_id || '标准' }}</td><td>{{ costMoney(r.subtotal_micro) }}</td></tr></tbody></table></div>
-        <details><summary>供应商价格快照与调用规格</summary><pre>{{ JSON.stringify({ pricing_context: detail.pricing_context, supplier: detail.supplier, usage_evidence: detail.usage_evidence }, null, 2) }}</pre></details>
-        <details><summary>平台积分依据（不用于成本估算）</summary><p>{{ detail.platform_reason }}</p><pre>{{ JSON.stringify(detail.rates, null, 2) }}</pre></details>
-        <details v-if="detail.attempts.length"><summary>调用尝试与旧成本修订（不重复计入汇总）</summary><article v-for="a in detail.attempts" :key="a.id" class="revision"><p>{{ a.origin === 'historical_summary' ? '旧历史补录' : `尝试 ${a.attempt}` }} · {{ a.model }} · {{ chinaTime(a.submitted_at) }}</p><p v-for="r in a.revisions" :key="r.id">旧修订 #{{ r.id }}：{{ costMoney(r.amount_micro, r.currency || 'CNY') }} · {{ r.price?.source || '无价格' }} · {{ r.reason }}</p></article></details>
+
+      <section class="overview" aria-labelledby="cost-overview">
+        <div class="section-heading">
+          <h2 id="cost-overview">概览</h2>
+          <p v-if="summary" class="applied-range" :class="{ 'result-hidden': overviewResultsHidden }">{{ scopeText(resultRange) }}</p>
+        </div>
+        <div class="overview-content">
+          <p v-if="updatingResults" class="overview-state muted" role="status">正在更新消耗结果…</p>
+          <p v-else-if="failedFilterApply" class="overview-state muted">结果将在筛选更新后显示。</p>
+          <div v-else-if="overviewError" class="overview-state actions">
+            <p role="alert">{{ overviewError }}</p>
+            <button type="button" @click="query">重试</button>
+          </div>
+          <div v-if="summary" class="overview-data" :class="{ 'result-hidden': overviewResultsHidden }" :inert="overviewResultsHidden">
+            <div class="metrics" aria-label="消耗汇总">
+              <article class="metric-card metric-primary">
+                <h3>已扣积分</h3>
+                <div class="metric-value"><strong class="metric-number">{{ number(summary.charged_micro / 10000) }}</strong> 积分</div>
+                <p class="metric-note">项目 {{ number(summary.project_charged_micro / 10000) }} · 非项目 {{ number(summary.non_project_charged_micro / 10000) }}，含已记录的补扣</p>
+              </article>
+              <article class="metric-card metric-secondary">
+                <h3>供应商成本估算</h3>
+                <div class="metric-value"><strong class="metric-number">{{ costMoney(summary.supplier_priced_calls ? summary.supplier_amount_micro : null) }}</strong></div>
+                <p class="metric-note">已计价 {{ number(summary.supplier_priced_calls) }} / {{ number(summary.calls - summary.released_calls) }} 条（已排除无用量的释放记录）</p>
+                <p v-if="summary.missing_usage_calls || summary.missing_price_calls || summary.unverified_calls" class="coverage-links">
+                  <button v-if="summary.missing_usage_calls" type="button" @click="openCalls('status', 'missing_usage', $event)">缺用量 {{ number(summary.missing_usage_calls) }} 条</button>
+                  <button v-if="summary.missing_price_calls" type="button" @click="openCalls('status', 'missing_price', $event)">缺价格或规格 {{ number(summary.missing_price_calls) }} 条</button>
+                  <button v-if="summary.unverified_calls" type="button" @click="openCalls('status', 'unverified', $event)">待核实 {{ number(summary.unverified_calls) }} 条</button>
+                </p>
+              </article>
+            </div>
+            <div class="usage-strip" aria-label="实际用量">
+              <span>业务记录 <strong>{{ number(summary.calls) }} 条</strong></span>
+              <span>用量 <strong>{{ number(summary.total_tokens) }} Token</strong></span>
+              <span>图片 <strong>{{ number(summary.image) }} 张</strong></span>
+              <span>处理时长 <strong>{{ number(summary.millisecond / 1000 + summary.second) }} 秒</strong></span>
+              <details class="usage-breakdown">
+                <summary>用量详情</summary>
+                <p>输入 {{ number(summary.input_token) }}<template v-if="summary.input_image_token"> · {{ meterNames.input_image_token }} {{ number(summary.input_image_token) }}</template> · 缓存 {{ number(summary.cache_token) }} · 输出 {{ number(summary.output_token) }} Token（其中视频 {{ number(summary.video_output_token) }}）</p>
+                <p>字符 {{ number(summary.character) }} · 处理中或待对账 {{ number(summary.processing_calls) }} 条 · 已释放且无用量 {{ number(summary.released_calls) }} 条</p>
+              </details>
+            </div>
+          </div>
+        </div>
       </section>
-    </template>
+
+      <section v-if="summary" class="panel breakdown" aria-labelledby="cost-breakdown">
+        <div class="section-heading">
+          <h2 id="cost-breakdown" ref="breakdownHeading" tabindex="-1">{{ overviewView === 'all' ? '逐笔明细' : '消耗构成' }}</h2>
+          <div class="actions">
+            <label>查看方式<select ref="overviewViewControl" :value="overviewView" :aria-disabled="breakdownControlsDisabled" @change="changeOverviewView">
+              <option value="all">全部明细</option>
+              <option v-for="g in groups" :key="g.key" :value="g.key">按{{ g.label }}</option>
+            </select></label>
+          </div>
+        </div>
+        <div class="breakdown-content">
+          <div class="breakdown-data" :class="{ 'result-hidden': overviewResultsHidden }" :inert="overviewResultsHidden">
+            <p v-if="!overviewResults.total" class="muted">当前范围内无记录。</p>
+            <div v-else class="table-scroll" tabindex="0" :aria-label="resultView === 'all' ? '全部明细表' : '消耗构成表'">
+              <CostActivityRecords v-if="resultView === 'all'" :items="overviewResults.items" @inspect="openCall" />
+              <table v-else>
+                <thead><tr><th>{{ groups.find(g => g.key === resultView)?.label }}</th><th>{{ showProjectOwners ? '项目负责人 / 执行用户' : '执行用户' }}</th><th>业务记录</th><th>供应商成本估算</th><th>已扣积分</th><th v-if="filterableGroups.includes(resultView)">操作</th></tr></thead>
+                <tbody>
+                  <tr v-for="row in overviewResults.items" :key="row.key">
+                    <td>{{ groupDisplay(row) }}</td>
+                    <td>
+                      <div v-for="person in groupPeople(row).slice(0, 2)" :key="person.id" class="cost-owner">
+                        <strong v-if="person.display_name">{{ person.display_name }}</strong>
+                        <small v-if="person.display_name">{{ person.username || `用户 #${person.id}（用户名不可用）` }}</small>
+                        <span v-else>{{ person.username || `用户 #${person.id}（用户名不可用）` }}</span>
+                      </div>
+                      <small v-if="groupPeople(row).length > 2">另有 {{ groupPeople(row).length - 2 }} 位{{ groupUsesProjectOwner(row) ? '项目所有者' : '执行用户' }}</small>
+                      <span v-if="groupHasUnknownPerson(row) || !groupPeople(row).length" class="muted">{{ groupUsesProjectOwner(row) ? '未知项目所有者' : '未知执行用户' }}</span>
+                    </td>
+                    <td>{{ number(row.calls) }}</td>
+                    <td>{{ costMoney(row.supplier_priced_calls ? row.supplier_amount_micro : null) }}<small>{{ number(row.supplier_priced_calls) }} 条已计价</small></td>
+                    <td>{{ number(row.charged_micro / 10000) }}</td>
+                    <td v-if="filterableGroups.includes(resultView)">
+                      <button :disabled="busy" @click="openCalls(resultView, row.key, $event)">查看明细</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div v-if="overviewResultsHidden" class="breakdown-feedback">
+            <div class="breakdown-message actions">
+              <p v-if="updatingResults" class="muted" aria-hidden="true">正在读取表格…</p>
+              <p v-else-if="failedFilterApply" class="muted">结果将在筛选更新后显示。</p>
+              <template v-else>
+                <p class="muted">表格读取失败。</p>
+                <button type="button" @click="retryOverview(overviewViewControl)">重试表格</button>
+              </template>
+            </div>
+          </div>
+        </div>
+        <div v-if="overviewResults.total" class="pagination">
+          <button :aria-disabled="breakdownControlsDisabled || overviewPage <= 1" @click="changeOverviewPage(-1)">上一页</button>
+          <div class="breakdown-page-state">
+            <span :class="{ 'result-hidden': overviewResultsHidden }">第 {{ overviewPage }} 页 · {{ number(overviewResults.total) }} {{ resultView === 'all' ? '条' : '组' }}</span>
+            <span v-if="updatingResults" aria-hidden="true">正在读取…</span>
+            <button v-else-if="overviewError && !failedFilterApply" type="button" @click="retryOverview(nextPageControl)">重试本页</button>
+          </div>
+          <button ref="nextPageControl" :aria-disabled="breakdownControlsDisabled || overviewPage * pageSize >= overviewResults.total" @click="changeOverviewPage(1)">下一页</button>
+        </div>
+      </section>
+
+      <details class="panel price-status">
+        <summary>供应商价格与统计口径<span class="muted">
+          {{ supplierPrices?.latest ? `最近价格 ${supplierPrices.latest.day}` : '尚无价格快照' }}
+          <span v-if="supplierPrices?.latest && supplierPrices.latest.day !== today" class="warning"> · 今日价格尚未获取</span>
+        </span></summary>
+        <div class="price-body">
+          <p>供应商成本按实际用量和调用当日的供应商价格估算。当日缺价时使用调用日前最近的价格。平台积分扣费独立展示。</p>
+          <p>插帧 ¥0.60/分钟，画质增强 ¥2.50/分钟，按实际处理时长计算。</p>
+          <p>全部时间为北京时间。已结算按结算时间，未结算账本记录按预授权时间。独立供应商记录按提交时间。</p>
+          <p v-if="summary" :class="{ 'result-hidden': overviewResultsHidden }">沿用旧价格 {{ number(summary.supplier_stale_calls) }} 条 · 固定费率 {{ number(summary.supplier_fixed_calls) }} 条。</p>
+          <p v-if="supplierPrices?.error" class="warning">{{ supplierPrices.error }}。仍可使用最近成功的价格估算。</p>
+          <button :disabled="busy || priceRefreshing || supplierPrices?.status === 'completed'" @click="syncPrices">
+            {{ priceRefreshing ? '正在获取价格…' : supplierPrices?.status === 'completed' ? '今日价格已获取' : '获取今日价格' }}
+          </button>
+        </div>
+      </details>
+    </div>
+
+    <section v-if="tab === 'query' && callGroup" class="panel calls-view" aria-labelledby="cost-calls" :aria-busy="callsBusy">
+      <header class="calls-heading">
+        <button @click="leaveCalls">{{ resultView === 'all' ? '返回全部明细' : '返回消耗构成' }}</button>
+        <h2 id="cost-calls" ref="callsHeading" tabindex="-1">消耗明细<span v-if="callGroup !== 'all'"> · {{ groupLabel(callGroup, callKey) }}</span></h2>
+        <p class="applied-range">{{ scopeText(callFilters) }}</p>
+      </header>
+      <div v-if="callViews.length > 1" class="actions call-views" role="group" aria-label="明细查看方式">
+        <button v-for="view in callViews" :key="view.key" :aria-pressed="callView === view.key" @click="changeCallView(view.key)">{{ view.label }}</button>
+      </div>
+      <p v-if="callsBusy" role="status">正在读取{{ callViewLabel }}…</p>
+      <div v-else-if="callsError" class="feedback error" role="alert">
+        <p>{{ callsError }}</p><button @click="loadCalls">重试</button>
+      </div>
+      <p v-else-if="!callResults.total" class="muted">当前范围内无记录。</p>
+      <div v-else-if="callView === 'records'" class="table-scroll" tabindex="0" aria-label="逐笔记录表">
+        <CostActivityRecords :items="callResults.items" @inspect="openCall" />
+      </div>
+      <div v-else class="table-scroll" tabindex="0" :aria-label="callViewLabel + '表'">
+        <table class="call-summary-table">
+          <thead><tr><th>{{ detailGroupTitles[callView] }}</th><th>业务记录</th><th>供应商成本估算</th><th>已扣积分</th></tr></thead>
+          <tbody>
+            <tr v-for="row in callResults.items" :key="row.key">
+              <td>{{ detailGroupLabel(row) }}</td>
+              <td>{{ number(row.calls) }}</td>
+              <td>{{ costMoney(row.supplier_priced_calls ? row.supplier_amount_micro : null) }}<small>{{ number(row.supplier_priced_calls) }} 条已计价</small></td>
+              <td>{{ number(row.charged_micro / 10000) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div v-if="!callsBusy && !callsError && callResults.total" class="pagination">
+        <button :disabled="callPage <= 1" @click="changeCallPage(-1)">上一页</button>
+        <span>第 {{ callPage }} 页 · {{ number(callResults.total) }} {{ callView === 'records' ? '条' : '组' }}</span>
+        <button :disabled="callPage * pageSize >= callResults.total" @click="changeCallPage(1)">下一页</button>
+      </div>
+    </section>
+
+    <dialog ref="detailPanel" class="call-drawer" aria-labelledby="call-detail" @close="afterDetailClose">
+      <header class="drawer-heading">
+        <h2 id="call-detail">调用依据</h2>
+        <button autofocus @click="detailPanel.close()">关闭详情</button>
+      </header>
+      <div class="drawer-content" tabindex="0" aria-label="调用依据内容">
+        <p v-if="detailBusy" role="status">正在读取调用依据…</p>
+        <p v-else-if="detailError" class="feedback error" role="alert">{{ detailError }}</p>
+        <template v-else-if="detail">
+          <p>{{ detail.project_title || '非项目操作' }} · {{ detail.model }}</p>
+          <dl>
+            <dt>业务记录</dt><dd>{{ detail.id }}</dd>
+            <template v-if="detail.ops_scope">
+              <dt>消耗归属</dt><dd>{{ activityOwnership(detail) }}</dd>
+              <dt>扣费账户</dt><dd>{{ billingAccountLabel(detail) }}</dd>
+            </template>
+            <dt>功能 / 操作来源</dt><dd>{{ sourceKindLabel(detail.source_kind) }}<small v-if="detail.source_id">来源记录 ID：{{ detail.source_id }}</small></dd>
+            <dt>服务</dt><dd>{{ serviceTypeLabel(detail.service_type) }}</dd>
+            <dt>已有 AI 连接</dt><dd>{{ detail.config_name || '历史记录未保存连接归属' }}<small v-if="detail.config_id">配置 #{{ detail.config_id }} · 共享连接 {{ detail.connection_id || '未使用' }} · {{ detail.provider || '未知供应商' }}</small></dd>
+            <dt>供应商请求</dt><dd>{{ detail.provider_request_id || '未保存' }}</dd>
+            <dt>价格适用时间</dt><dd>{{ chinaTime(detail.price_at) }}</dd>
+            <dt>供应商成本估算</dt><dd>{{ costMoney(detail.supplier_amount_micro) }}<small>{{ detail.reason }}</small></dd>
+            <dt>原扣费 / 关联补扣</dt><dd>{{ detail.original_charged_micro == null ? '未结算' : number(detail.original_charged_micro / 10000) }} / {{ number(detail.supplement_micro / 10000) }} 积分</dd>
+            <dt>供应商价格依据</dt><dd>{{ detail.supplier?.source_label || '尚无可用价格' }}<small v-if="detail.supplier?.price_day">{{ detail.supplier.price_day }}{{ detail.supplier.stale ? ' · 沿用此前价格' : '' }}</small></dd>
+          </dl>
+          <h3>供应商价格与实际用量</h3>
+          <p v-if="!detail.supplier?.rates?.length">{{ detail.reason }}</p>
+          <div v-else class="table-scroll" tabindex="0" aria-label="供应商计费明细">
+            <table>
+              <thead><tr><th>计量</th><th>实际 / 计费数量</th><th>单价（元） / 单位数量</th><th>规格</th><th>估算小计（元）</th></tr></thead>
+              <tbody><tr v-for="r in detail.supplier.rates" :key="r.meter"><td>{{ meterNames[r.meter] || r.meter }}</td><td>{{ number(r.quantity) }} / {{ number(r.billable_quantity) }}</td><td>{{ number(r.unit_price_cny) }} / {{ r.unit_size }}</td><td>{{ r.rate_id || '标准' }}</td><td>{{ costMoney(r.subtotal_micro) }}</td></tr></tbody>
+            </table>
+          </div>
+          <details><summary>供应商价格快照与调用规格</summary><pre>{{ JSON.stringify({ pricing_context: detail.pricing_context, supplier: detail.supplier, usage_evidence: detail.usage_evidence }, null, 2) }}</pre></details>
+          <details><summary>平台积分依据</summary><p>{{ detail.platform_reason }}</p><pre>{{ JSON.stringify(detail.rates, null, 2) }}</pre></details>
+          <details v-if="detail.attempts.length">
+            <summary>调用尝试与旧成本修订（不重复计入汇总）</summary>
+            <article v-for="a in detail.attempts" :key="a.id" class="revision">
+              <p>{{ a.origin === 'historical_summary' ? '旧历史补录' : `尝试 ${a.attempt}` }} · {{ a.model }} · {{ chinaTime(a.submitted_at) }}</p>
+              <p v-for="r in a.revisions" :key="r.id">旧修订 #{{ r.id }}：{{ costMoney(r.amount_micro, r.currency || 'CNY') }} · {{ r.price?.source || '无价格' }} · {{ r.reason }}</p>
+            </article>
+          </details>
+        </template>
+      </div>
+    </dialog>
+
+
     <template v-if="tab === 'reports'">
       <section class="panel"><h2>客户月报</h2><p>保存每日供应商价格口径的成本月报，冻结用量、价格日期与估算金额。旧版本保持原值。</p><form class="inline-form" @submit.prevent="saveReport"><label>客户<select v-model="reportForm.organization_id" required><option value="">请选择客户</option><option v-for="c in customers" :key="c.id" :value="c.id">{{ c.name }}</option></select></label><label>自然月<input v-model="reportForm.month" type="month" required></label><button class="primary" :disabled="busy">保存月报新版本</button></form></section>
-      <section class="panel"><h2>已保存版本</h2><div class="table-scroll" tabindex="0"><table><thead><tr><th>客户</th><th>月份 / 版本</th><th>保存时间</th><th>操作</th></tr></thead><tbody><tr v-for="r in reports" :key="r.id"><td>{{ customers.find(c => c.id === r.organization_id)?.name || `客户 #${r.organization_id}` }}</td><td>{{ r.month }} · v{{ r.version }}</td><td>{{ chinaTime(r.generated_at) }}</td><td><button @click="showReport(r.id)">查看月报</button></td></tr></tbody></table></div><p v-if="!reports.length">尚无月报</p></section>
+      <section class="panel">
+        <h2>已保存版本</h2>
+        <p v-if="!reportsLoaded && !reportsError" role="status">正在读取月报…</p>
+        <p v-else-if="reportsError" class="warning">{{ reportsError }} <button @click="loadReports">重试</button></p>
+        <p v-else-if="!reports.length">尚无月报</p>
+        <div v-else class="table-scroll" tabindex="0" aria-label="已保存月报表">
+          <table>
+            <thead><tr><th>客户</th><th>月份 / 版本</th><th>保存时间</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr v-for="r in reports" :key="r.id">
+                <td>{{ customers.find(c => c.id === r.organization_id)?.name || `客户 #${r.organization_id}` }}</td>
+                <td>{{ r.month }} · v{{ r.version }}</td>
+                <td>{{ chinaTime(r.generated_at) }}</td>
+                <td><button :disabled="busy" @click="showReport(r.id)">查看月报</button></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
       <section v-if="report" class="panel"><h2>{{ report.summary.organization_name }} · {{ report.month }} · v{{ report.version }}</h2><template v-if="report.summary.basis === 'supplier_daily_v1'"><p>每日供应商价格估算 · {{ report.summary.calls }} 条业务记录</p><p>供应商成本估算 {{ costMoney(report.summary.supplier_priced_calls ? report.summary.supplier_amount_micro : null) }} · {{ report.summary.supplier_priced_calls }} 条已计价</p><p>沿用旧价格 {{ report.summary.supplier_stale_calls }} 条 · 固定费率 {{ report.summary.supplier_fixed_calls }} 条 · 缺价格或规格 {{ report.summary.missing_price_calls }} 条</p><p>原平台扣费 {{ number(report.summary.charged_micro / 10000) }} 积分</p></template><template v-else-if="report.summary.basis === 'billing_activity_v1'"><p>旧版平台价目复算（不代表供应商成本） · {{ report.summary.calls }} 条业务记录</p><p>模型计价折合 {{ costMoney(report.summary.calculated_calls ? report.summary.model_amount_micro : null) }} · 供应商费率估算 {{ costMoney(report.summary.supplier_priced_calls ? report.summary.supplier_amount_micro : null) }}（{{ report.summary.supplier_priced_calls }} 条有来源）</p><p>原扣费 {{ number(report.summary.charged_micro / 10000) }} 积分</p></template><p v-else>旧版独立成本规则快照：{{ costMoney(report.summary.cny_micro) }} · {{ report.summary.calls }} 条。此版本保留原值，与当前原调用口径不同。</p><div class="actions"><a class="button" :href="exportUrl(false)">导出汇总 CSV</a><a class="button" :href="exportUrl(true)">导出明细 CSV</a></div></section>
     </template>
   </main>
 </template>
 <script setup>
-import { nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, shallowRef, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import CostActivityRecords from './CostActivityRecords.vue'
+import UsageDateRange from '@/components/UsageDateRange.vue'
+import UsageOwnershipFilters from '@/components/UsageOwnershipFilters.vue'
 import { costsAPI as api } from '@/api/costs'
 import { adminAPI } from '@/api/account'
-import { chinaDate, chinaTime, costMoney, usageText, meterNames, sourceKindLabel, serviceTypeLabel } from '@/utils/costPresentation'
-const route = useRoute(), router = useRouter(), today = chinaDate()
-const tabs = [{ key: 'query', label: '查询与明细' }, { key: 'reports', label: '客户月报' }]
-const groups = [{ key: 'project', label: '项目' }, { key: 'customer', label: '客户' }, { key: 'user', label: '用户' }, { key: 'model', label: '模型' }, { key: 'operation', label: '功能 / 操作来源' }, { key: 'hour', label: '小时' }, { key: 'day', label: '日期' }, { key: 'month', label: '月份' }]
-const statuses = { settled: '已结算', processing: '处理中', released: '已释放', reconciliation: '待对账', completed: '已完成', failed: '失败', unknown: '结果不明' }
+import { chinaTime, costMoney, meterNames, sourceKindLabel, serviceTypeLabel } from '@/utils/costPresentation'
+import { ownershipLabels, activityOwnership, billingAccountLabel } from '@/utils/costOwnership'
+import { defaultUsageDates, readUsageRange, usageDateLabel, usageProjectOptionsScope, usageRangeParams, usageRangeQuery } from '@/utils/operationsUsageQuery'
+
+const route = useRoute()
+const router = useRouter()
+const today = defaultUsageDates().date_to
+const basis = 'supplier_daily_v1'
+const pageSize = 20
+const groups = [
+  { key: 'project', label: '项目' }, { key: 'ops_customer', label: '归属客户' },
+  { key: 'customer', label: '扣费账户' }, { key: 'user', label: '用户' },
+  { key: 'model', label: '模型' }, { key: 'operation', label: '功能来源' },
+  { key: 'hour', label: '小时' }, { key: 'day', label: '日期' }, { key: 'month', label: '月份' },
+]
+const filterableGroups = ['ops_customer', 'customer', 'project', 'user', 'model', 'operation']
+const groupFields = { project: 'drama_id', user: 'user_id', model: 'model', operation: 'source_kind', status: 'cost_status' }
 const costStatuses = { calculated: '成本已计价', missing_usage: '缺实际用量', missing_price: '缺供应商价格或规格', released: '已释放且无用量', unverified: '待核实' }
-const timeBasis = { settlement: '结算时间', authorization: '预授权时间', supplier_submission: '提交时间' }
-const defaults = () => ({ date_from: today.slice(0, 7) + '-01', date_to: today, organization_id: '', drama_id: '', user_id: '', model: '', source_kind: '', cost_status: '', customer_kind: '' })
-const filters = reactive({ ...defaults(), ...Object.fromEntries(Object.keys(defaults()).filter(k => typeof route.query[k] === 'string').map(k => [k, route.query[k]])) })
-const params = () => Object.fromEntries(Object.entries(filters).filter(([, v]) => v !== ''))
-const applied = ref(params()), tab = ref('query'), busy = ref(false), error = ref(''), notice = ref(''), errorPanel = ref(null)
-const basis = 'supplier_daily_v1', supplierPrices = ref(null), priceRefreshing = ref(false)
-let pricePoll = null, disposed = false
-const customers = ref([]), reports = ref([]), report = ref(null), summary = ref(null), calls = ref({ items: [], total: 0 }), breakdown = ref({ items: [], total: 0 })
-const filterOptions = ref({ projects: [], users: [] })
-const page = ref(1), groupPage = ref(1), groupBy = ref('project'), detail = ref(null), detailPanel = ref(null)
-const reportForm = reactive({ organization_id: '', month: today.slice(0, 7) })
-const number = v => Number(v || 0).toLocaleString('zh-CN', { maximumFractionDigits: 4 })
-const customerLabel = v => ({ personal: '个人账户', unknown: '未知客户' })[v] || v
-const groupUsesProjectOwner = row => groupBy.value === 'project' && row.key !== 'unknown'
-const groupPeople = row => groupUsesProjectOwner(row) ? row.owners || [] : row.executors || []
-const groupHasUnknownPerson = row => groupUsesProjectOwner(row) ? row.has_unknown_owner : row.has_unknown_executor
-const groupDisplay = row => groupBy.value === 'project' && row.key === 'unknown' ? '非项目操作' : groupBy.value === 'operation' ? sourceKindLabel(row.key === 'unknown' ? null : row.key) : row.label
-async function perform(fn, message = '') { if (busy.value) return; busy.value = true; error.value = ''; notice.value = ''; try { await fn(); notice.value = message } catch (e) { error.value = e.message || '读取失败，请重试' } finally { busy.value = false; if (error.value) { await nextTick(); errorPanel.value?.focus(); errorPanel.value?.scrollIntoView({ block: 'center' }) } } }
-async function query() { try { const result = await api.activity({ ...applied.value, basis, page: page.value, group_page: groupPage.value, group_by: groupBy.value }); supplierPrices.value = result.supplier_prices; watchPrices(); summary.value = result.summary; calls.value = result.calls; breakdown.value = result.breakdown } catch (e) { summary.value = null; calls.value = { items: [], total: 0 }; breakdown.value = { items: [], total: 0 }; throw e } }
-function load() { return perform(query) }
-function refresh(resetPage = false) { return perform(async () => { if (resetPage) { page.value = 1; groupPage.value = 1; detail.value = null } applied.value = params(); await query(); await router.replace({ query: applied.value }) }) }
-function reset() { Object.assign(filters, defaults()); refresh(true) }
-function filterToGroup(row) {
-  Object.assign(filters, defaults(), applied.value)
-  if (groupBy.value === 'customer') {
-    filters.organization_id = ['personal', 'unknown'].includes(row.key) ? '0' : row.key
-    filters.customer_kind = ['personal', 'unknown'].includes(row.key) ? row.key : ''
-  } else {
-    const key = { project: 'drama_id', user: 'user_id', model: 'model', operation: 'source_kind' }[groupBy.value]
-    filters[key] = row.key === 'unknown' ? '0' : row.key
+const detailGroupTitles = { user: '执行用户', operation: '功能来源', day: '日期', month: '月份' }
+const additionalFilterKeys = ['organization_id', 'user_id', 'model', 'source_kind', 'cost_status', 'customer_kind']
+const defaultView = range => range.ops_scope === 'external' && !range.ops_customer_id && !range.ops_individual_id ? 'ops_customer' : 'project'
+const number = value => Number(value || 0).toLocaleString('zh-CN', { maximumFractionDigits: 4 })
+const pageNumber = value => Math.max(1, Number.parseInt(value, 10) || 1)
+const customerLabel = value => ({ personal: '个人账户', unknown: '未知客户' })[value] || value
+const emptyPage = () => ({ items: [], total: 0 })
+
+function readFilters(query = {}) {
+  return {
+    ...readUsageRange(query),
+    ...Object.fromEntries(additionalFilterKeys.map(key => [key, typeof query[key] === 'string' ? query[key] : ''])),
   }
 }
-function drill(row) {
-  if (busy.value) return
-  const previousGroup = groupBy.value
-  filterToGroup(row)
-  if (previousGroup === 'customer') groupBy.value = 'project'
-  else if (previousGroup === 'project') groupBy.value = row.key === 'unknown' ? 'operation' : 'user'
-  refresh(true)
+
+function additionalParams(range) {
+  return Object.fromEntries(additionalFilterKeys.filter(key => range[key] !== '').map(key => [key, range[key]]))
 }
-function drillUsers(row) {
-  if (busy.value) return
-  filterToGroup(row)
-  groupBy.value = 'user'
-  refresh(true)
+
+function scopedOptionParams(range) {
+  const { organization_id, customer_kind } = range
+  return {
+    ...usageRangeParams(range),
+    ...(organization_id ? { organization_id } : {}),
+    ...(customer_kind ? { customer_kind } : {}),
+  }
 }
-function openCall(id) { return perform(async () => { detail.value = await api.activityDetail(id, { basis }); await nextTick(); detailPanel.value?.focus(); detailPanel.value?.scrollIntoView({ block: 'start' }) }) }
-function saveReport() { return perform(async () => { report.value = await api.saveReport({ ...reportForm, basis }); reports.value = await api.reports() }, '月报新版本已保存。') }
-function showReport(id) { return perform(async () => { report.value = await api.report(id) }) }
-function exportUrl(detailRows) { return `/api/v1/admin/costs/reports/${encodeURIComponent(report.value.id)}/export?detail=${detailRows}` }
-function watchPrices() { priceRefreshing.value = supplierPrices.value?.status === 'processing'; if (priceRefreshing.value && !pricePoll && !disposed) pricePoll = setTimeout(pollPrices, 2500) }
-async function pollPrices() { pricePoll = null; if (disposed) return; try { supplierPrices.value = await api.supplierPrices(); watchPrices(); if (!priceRefreshing.value && !busy.value) await load() } catch (e) { priceRefreshing.value = false; error.value = e.message || '无法读取价格状态，请刷新' } }
-function syncPrices() { return perform(async () => { supplierPrices.value = await api.syncSupplierPrices(); watchPrices(); if (!priceRefreshing.value) await query() }) }
-onUnmounted(() => { disposed = true; clearTimeout(pricePoll) })
-onMounted(() => perform(async () => { const [c, r, options] = await Promise.all([adminAPI.customerOrganizations(), api.reports(), api.filterOptions()]); customers.value = c; reports.value = r; filterOptions.value = options; await query() }))
+
+const applied = computed(() => readFilters(route.query))
+const appliedKey = computed(() => JSON.stringify(applied.value))
+const filters = reactive({ ...applied.value })
+const dateInputReset = ref(0)
+const dateInputKey = computed(() => [
+  filters.ops_scope, filters.ops_customer_id, filters.ops_individual_id, filters.drama_id, dateInputReset.value,
+].join(':'))
+const pendingFilterApply = ref(false)
+const navigatingFilters = ref(false)
+const filterNavigationError = ref(false)
+const resultRange = ref(applied.value)
+const tab = ref('query')
+const taskBusy = ref(false)
+const filtersDisabled = computed(() => taskBusy.value || navigatingFilters.value)
+const overviewLoading = ref(false)
+const overviewError = ref('')
+const busy = computed(() => taskBusy.value || overviewLoading.value)
+const error = ref('')
+const notice = ref('')
+const summary = ref(null)
+const overviewResults = ref(emptyPage())
+const routeView = computed(() => route.query.group_by === 'all' ? 'all' : groups.find(group => group.key === route.query.group_by)?.key || defaultView(applied.value))
+const overviewView = ref(routeView.value)
+const overviewViewControl = ref(null)
+const nextPageControl = ref(null)
+const overviewPage = computed(() => pageNumber(route.query.group_page))
+const overviewKey = computed(() => JSON.stringify(overviewQuery()))
+const resultView = ref(routeView.value)
+const supplierPrices = ref(null)
+const priceRefreshing = ref(false)
+
+const customers = ref([])
+const individualCustomers = ref([])
+const projectNames = reactive(new Map())
+const userNames = reactive(new Map())
+const resolvedOptions = shallowRef(null)
+const optionsFailedKey = ref('')
+const optionParams = computed(() => scopedOptionParams(filters))
+const optionKey = computed(() => JSON.stringify(optionParams.value))
+const projectOptionsScope = computed(() => usageProjectOptionsScope(filters))
+const projectOptionsKey = computed(() => JSON.stringify(projectOptionsScope.value))
+const currentOptions = computed(() => resolvedOptions.value?.key === optionKey.value ? resolvedOptions.value.data : null)
+const optionsFailed = computed(() => optionsFailedKey.value === optionKey.value)
+const optionsLoading = computed(() => !currentOptions.value && !optionsFailed.value)
+const failedFilterApply = computed(() => pendingFilterApply.value && (optionsFailed.value || filterNavigationError.value))
+const updatingResults = computed(() => overviewLoading.value || (pendingFilterApply.value && !failedFilterApply.value))
+const overviewResultsHidden = computed(() => updatingResults.value || failedFilterApply.value || Boolean(overviewError.value))
+const breakdownControlsDisabled = computed(() => taskBusy.value || overviewResultsHidden.value)
+const projectOptions = computed(() => resolvedOptions.value?.projectKey === projectOptionsKey.value ? resolvedOptions.value.data.projects || [] : [])
+const projectsLoading = computed(() => optionsLoading.value && resolvedOptions.value?.projectKey !== projectOptionsKey.value)
+const userOptions = computed(() => currentOptions.value?.users || [])
+const modelOptions = computed(() => currentOptions.value?.models || [])
+const reports = ref([])
+const report = ref(null)
+const reportsLoaded = ref(false)
+const reportsError = ref('')
+const reportForm = reactive({ organization_id: '', month: today.slice(0, 7) })
+const missingUser = computed(() => filters.user_id && !hasUserOption(filters.user_id))
+const callGroup = computed(() => {
+  const group = route.query.calls
+  const key = route.query.call_key
+  if (group === 'all') return group
+  if (group === 'status') return typeof key === 'string' && Object.hasOwn(costStatuses, key) ? group : ''
+  return filterableGroups.includes(group) && typeof key === 'string' && key ? group : ''
+})
+const callKey = computed(() => callGroup.value === 'user' && applied.value.user_id ? applied.value.user_id : route.query.call_key || '')
+const callPage = computed(() => pageNumber(route.query.call_page))
+const callFilters = computed(() => ({ ...applied.value, ...groupFilter(callGroup.value, callKey.value) }))
+const linkedRange = computed(() => usageRangeQuery(callGroup.value ? callFilters.value : filters))
+const callViews = computed(() => {
+  const views = [{ key: 'records', label: '逐笔记录' }]
+  if (!callFilters.value.user_id) views.push({ key: 'user', label: '按用户汇总' })
+  if (callGroup.value === 'project' && callKey.value === 'unknown') {
+    views.push({ key: 'operation', label: '按来源汇总' })
+  }
+  if (callGroup.value === 'project') {
+    views.push({ key: 'day', label: '按日汇总' }, { key: 'month', label: '按月汇总' })
+  }
+  return views
+})
+const selectedCallView = computed(() => callViews.value.find(view => view.key === route.query.call_view) || callViews.value[0])
+const callView = computed(() => selectedCallView.value.key)
+const callViewLabel = computed(() => selectedCallView.value.label)
+const callResults = ref(emptyPage())
+const callsBusy = ref(false)
+const callsError = ref('')
+const callsHeading = ref(null)
+const breakdownHeading = ref(null)
+const detail = ref(null)
+const detailBusy = ref(false)
+const detailError = ref('')
+const detailPanel = ref(null)
+let detailOrigin = null
+let callOrigin = null
+let callOriginOverview = ''
+let overviewScroll = 0
+let overviewRequest = 0
+let callsRequest = 0
+let detailRequest = 0
+let optionsRequest = 0
+let pricePoll = null
+let disposed = false
+
+function groupFilter(group, key) {
+  if (group === 'ops_customer') {
+    if (key === 'internal' || key === 'pending') return { ops_scope: key, ops_customer_id: '', ops_individual_id: '' }
+    if (key.startsWith('individual:')) return { ops_scope: 'external', ops_customer_id: '', ops_individual_id: key.slice('individual:'.length) }
+    return { ops_scope: 'external', ops_customer_id: key, ops_individual_id: '' }
+  }
+  if (group === 'customer') {
+    const unassigned = key === 'personal' || key === 'unknown'
+    return { organization_id: unassigned ? '0' : key, customer_kind: unassigned ? key : '' }
+  }
+  const field = groupFields[group]
+  return field ? { [field]: key === 'unknown' ? '0' : key } : {}
+}
+
+function userLabel({ id, username, display_name }) {
+  if (username && display_name && username !== display_name) return `${display_name}（${username}）`
+  return display_name || username || `用户 #${id}`
+}
+
+function hasUserOption(id) {
+  if (id === '0') return currentOptions.value?.has_unknown_user
+  return userOptions.value.some(user => String(user.id) === id)
+}
+
+function groupLabel(group, key) {
+  if (group === 'status') return costStatuses[key]
+  if (group === 'ops_customer') {
+    if (key.startsWith('individual:')) {
+      const id = key.slice('individual:'.length)
+      return individualCustomers.value.find(c => String(c.id) === id)?.name || `独立客户 #${id}`
+    }
+    if (key === 'external') return '外部客户合计'
+    return ownershipLabels[key] || customers.value.find(c => String(c.id) === key)?.name || `客户 #${key}`
+  }
+  if (group === 'customer') {
+    if (key === '0') return '个人账户或未知客户'
+    return customers.value.find(c => String(c.id) === key)?.name || (['personal', 'unknown'].includes(key) ? customerLabel(key) : `客户 #${key}`)
+  }
+  if (group === 'project') {
+    if (key === '0' || key === 'unknown') return '非项目操作'
+    return projectNames.get(key) || `项目 #${key}`
+  }
+  if (group === 'user') {
+    if (key === '0' || key === 'unknown') return '未知用户'
+    return userNames.get(key) || `用户 #${key}`
+  }
+  if (group === 'operation') return sourceKindLabel(key === '0' || key === 'unknown' ? null : key)
+  return key
+}
+
+function scopeText(range) {
+  const ownership = range.ops_individual_id ? `individual:${range.ops_individual_id}` : range.ops_customer_id || range.ops_scope || 'all'
+  const selected = [
+    groupLabel('ops_customer', ownership),
+    (range.customer_kind || range.organization_id) && `扣费账户 ${groupLabel('customer', range.customer_kind || range.organization_id)}`,
+    range.drama_id && groupLabel('project', range.drama_id),
+    range.user_id && `执行用户 ${groupLabel('user', range.user_id)}`,
+    range.model,
+    range.source_kind && groupLabel('operation', range.source_kind),
+    range.cost_status && costStatuses[range.cost_status],
+  ].filter(Boolean)
+  const dates = usageDateLabel(range)
+  return [range.date_from || range.date_to ? `${dates}（北京时间）` : dates, ...selected].join(' · ')
+}
+
+const showProjectOwners = computed(() => resultView.value === 'project' && !resultRange.value.user_id)
+const groupUsesProjectOwner = row => showProjectOwners.value && row.key !== 'unknown'
+const groupPeople = row => groupUsesProjectOwner(row) ? row.owners || [] : row.executors || []
+const groupHasUnknownPerson = row => groupUsesProjectOwner(row) ? row.has_unknown_owner : row.has_unknown_executor
+function groupDisplay(row) {
+  if (resultView.value === 'project' && row.key === 'unknown') return '非项目操作'
+  if (resultView.value === 'operation') return groupLabel('operation', row.key)
+  return row.label
+}
+
+function executorLabel(row) {
+  if (row.key === 'unknown') return '未知用户'
+  const executor = row.executors?.[0]
+  return executor?.display_name || executor?.username || row.label
+}
+
+function detailGroupLabel(row) {
+  if (callView.value === 'user') return executorLabel(row)
+  if (callView.value === 'operation') return groupLabel('operation', row.key)
+  return row.label
+}
+
+function overviewQuery(range = applied.value, view = routeView.value, page = overviewPage.value) {
+  return {
+    ...usageRangeQuery(range),
+    ...additionalParams(range),
+    group_by: view === defaultView(range) ? undefined : view,
+    group_page: page > 1 ? String(page) : undefined,
+  }
+}
+
+async function perform(action, message = '') {
+  if (busy.value) return
+  taskBusy.value = true
+  error.value = ''
+  notice.value = ''
+  try {
+    await action()
+    notice.value = message
+  } catch (e) {
+    error.value = e.message || '读取失败，请重试'
+  } finally {
+    taskBusy.value = false
+  }
+}
+
+async function query() {
+  const requestId = ++overviewRequest
+  const routeKey = overviewKey.value
+  const range = applied.value
+  const view = routeView.value
+  const requestedPage = overviewPage.value
+  const pagination = view === 'all'
+    ? { page: requestedPage }
+    : { group_by: view, group_page: requestedPage }
+  overviewLoading.value = true
+  overviewError.value = ''
+  error.value = ''
+  notice.value = ''
+  try {
+    const result = await api.activity({ ...usageRangeParams(range), ...additionalParams(range), basis, time_order: 'desc', ...pagination })
+    if (requestId !== overviewRequest || routeKey !== overviewKey.value) return
+    supplierPrices.value = result.supplier_prices
+    watchPrices()
+    summary.value = result.summary
+    overviewResults.value = view === 'all' ? result.calls : result.breakdown
+    resultRange.value = range
+    resultView.value = view
+  } catch (e) {
+    if (requestId !== overviewRequest || routeKey !== overviewKey.value) return
+    overviewError.value = e.message || '读取消耗结果失败，请重试'
+  } finally {
+    if (requestId === overviewRequest) overviewLoading.value = false
+  }
+}
+
+function load(range = applied.value, requestedPage = overviewPage.value) {
+  const destination = overviewQuery(range, overviewView.value, requestedPage)
+  if (JSON.stringify(destination) === overviewKey.value) return query()
+  return router.replace({ query: destination })
+}
+
+async function applyPendingFilters() {
+  if (!pendingFilterApply.value || !currentOptions.value || navigatingFilters.value) return
+  if (optionKey.value !== JSON.stringify(scopedOptionParams(applied.value))) {
+    if (filters.user_id && !hasUserOption(filters.user_id)) filters.user_id = ''
+    if (filters.model && !modelOptions.value.includes(filters.model)) filters.model = ''
+  }
+  const range = { ...filters }
+  let view = routeView.value
+  if (['project', 'ops_customer'].includes(view) &&
+    (range.ops_scope !== applied.value.ops_scope || range.ops_customer_id !== applied.value.ops_customer_id || range.ops_individual_id !== applied.value.ops_individual_id)) {
+    view = defaultView(range)
+  }
+  const destination = overviewQuery(range, view, 1)
+  if (JSON.stringify(destination) === overviewKey.value) {
+    pendingFilterApply.value = false
+    return
+  }
+  filterNavigationError.value = false
+  navigatingFilters.value = true
+  try {
+    const failure = await router.push({ query: destination })
+    if (failure && pendingFilterApply.value) filterNavigationError.value = true
+  } catch {
+    filterNavigationError.value = true
+  } finally {
+    navigatingFilters.value = false
+  }
+}
+
+function changeFilters(patch, resetPage = false) {
+  if (filtersDisabled.value) return
+  if (!resetPage && Object.keys(patch).every(key => patch[key] === filters[key])) return
+  Object.assign(filters, patch)
+  filterNavigationError.value = false
+  pendingFilterApply.value = true
+  return applyPendingFilters()
+}
+
+function chooseOwnership(patch) {
+  if (Object.hasOwn(patch, 'ops_scope') || Object.hasOwn(patch, 'ops_customer_id') || Object.hasOwn(patch, 'ops_individual_id')) {
+    return changeFilters({ organization_id: '', customer_kind: '', ...patch })
+  }
+  return changeFilters(patch)
+}
+
+function changeDates(range) {
+  const { date_from = '', date_to = '' } = range || {}
+  if (Boolean(date_from) !== Boolean(date_to)) return
+  if (!range) dateInputReset.value++
+  return changeFilters({ date_from, date_to })
+}
+
+function changeOverviewView(event) {
+  if (breakdownControlsDisabled.value) {
+    event.target.value = overviewView.value
+    return
+  }
+  overviewView.value = event.target.value
+  return load(applied.value, 1)
+}
+
+function changeOverviewPage(delta) {
+  const nextPage = overviewPage.value + delta
+  if (breakdownControlsDisabled.value || nextPage < 1 || (nextPage - 1) * pageSize >= overviewResults.value.total) return
+  return load(applied.value, nextPage)
+}
+
+function retryOverview(focusTarget) {
+  focusTarget?.focus({ preventScroll: true })
+  return query()
+}
+
+function reset() {
+  dateInputReset.value++
+  return changeFilters(readFilters(), true)
+}
+
+function openCalls(group, key, event) {
+  callOrigin = event.currentTarget
+  callOriginOverview = overviewKey.value
+  overviewScroll = window.scrollY
+  return router.push({
+    query: { ...overviewQuery(), calls: group, call_key: key || undefined },
+    state: { costOverview: true },
+  })
+}
+
+function leaveCalls() {
+  if (router.options.history.state.costOverview) router.back()
+  else return router.replace({ query: overviewQuery() })
+}
+
+function showOverview() {
+  tab.value = 'query'
+  if (callGroup.value) leaveCalls()
+}
+
+function showReports() {
+  tab.value = 'reports'
+  if (callGroup.value) leaveCalls()
+}
+
+async function loadCalls() {
+  const requestId = ++callsRequest
+  const view = callView.value
+  const pagination = view === 'records'
+    ? { page: callPage.value }
+    : { group_by: view, group_page: callPage.value }
+  callsBusy.value = true
+  callsError.value = ''
+  try {
+    const range = callFilters.value
+    const result = await api.activity({ ...usageRangeParams(range), ...additionalParams(range), basis, time_order: 'desc', ...pagination })
+    if (requestId === callsRequest) callResults.value = view === 'records' ? result.calls : result.breakdown
+  } catch (e) {
+    if (requestId === callsRequest) callsError.value = e.message || '明细读取失败'
+  } finally {
+    if (requestId === callsRequest) callsBusy.value = false
+  }
+}
+
+function changeCallView(view) {
+  if (view === callView.value) return
+  return router.replace({
+    query: { ...route.query, call_view: view === 'records' ? undefined : view, call_page: undefined },
+  })
+}
+
+function changeCallPage(delta) {
+  const nextPage = callPage.value + delta
+  return router.replace({ query: { ...route.query, call_page: nextPage > 1 ? String(nextPage) : undefined } })
+}
+
+watch([callGroup, callKey, callPage, callView, appliedKey], async ([group, key], previous) => {
+  if (!group) {
+    callsRequest++
+    if (!previous?.[0]) return
+    await nextTick()
+    if (tab.value === 'query') {
+      if (callOrigin?.isConnected && callOriginOverview === overviewKey.value) {
+        window.scrollTo({ top: overviewScroll, behavior: 'instant' })
+        callOrigin.focus({ preventScroll: true })
+      } else {
+        breakdownHeading.value?.focus()
+      }
+    }
+    return
+  }
+  callsBusy.value = true
+  if (group !== previous?.[0] || key !== previous?.[1]) {
+    tab.value = 'query'
+    await nextTick()
+    window.scrollTo({ top: 0, behavior: 'instant' })
+    callsHeading.value?.focus({ preventScroll: true })
+  }
+  if (callGroup.value) await loadCalls()
+}, { immediate: true })
+
+async function openCall(id, event) {
+  detailOrigin = event.currentTarget
+  const requestId = ++detailRequest
+  detail.value = null
+  detailBusy.value = true
+  detailError.value = ''
+  detailPanel.value.showModal()
+  try {
+    const record = await api.activityDetail(id, { basis, ops_scope: 'all' })
+    if (requestId === detailRequest) detail.value = record
+  } catch (e) {
+    if (requestId === detailRequest) detailError.value = e.message || '调用依据读取失败'
+  } finally {
+    if (requestId === detailRequest) detailBusy.value = false
+  }
+}
+
+function afterDetailClose() {
+  detailRequest++
+  detailOrigin?.focus({ preventScroll: true })
+  detailOrigin = null
+}
+
+function saveReport() {
+  return perform(async () => {
+    report.value = await api.saveReport({ ...reportForm, basis })
+    await loadReports()
+  }, '月报新版本已保存。')
+}
+
+function showReport(id) {
+  return perform(async () => { report.value = await api.report(id) })
+}
+
+function exportUrl(detailRows) {
+  return `/api/v1/admin/costs/reports/${encodeURIComponent(report.value.id)}/export?detail=${detailRows}`
+}
+
+function watchPrices() {
+  priceRefreshing.value = supplierPrices.value?.status === 'processing'
+  if (priceRefreshing.value && !pricePoll && !disposed) pricePoll = setTimeout(pollPrices, 2500)
+}
+
+async function pollPrices() {
+  pricePoll = null
+  if (disposed) return
+  try {
+    supplierPrices.value = await api.supplierPrices()
+    watchPrices()
+    if (!priceRefreshing.value && !busy.value && !pendingFilterApply.value) await query()
+  } catch (e) {
+    priceRefreshing.value = false
+    error.value = e.message || '无法读取价格状态，请刷新'
+  }
+}
+
+function syncPrices() {
+  return perform(async () => {
+    supplierPrices.value = await api.syncSupplierPrices()
+    watchPrices()
+    if (!priceRefreshing.value) await query()
+  })
+}
+
+watch(overviewKey, () => {
+  if (route.name !== 'admin-costs') return
+  pendingFilterApply.value = false
+  filterNavigationError.value = false
+  Object.assign(filters, applied.value)
+  overviewView.value = routeView.value
+  query()
+}, { immediate: true })
+
+async function loadFilterOptions() {
+  const requestId = ++optionsRequest
+  const key = optionKey.value
+  const projectKey = projectOptionsKey.value
+  optionsFailedKey.value = ''
+  try {
+    const data = await api.filterOptions({ ...optionParams.value, scoped_usage: '1' })
+    if (requestId !== optionsRequest || key !== optionKey.value) return
+    resolvedOptions.value = { key, projectKey, data }
+    individualCustomers.value = data.individual_customers || []
+    for (const project of data.projects || []) if (project.title) projectNames.set(String(project.id), project.title)
+    for (const user of data.users || []) userNames.set(String(user.id), userLabel(user))
+  } catch {
+    if (requestId === optionsRequest && key === optionKey.value) optionsFailedKey.value = key
+    return
+  }
+  return applyPendingFilters()
+}
+
+watch(optionKey, loadFilterOptions, { immediate: true })
+
+onMounted(() => {
+  adminAPI.customerOrganizations().then(value => { customers.value = value }).catch(() => {})
+})
+
+async function loadReports() {
+  reportsError.value = ''
+  try {
+    reports.value = await api.reports()
+    reportsLoaded.value = true
+  } catch (e) {
+    reportsError.value = e.message || '月报读取失败'
+  }
+}
+
+watch(tab, value => {
+  if (value === 'reports' && !reportsLoaded.value) loadReports()
+})
+
+onUnmounted(() => {
+  disposed = true
+  overviewRequest++
+  optionsRequest++
+  clearTimeout(pricePoll)
+})
 </script>
-<style scoped>
-.cost-workspace { width: 100%; min-width: 0; max-width: 1680px; margin: 0 auto; padding: 28px; color: var(--text-primary); }
-.page-heading,.section-heading,.actions,.pagination,.tabs { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-.page-heading { margin-bottom: 22px; }.eyebrow { font-size: 12px; color: var(--text-secondary); letter-spacing: .1em; }h1 { font-size: 28px; margin: 6px 0; }h2 { font-size: 19px; margin: 0 0 14px; }h3 { font-size: 15px; }p { line-height: 1.65; margin: 8px 0; }small { display: block; color: var(--text-secondary); margin-top: 6px; line-height: 1.5; }
-.tabs { justify-content: flex-start; border-bottom: 1px solid var(--border-color); padding-bottom: 12px; margin-bottom: 20px; }.tabs [aria-current],.primary { background: var(--el-color-primary, #365cd6); color: white; border-color: transparent; }
-button,.button { border: 1px solid var(--border-color); border-radius: 7px; background: var(--bg-raised); color: inherit; padding: 9px 14px; font: inherit; font-size: 13px; cursor: pointer; text-decoration: none; }button:disabled { opacity: .5; cursor: not-allowed; }button:hover:not(:disabled),.button:hover { border-color: var(--el-color-primary); }button.primary { background: var(--el-color-primary); color: #fff; }button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,.table-scroll:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 3px; }
-.panel { min-width: 0; padding: 22px; margin-bottom: 20px; border: 1px solid var(--border-color); background: var(--bg-surface); border-radius: 12px; }.filters { display: grid; grid-template-columns: repeat(auto-fit,minmax(175px,1fr)); gap: 16px; align-items: end; }label { display: flex; flex-direction: column; gap: 7px; font-size: 13px; min-width: 0; }input,select,textarea { box-sizing: border-box; width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-raised); color: inherit; font: inherit; }textarea { resize: vertical; font-family: monospace; }.full { grid-column: 1 / -1; }.form-actions,.inline-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }.inline-form { margin: 18px 0; }.inline-form label { flex: 1 1 200px; max-width: 480px; }.checkbox { flex-direction: row; align-items: center; margin: 16px 0; }.checkbox input { width: 17px; height: 17px; }.source-select { max-width: 520px; margin-top: 16px; }
-.metrics { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 16px; margin: 20px 0; }.metrics article { border-top: 3px solid var(--el-color-primary); background: var(--bg-surface); padding: 20px; border-radius: 9px; }.metrics strong { display: block; font-size: clamp(20px,2vw,30px); margin: 12px 0; overflow-wrap: anywhere; }.metrics span,.muted { color: var(--text-secondary); }.coverage { border-inline-start: 3px solid var(--el-color-primary); }.warning { color: var(--status-warning, #bd7900); }.feedback { border: 1px solid var(--border-color); border-inline-start: 3px solid var(--el-color-primary); padding: 12px 16px; margin-bottom: 16px; overflow-wrap: anywhere; }.error { border-inline-start-color: var(--status-danger, #e45454); color: var(--status-danger, #e45454); }
-.cost-owner + .cost-owner { margin-top: 12px; }.cost-owner small { margin-top: 3px; }
-.group-actions { display: flex; flex-wrap: wrap; gap: 8px; max-width: 190px; }
-.table-scroll { overflow-x: auto; width: 100%; margin-top: 14px; }table { border-collapse: collapse; width: 100%; min-width: 740px; text-align: left; font-size: 13px; }th,td { padding: 13px 12px; border-bottom: 1px solid var(--border-color); vertical-align: top; }th { color: var(--text-secondary); font-weight: 500; background: var(--bg-muted); }td { max-width: 310px; overflow-wrap: anywhere; }.usage-cell { min-width: 180px; max-width: 260px; }.pagination { justify-content: flex-end; margin-top: 18px; font-size: 13px; }.section-heading label { min-width: 130px; }.revision { border-top: 1px solid var(--border-color); padding: 16px 0; }pre { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 100%; padding: 12px; background: var(--bg-muted); border-radius: 6px; font-size: 12px; }summary { cursor: pointer; padding: 8px 0; }dl { display: grid; grid-template-columns: 190px minmax(0,1fr); gap: 12px; font-size: 13px; }dt { color: var(--text-secondary); }dd { margin: 0; overflow-wrap: anywhere; }.actions { justify-content: flex-start; }li { margin: 8px 0; }
-@media(max-width:800px) { .cost-workspace { padding: 16px; }.metrics { grid-template-columns: repeat(2,minmax(0,1fr)); }.panel { padding: 16px; }.page-heading { align-items: flex-start; }dl { grid-template-columns: 1fr; gap: 6px; }dd { margin-bottom: 10px; }.pagination { justify-content: space-between; } }
-@media(max-width:430px) { .metrics { gap: 10px; }.metrics article { padding: 14px; }.metrics strong { font-size: 21px; }.filters { grid-template-columns: 1fr; }.tabs { gap: 8px; }.tabs button { flex: 1 1 40%; } }
-</style>
+<style scoped src="./CostAccounting.css"></style>

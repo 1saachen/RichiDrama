@@ -5,11 +5,21 @@ const tenants = require('../services/tenantService');
 const customerOrganizations = require('../services/customerOrganizationService');
 const providerPrices = require('../services/providerPriceService');
 const richbestRebind = require('../services/richbestAssetRebindService');
+const { InvalidOperationsUsageScope } = require('../services/operationsUsageScope');
 const response = require('../response');
 
 module.exports = function adminRoutes(db, log = console, cfg = {}) {
   function guarded(fn) { return (req, res) => { try { fn(req, res); } catch (e) { response.badRequest(res, e.message); } }; }
   function guardedAsync(fn) { return async (req, res) => { try { await fn(req, res); } catch (e) { response.badRequest(res, e.message); } }; }
+  function usageQuery(fn) {
+    return (req, res) => {
+      try { return fn(req, res); }
+      catch (error) {
+        if (!(error instanceof InvalidOperationsUsageScope)) throw error;
+        return response.badRequest(res, error.message);
+      }
+    };
+  }
   function confirmed(req) {
     const body = req.body || {};
     if (body.confirm !== true || !String(body.reason || '').trim() || !String(body.idempotency_key || '').trim()) {
@@ -200,18 +210,18 @@ module.exports = function adminRoutes(db, log = console, cfg = {}) {
     notices: (req, res) => response.success(res, providerPrices.listNotices(db, req.query?.limit)),
     archiveNotice: guarded((req, res) => response.success(res, providerPrices.archiveNotice(db, req.auth.id, req.params.id))),
     transactions: (req, res) => response.success(res, billing.pagedTransactions(db, req.query)),
-    usage: (req, res) => response.success(res, billing.pagedUsage(db, req.query)),
-    usageSummary: (req, res) => response.success(res, billing.usageSummary(db, req.query)),
-    projectUsage: (req, res) => response.success(res, billing.projectUsage(db, req.query)),
-    projectUsageDetail: (req, res) => {
+    usage: usageQuery((req, res) => response.success(res, billing.pagedUsage(db, req.query, { operationsScope: true }))),
+    usageSummary: usageQuery((req, res) => response.success(res, billing.usageSummary(db, req.query, { operationsScope: true }))),
+    projectUsage: usageQuery((req, res) => response.success(res, billing.projectUsage(db, req.query))),
+    projectUsageDetail: usageQuery((req, res) => {
       const result = billing.projectUsageDetail(db, req.params.dramaId, req.query);
       return result ? response.success(res, result) : response.notFound(res, '项目不存在');
-    },
-    projectUsageSection: (section) => (req, res) => {
+    }),
+    projectUsageSection: (section) => usageQuery((req, res) => {
       const result = billing.projectUsageSection(db, req.params.dramaId, req.query, section);
       return result ? response.success(res, result) : response.notFound(res, '项目不存在');
-    },
-    unassignedProjectUsage: (req, res) => response.success(res, billing.unassignedProjectUsage(db, req.query)),
+    }),
+    unassignedProjectUsage: usageQuery((req, res) => response.success(res, billing.unassignedProjectUsage(db, req.query))),
     backfillProjectUsage: guarded((req, res) => {
       const body = confirmed(req);
       const result = billing.backfillProjectSnapshots(db, req.auth.id, body.idempotency_key);
