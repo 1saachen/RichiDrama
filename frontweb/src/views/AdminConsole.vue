@@ -1,13 +1,14 @@
 <template>
   <a class="skip-link" href="#admin-workspace">跳到运营工作区</a>
-  <main id="admin-workspace" class="console" :class="{ 'overview-mode': activeView === 'overview', 'workspace-mode': activeView !== 'overview' }" :aria-busy="loading">
+  <main id="admin-workspace" class="console" :class="{ 'overview-mode': activeView === 'overview', 'workspace-mode': activeView !== 'overview', 'project-usage-mode': activeView === 'projectUsage' || (activeView === 'governance' && governanceTab === 'usage' && projectAuditScope) }" :aria-busy="loading">
     <header class="console-header">
       <div>
         <p class="eyebrow">运营管理</p>
         <h1>运营工作台</h1>
       </div>
       <div class="header-actions">
-        <el-button @click="$router.push('/admin/costs')">消耗与成本</el-button>
+        <el-button @click="openUsageDestination('/admin/ownership')">客户与项目</el-button>
+        <el-button @click="openUsageDestination('/admin/costs')">消耗与成本</el-button>
         <el-button @click="$router.push('/')">返回主页</el-button>
         <span class="updated" aria-live="polite">数据截至 {{ overview?.generated_at ? formatChinaDateTime(overview.generated_at) : '加载中' }}</span>
         <el-button @click="refresh">刷新态势</el-button>
@@ -90,10 +91,33 @@
       <LogPagination :meta="pages.reconciliations" @change="changePage('reconciliations', $event)" />
     </section>
 
-    <section v-else-if="activeView === 'projectUsage'" class="workbench project-usage-workbench" aria-labelledby="project-usage-heading">
-      <div class="workbench-heading"><div><p class="card-kicker">项目用量管理</p><h2 id="project-usage-heading">按项目查看实际成本</h2></div><el-button @click="loadProjectUsage">刷新</el-button></div>
-      <div class="project-usage-toolbar"><el-button size="small" @click="setQuickProjectRange(7)">近 7 天</el-button><el-button size="small" @click="setQuickProjectRange(30)">近 30 天</el-button><el-date-picker v-model="filters.projectUsage.dates" type="daterange" value-format="YYYY-MM-DD" range-separator="至" start-placeholder="开始日期" end-placeholder="结束日期" @change="loadProjectUsage"/><el-input v-model="filters.projectUsage.keyword" clearable placeholder="搜索项目或负责人" @change="loadProjectUsage"/><el-select v-model="filters.projectUsage.tenant_id" clearable placeholder="全部分组" @change="loadProjectUsage"><el-option v-for="tenant in tenants" :key="tenant.id" :label="tenant.name" :value="tenant.id"/></el-select><el-button text @click="clearProjectUsageFilters">清除</el-button><el-button text type="warning" @click="toggleHistoricalUsage">非项目操作 {{ projectUsage?.historical_unassigned?.records || 0 }}</el-button></div>
-      <div class="project-usage-metrics"><article><small>项目数</small><strong>{{ projectUsage?.summary?.projects || 0 }}</strong></article><article><small>实际结算</small><strong>{{ formatCredits(projectUsage?.summary?.charged || 0) }}</strong></article><article><small>冻结中</small><strong>{{ formatCredits(projectUsage?.items?.reduce((sum, item) => sum + Number(item.frozen || 0), 0) || 0) }}</strong></article><article :class="{ warning: Number(projectUsage?.historical_unassigned?.calls || 0) > 0 }"><small>非项目操作</small><strong>{{ formatCredits(projectUsage?.historical_unassigned?.charged || 0) }}</strong></article></div>
+    <section v-else-if="activeView === 'projectUsage'" class="workbench project-usage-workbench" aria-labelledby="project-usage-heading" :aria-busy="projectUsageLoading">
+      <div class="workbench-heading"><h2 id="project-usage-heading">项目用量</h2><el-button @click="refreshProjectUsage">刷新</el-button></div>
+      <div class="project-usage-toolbar">
+        <UsageOwnershipFilters :range="projectUsageRange" :customers="customerOrganizations" :individual-customers="individualCustomers" :projects="scopedProjects" :projects-loading="scopedProjectsLoading" @change="applyProjectUsageFilters"/>
+        <el-button size="small" @click="applyProjectUsageFilters(defaultUsageDates())">本月</el-button>
+        <el-button size="small" @click="setQuickProjectRange(7)">近 7 天</el-button>
+        <el-button size="small" @click="setQuickProjectRange(30)">近 30 天</el-button>
+        <el-button size="small" @click="applyProjectUsageFilters({ date_from: '', date_to: '' })">全部日期</el-button>
+        <div class="project-usage-dates">
+          <el-date-picker :model-value="projectUsageRange.date_from" type="date" value-format="YYYY-MM-DD" placeholder="开始不限" aria-label="项目用量开始日期" @update:model-value="setProjectUsageDate('date_from', $event)"/>
+          <span>至</span>
+          <el-date-picker :model-value="projectUsageRange.date_to" type="date" value-format="YYYY-MM-DD" placeholder="结束不限" aria-label="项目用量结束日期" @update:model-value="setProjectUsageDate('date_to', $event)"/>
+        </div>
+        <el-input v-model="filters.projectUsage.keyword" clearable placeholder="搜索项目或负责人" @change="applyProjectUsageFilters()"/>
+        <el-button text @click="clearProjectUsageFilters">重置筛选</el-button>
+        <el-button v-if="includesUnassignedUsage" text :aria-expanded="showHistoricalUsage" @click="toggleHistoricalUsage">{{ showHistoricalUsage ? '收起' : '查看' }}非项目用量（{{ projectUsage?.historical_unassigned?.records || 0 }}）</el-button>
+        <div v-if="projectUsageRange.drama_id && !projectOptionsScope" class="project-usage-selection">
+          <span>{{ projectSelectionLabel }}</span>
+          <el-button text @click="applyProjectUsageFilters({ drama_id: '' })">清除项目筛选</el-button>
+        </div>
+      </div>
+      <div v-loading="projectUsageLoading" class="project-usage-metrics" aria-live="polite">
+        <article><small>实际结算合计（积分）</small><strong>{{ formatCredits(projectUsageCharged) }}</strong></article>
+        <article><small>项目用量 · {{ projectUsage?.summary?.projects || 0 }} 个项目</small><strong>{{ formatCredits(projectUsage?.summary?.charged || 0) }}</strong></article>
+        <article><small>非项目用量</small><strong>{{ formatCredits(projectUsage?.historical_unassigned?.charged || 0) }}</strong></article>
+        <article><small>项目冻结中</small><strong>{{ formatCredits(projectUsage?.summary?.frozen || 0) }}</strong></article>
+      </div>
       <div class="table-scroll project-usage-table-scroll"><el-table :data="projectUsage?.items || []" row-key="drama_id" @row-click="openProjectUsageDetail"><el-table-column label="项目信息" min-width="210"><template #default="{row}"><strong>{{ row.title }}</strong><small class="project-subline">#{{ row.drama_id }} · 比例：{{ row.aspect_ratio }} · 风格：{{ projectStyleLabel(row.style) }}</small></template></el-table-column><el-table-column label="项目所属人" min-width="150"><template #default="{row}"><div class="project-owner"><strong>{{ row.owner_display_name || row.owner_username || '未设置负责人' }}</strong><small>{{ row.owner_username || '—' }}</small></div></template></el-table-column><el-table-column label="制作进度" width="142"><template #default="{row}"><div class="project-progress"><div class="project-progress-track"><i :style="{ width: `${row.progress_percent || 0}%` }"/></div><small>{{ row.progress_percent || 0 }}% · {{ projectStatusLabel(row.project_status) }}</small></div></template></el-table-column><el-table-column label="创建时间" min-width="165"><template #default="{row}">{{ formatChinaDateTime(row.created_at) }}</template></el-table-column><el-table-column label="更新时间" min-width="165"><template #default="{row}">{{ formatChinaDateTime(row.project_updated_at) }}</template></el-table-column><el-table-column label="实际结算" width="115"><template #default="{row}">{{ formatCredits(row.charged) }}</template></el-table-column><el-table-column label="冻结中" width="100"><template #default="{row}">{{ formatCredits(row.frozen) }}</template></el-table-column><el-table-column label="操作" width="110" fixed="right"><template #default="{row}"><el-button link type="primary" @click.stop="openProjectUsageDetail(row)">上帝视角</el-button></template></el-table-column></el-table></div>
       <LogPagination :meta="pages.projectUsage" @change="changeProjectUsagePage"/>
       <section v-if="showHistoricalUsage" class="historical-usage"><div><b>非项目操作总览</b><small>统计筛选范围内未绑定短剧项目的已结算记录，按来源和服务查看用途。</small></div><div class="historical-summary-cards"><article><small>实际结算</small><strong>{{ formatCredits(historicalUsage?.summary?.charged || 0) }}</strong></article><article><small>涉及账号</small><strong>{{ historicalUsage?.summary?.users || 0 }}</strong></article><article><small>结算记录</small><strong>{{ historicalUsage?.summary?.records || 0 }}</strong></article><article><small>最近记录</small><strong>{{ historicalUsage?.summary?.last_activity_at ? formatChinaDateTime(historicalUsage.summary.last_activity_at) : '—' }}</strong></article></div><div class="historical-overview-grid"><section><h3>账号消耗排行</h3><div class="table-scroll"><el-table :data="historicalUsage.by_user || []" size="small"><el-table-column prop="display_name" label="显示名" min-width="110"><template #default="{row}">{{ row.display_name || row.username }}</template></el-table-column><el-table-column prop="username" label="账号" min-width="120"/><el-table-column label="实际结算" width="120"><template #default="{row}">{{ formatCredits(row.charged) }}</template></el-table-column></el-table></div></section><section><h3>来源构成</h3><div class="table-scroll"><el-table :data="historicalUsage.by_source || []" size="small"><el-table-column label="来源" min-width="120"><template #default="{row}">{{ sourceKindLabel(row.source_kind) }}</template></el-table-column><el-table-column label="服务" min-width="100"><template #default="{row}">{{ serviceLabel(row.service_type) }}</template></el-table-column><el-table-column label="实际结算" width="120"><template #default="{row}">{{ formatCredits(row.charged) }}</template></el-table-column></el-table></div></section></div><section class="historical-detail"><h3>逐笔明细</h3><div class="table-scroll"><el-table :data="historicalUsage.items" size="small"><el-table-column label="时间" min-width="170"><template #default="{row}">{{ formatChinaDateTime(row.created_at) }}</template></el-table-column><el-table-column prop="display_name" label="执行人"/><el-table-column label="服务"><template #default="{row}">{{ serviceTypeLabel(row.service_type) }}</template></el-table-column><el-table-column prop="model" label="模型"/><el-table-column label="来源状态"><template #default="{row}">{{ row.source_kind ? sourceKindLabel(row.source_kind) : '来源未记录' }}</template></el-table-column><el-table-column label="积分"><template #default="{row}">{{ formatCredits(row.charged) }}</template></el-table-column></el-table></div></section></section>
@@ -101,7 +125,12 @@
 
     <section v-else class="workbench" aria-labelledby="governance-heading">
       <div class="workbench-heading"><div><p class="card-kicker">治理配置</p><h2 id="governance-heading">账户、价目与审计</h2></div></div>
-      <div v-show="governanceTab === 'transactions' || governanceTab === 'usage'" class="billing-filters">
+      <div v-if="governanceTab === 'usage' && projectAuditScope" class="project-audit-context">
+        <div><strong>{{ projectAuditScope.title }}</strong><small>消耗归属 · {{ projectAuditScope.label }}　日期 · {{ projectAuditScope.dates }}</small></div>
+        <el-button @click="returnToProjectUsage">返回项目用量</el-button>
+        <el-button text @click="exitProjectAudit">退出项目筛选</el-button>
+      </div>
+      <div v-else-if="governanceTab === 'transactions' || governanceTab === 'usage'" class="billing-filters">
         <el-button size="small" @click="setQuickUsageRange(7)">近 7 天</el-button><el-button size="small" @click="setQuickUsageRange(30)">近 30 天</el-button>
         <el-date-picker v-model="filters.billing.dates" type="daterange" value-format="YYYY-MM-DD" range-separator="至" start-placeholder="开始日期" end-placeholder="结束日期" aria-label="按日期筛选账务" @change="reloadBilling"/>
         <el-select v-model="filters.billing.role" clearable placeholder="全部角色" aria-label="按角色筛选" @change="onBillingRoleChange"><el-option label="管理员" value="admin"/><el-option label="普通用户" value="user"/></el-select>
@@ -110,7 +139,7 @@
         <el-select v-model="filters.billing.user_id" clearable filterable placeholder="全部用户" aria-label="按用户筛选" @change="reloadBilling"><el-option v-for="user in filteredBillingUsers" :key="user.id" :label="billingUserLabel(user)" :value="user.id"/></el-select>
         <el-button text @click="clearBillingFilters">清除筛选</el-button>
       </div>
-      <el-tabs v-model="governanceTab">
+      <el-tabs v-model="governanceTab" @tab-change="onGovernanceTabChange">
         <el-tab-pane label="用户与余额" name="users">
           <div class="governance-toolbar"><el-button type="primary" @click="showCreate = true">新建账号</el-button></div>
           <div class="table-scroll users-table-scroll"><el-table :data="users"><el-table-column prop="username" label="用户"/><el-table-column prop="display_name" label="显示名"/><el-table-column label="账号类型"><template #default="{row}">{{ row.account_kind === 'platform_admin' ? '运营后台账号' : '创作账号' }}</template></el-table-column><el-table-column label="配置组" min-width="130"><template #default="{row}">{{ row.tenant_name || '未分组' }}</template></el-table-column><el-table-column label="客户账户" min-width="140"><template #default="{row}">{{ row.organization_name || '个人账户' }}</template></el-table-column><el-table-column prop="balance" label="个人余额"/><el-table-column prop="frozen" label="个人冻结"/><el-table-column label="操作" width="260" fixed="right"><template #default="{ row }"><el-button v-if="row.account_kind === 'creator' && !row.console_access" link type="warning" :disabled="resetting" @click="resetUserPassword(row)">重置密码</el-button><el-button link @click="openUserGroup(row)">配置组</el-button><el-button link class="balance-adjust-action" :disabled="!!row.organization_id" :title="row.organization_id ? '该成员使用客户共享额度' : ''" @click="openBalance(row)">个人积分</el-button></template></el-table-column></el-table></div>
@@ -177,7 +206,7 @@
     </el-drawer>
     <el-drawer v-model="showProjectUsageDetail" title="上帝视角 · 项目概览" size="min(860px, 94vw)">
       <template v-if="projectUsageDetail">
-        <section class="project-detail-heading"><h3>{{ projectUsageDetail.project.title }}</h3><p>#{{ projectUsageDetail.project.id }} · {{ projectOwnerLabel(projectUsageDetail.project) }}</p><div><strong>{{ projectUsageDetail.project.progress_percent || 0 }}%</strong><span>镜头交付进度 · {{ formatCredits(projectUsageDetail.summary.charged) }} 实际结算</span></div></section>
+        <section class="project-detail-heading"><h3>{{ projectUsageDetail.project.title }}</h3><p>#{{ projectUsageDetail.project.id }} · {{ projectOwnerLabel(projectUsageDetail.project) }}</p><p class="project-usage-context">消耗归属 · {{ projectOwnershipLabel }}　日期 · {{ projectUsageDateLabel }}</p><div><strong>{{ projectUsageDetail.project.progress_percent || 0 }}%</strong><span>镜头交付进度 · {{ formatCredits(projectUsageDetail.summary.charged) }} 实际结算</span></div></section>
         <section class="project-detail-section"><h4>项目概览</h4><dl class="project-facts"><div><dt>项目描述</dt><dd>{{ projectUsageDetail.project.description || '—' }}</dd></div><div><dt>所有者信息</dt><dd>{{ projectOwnerLabel(projectUsageDetail.project) }}</dd></div><div><dt>技术信息</dt><dd>{{ projectUsageDetail.project.aspect_ratio }} · {{ projectStyleLabel(projectUsageDetail.project.style) }}</dd></div><div><dt>项目状态</dt><dd>{{ projectStatusLabel(projectUsageDetail.project.project_status) }}</dd></div><div><dt>创建时间</dt><dd>{{ formatChinaDateTime(projectUsageDetail.project.created_at) }}</dd></div><div><dt>更新时间</dt><dd>{{ formatChinaDateTime(projectUsageDetail.project.project_updated_at || projectUsageDetail.project.updated_at) }}</dd></div></dl><div class="project-asset-summary"><span>剧集 {{ projectUsageDetail.project.episode_count || 0 }}</span><span>角色 {{ projectUsageDetail.project.character_count || 0 }}</span><span>场景 {{ projectUsageDetail.project.scene_count || 0 }}</span><span>道具 {{ projectUsageDetail.project.prop_count || 0 }}</span></div></section>
         <section class="project-detail-section"><h4>镜头交付</h4><p class="shot-delivery-note">每个镜头按当前最高阶段计入：提示词 25% → 已出图/有有效视觉素材 45% → 视频生成中 70% → 已有本地可播放视频 100%。</p><div class="shot-delivery-grid"><article><b>{{ projectUsageDetail.project.storyboard_count || 0 }}</b><span>镜头总数</span></article><article><b>{{ projectUsageDetail.project.shot_not_started_count || 0 }}</b><span>未开始</span></article><article><b>{{ projectUsageDetail.project.shot_prompt_ready_count || 0 }}</b><span>仅提示词</span></article><article><b>{{ projectUsageDetail.project.shot_visual_ready_count || 0 }}</b><span>已出图</span></article><article><b>{{ projectUsageDetail.project.shot_video_processing_count || 0 }}</b><span>视频生成中</span></article><article><b>{{ projectUsageDetail.project.video_completed_count || 0 }}</b><span>已交付视频</span></article><article :class="{ warning: projectUsageDetail.project.shot_failed_count > 0 }"><b>{{ projectUsageDetail.project.shot_failed_count || 0 }}</b><span>异常镜头</span></article></div></section>
         <section class="project-detail-section"><h4>费用构成</h4><div class="table-scroll"><el-table :data="projectUsageDetail.breakdown" size="small"><el-table-column label="来源" min-width="120"><template #default="{row}">{{ sourceKindLabel(row.source_kind) }}</template></el-table-column><el-table-column label="服务" min-width="100"><template #default="{row}">{{ serviceTypeLabel(row.service_type) }}</template></el-table-column><el-table-column prop="model" label="模型" min-width="180" show-overflow-tooltip/><el-table-column label="实际结算" width="110"><template #default="{row}">{{ formatCredits(row.charged) }}</template></el-table-column></el-table></div></section>
@@ -227,15 +256,19 @@
 </template>
 
 <script setup>
-import { computed, defineComponent, h, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, defineComponent, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, ElPagination, ElCheckbox, ElInput } from 'element-plus'
 import { CircleCheckFilled, PictureFilled, Setting, VideoCamera, WalletFilled, WarningFilled } from '@element-plus/icons-vue'
 import { adminAPI } from '@/api/account'
+import { costsAPI } from '@/api/costs'
 import request from '@/utils/request'
 import BillingTransactionTable from '@/components/BillingTransactionTable.vue'
+import UsageOwnershipFilters from '@/components/UsageOwnershipFilters.vue'
 import { formatCredits } from '@/utils/billingPresentation'
 import { meterNames, sourceKindLabel, serviceTypeLabel } from '@/utils/costPresentation'
+import { ownershipLabels } from '@/utils/costOwnership'
+import { defaultUsageDates, readUsageRange, usageDateLabel, usageProjectOptionsScope, usageRangeParams, usageRangeQuery } from '@/utils/operationsUsageQuery'
 import OperationsTrendChart from '@/components/OperationsTrendChart.vue'
 import { formatChinaDateTime } from '@/utils/time'
 import { createClientRequestId } from '@/utils/requestId'
@@ -273,8 +306,47 @@ const price = reactive({ name: '', status: 'draft', provider: '', rules_locked: 
 const priceProviderLabels = { volcengine: '火山引擎（方舟）', richbest: '瑞池中转', las: '火山引擎 LAS 在线算子' }
 function priceProviderLabel(provider) { return provider ? (priceProviderLabels[provider] || provider) : '平台通用' }
 const priceProviderOptions = computed(() => [...new Set(['volcengine', 'richbest', 'las', ...books.value.map((book) => book.provider).filter(Boolean)])].map((value) => ({ value, label: priceProviderLabel(value) })))
-const filters = reactive({ production: { status: route.query.status || '', model: route.query.model || '' }, archives: { status: '' }, reconciliations: { status: '' }, billing: { dates: [], role: '', user_id: null, tenant_id: null, organization_id: null, drama_id: null }, payments: { channel: '', status: '', keyword: '' }, projectUsage: { dates: [], keyword: '', tenant_id: null } })
-const pages = reactive({ production: { page: 1, page_size: 20, total: 0 }, archives: { page: 1, page_size: 20, total: 0 }, las: { page: 1, page_size: 20, total: 0 }, reconciliations: { page: 1, page_size: 20, total: 0 }, transactions: { page: 1, page_size: 20, total: 0 }, paymentOrders: { page: 1, page_size: 20, total: 0 }, usage: { page: 1, page_size: 20, total: 0 }, audit: { page: 1, page_size: 20, total: 0 }, projectUsage: { page: 1, page_size: 20, total: 0 } })
+const filters = reactive({ production: { status: route.query.status || '', model: route.query.model || '' }, archives: { status: '' }, reconciliations: { status: '' }, billing: { dates: [], role: '', user_id: null, tenant_id: null, organization_id: null }, payments: { channel: '', status: '', keyword: '' }, projectUsage: { keyword: projectKeyword(route.query) } })
+const projectUsageRange = ref(readUsageRange(route.query))
+const individualCustomers = ref([])
+const projectOptionsScope = computed(() => usageProjectOptionsScope(projectUsageRange.value))
+const projectOptionsKey = computed(() => JSON.stringify(projectOptionsScope.value))
+const projectOptions = ref({ key: '', items: [], loading: false })
+const scopedProjects = computed(() => projectOptions.value.key === projectOptionsKey.value ? projectOptions.value.items : [])
+const scopedProjectsLoading = computed(() => !!projectOptionsScope.value && (projectOptions.value.key !== projectOptionsKey.value || projectOptions.value.loading))
+let projectOptionsRequest = 0
+const projectUsageLoading = ref(false)
+const projectAudit = ref(null)
+const includesUnassignedUsage = computed(() => !projectUsageRange.value.drama_id || projectUsageRange.value.drama_id === '0')
+const projectSelectionLabel = computed(() => {
+  const id = projectUsageRange.value.drama_id
+  if (id === '0') return '非项目用量'
+  return projectUsage.value?.items.find(item => String(item.drama_id) === id)?.title || `项目 #${id}`
+})
+let projectUsageRequest = 0
+let projectUsageScroll = 0
+let modelUsageRequest = 0
+let standaloneUsagePage = 1
+const projectUsageCharged = computed(() => Number(projectUsage.value?.summary?.charged || 0) + Number(projectUsage.value?.historical_unassigned?.charged || 0))
+const projectUsageDateLabel = computed(() => usageDateLabel(projectUsageRange.value))
+const projectOwnershipLabel = computed(() => {
+  const { ops_scope, ops_customer_id, ops_individual_id } = projectUsageRange.value
+  const id = ops_individual_id || ops_customer_id
+  if (!id) return ownershipLabels[ops_scope] || ownershipLabels.all
+  const customers = ops_individual_id ? individualCustomers.value : customerOrganizations.value
+  return customers.find(customer => String(customer.id) === id)?.name || `客户 #${id}`
+})
+const projectAuditScope = computed(() => {
+  const id = auditProjectId(route.query)
+  if (!id || governanceTab.value !== 'usage') return null
+  return {
+    title: projectAudit.value?.id === id ? projectAudit.value.title : `项目 #${id}`,
+    label: projectOwnershipLabel.value,
+    dates: projectUsageDateLabel.value,
+    params: { ...usageRangeParams(projectUsageRange.value), drama_id: id },
+  }
+})
+const pages = reactive({ production: { page: 1, page_size: 20, total: 0 }, archives: { page: 1, page_size: 20, total: 0 }, las: { page: 1, page_size: 20, total: 0 }, reconciliations: { page: 1, page_size: 20, total: 0 }, transactions: { page: 1, page_size: 20, total: 0 }, paymentOrders: { page: 1, page_size: 20, total: 0 }, usage: { page: 1, page_size: 20, total: 0 }, audit: { page: 1, page_size: 20, total: 0 }, projectUsage: { page: projectPage(route.query), page_size: 20, total: 0 } })
 // 外部入口（如告警页「去处置」）通过 ?tab=archives&status=failed 直达过滤后的列表。
 if (route.query.tab === 'archives' && route.query.status) filters.archives.status = String(route.query.status)
 if (route.query.tab === 'reconciliations' && route.query.status) filters.reconciliations.status = String(route.query.status)
@@ -314,7 +386,8 @@ function materialTypeLabel(type) { return ({ image: '图片', video: '视频', a
 function materialUsageLabel(usage) { return ({ identity: '身份参考', reference: '参考素材', primary: '主要素材', motion: '动态参考', ambience: '环境音', first_frame: '首帧', last_frame: '尾帧' })[usage] || usage || '参考素材' }
 function stageTone(status) { return productionStatusTone(status) }
 function actionLabel(item) { return item.kind === 'stalled' ? `任务 #${item.id} 长时间未更新` : `任务 #${item.id} ${item.status === 'failed' ? '生成失败' : '可重试'}` }
-function syncRoute() { router.replace({ query: { ...route.query, tab: activeView.value, ...(filters.production.status ? { status: filters.production.status } : {}), ...(filters.production.model ? { model: filters.production.model } : {}), ...(activeView.value === 'archives' && filters.archives.status ? { status: filters.archives.status } : {}), ...(activeView.value === 'reconciliations' && filters.reconciliations.status ? { status: filters.reconciliations.status } : {}) } }) }
+function viewQuery(view) { return { ...route.query, tab: view, ...(filters.production.status ? { status: filters.production.status } : {}), ...(filters.production.model ? { model: filters.production.model } : {}), ...(view === 'archives' && filters.archives.status ? { status: filters.archives.status } : {}), ...(view === 'reconciliations' && filters.reconciliations.status ? { status: filters.reconciliations.status } : {}) } }
+function syncRoute() { return router.replace({ query: viewQuery(activeView.value) }) }
 async function refresh() { loading.value = true; try { overview.value = await adminAPI.overview() } finally { loading.value = false } }
 async function loadProduction() { await refresh(); applyPage(production, 'production', await adminAPI.production({ ...pages.production, ...filters.production })) }
 async function loadArchives() { applyPage(archives, 'archives', await adminAPI.mediaArchives(pages.archives)) }
@@ -418,15 +491,177 @@ function setQuickUsageRange(days) { const end = new Date(); const start = new Da
 function projectStyleLabel(style) { return ({ realistic: '真人写实', anime: '2D动漫风格', cartoon: '2D动漫风格', '2d_anime': '2D动漫风格', cinematic: '电影感', watercolor: '水彩风格' })[String(style || '').toLowerCase()] || style || '—' }
 function projectStatusLabel(status) { return ({ draft: '草稿', editing: '编辑中', active: '编辑中', completed: '已完成', archived: '已归档' })[String(status || '').toLowerCase()] || status || '编辑中' }
 function projectOwnerLabel(project) { const name = project?.owner_display_name || project?.owner_username || '未设置负责人'; return project?.owner_display_name && project?.owner_username ? `${name}（${project.owner_username}）` : name }
-function projectUsageParams() { const [date_from, date_to] = filters.projectUsage.dates || []; return { ...pages.projectUsage, ...(date_from ? { date_from } : {}), ...(date_to ? { date_to } : {}), ...(filters.projectUsage.keyword.trim() ? { keyword: filters.projectUsage.keyword.trim() } : {}), ...(filters.projectUsage.tenant_id ? { tenant_id: filters.projectUsage.tenant_id } : {}) } }
-function setQuickProjectRange(days) { const end = new Date(); const start = new Date(end.getTime() - (Number(days) - 1) * 86400000); const format = (value) => value.toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' }); filters.projectUsage.dates = [format(start), format(end)]; loadProjectUsage() }
-async function loadProjectUsage() { const params = projectUsageParams(); const [result, historical] = await Promise.all([adminAPI.projectUsage(params), showHistoricalUsage.value ? adminAPI.unassignedProjectUsage(params) : Promise.resolve({ items: [] })]); projectUsage.value = result; historicalUsage.value = historical; Object.assign(pages.projectUsage, { page: result.page || 1, page_size: result.page_size || 20, total: result.total || 0 }) }
-async function changeProjectUsagePage(page) { pages.projectUsage.page = page; await loadProjectUsage() }
-async function clearProjectUsageFilters() { filters.projectUsage.dates = []; filters.projectUsage.keyword = ''; filters.projectUsage.tenant_id = null; pages.projectUsage.page = 1; await loadProjectUsage() }
+function auditProjectId(query) {
+  const id = query.audit_drama_id
+  return query.tab === 'governance' && query.settings === 'usage' && typeof id === 'string' && /^[1-9]\d*$/.test(id) && Number.isSafeInteger(Number(id)) ? id : ''
+}
+function projectKeyword(query) { return typeof query.project_keyword === 'string' ? query.project_keyword.trim() : '' }
+function projectPage(query) {
+  const page = Number(query.project_page)
+  return Number.isSafeInteger(page) && page > 0 ? page : 1
+}
+function projectLocation(range, { page = pages.projectUsage.page, keyword = filters.projectUsage.keyword.trim(), auditId = '' } = {}) {
+  return {
+    path: '/admin',
+    query: {
+      ...usageRangeQuery(range),
+      tab: auditId ? 'governance' : 'projectUsage',
+      ...(keyword ? { project_keyword: keyword } : {}),
+      ...(page > 1 ? { project_page: String(page) } : {}),
+      ...(auditId ? { settings: 'usage', audit_drama_id: auditId } : {}),
+    },
+  }
+}
+function openUsageDestination(path) {
+  const range = activeView.value === 'projectUsage' ? projectUsageRange.value
+    : projectAuditScope.value ? { ...projectUsageRange.value, drama_id: auditProjectId(route.query) }
+      : null
+  return router.push({ path, ...(range ? { query: usageRangeQuery(range) } : {}) })
+}
+function projectUsageParams() {
+  const { page, page_size } = pages.projectUsage
+  const keyword = projectKeyword(route.query)
+  return { page, page_size, ...usageRangeParams(projectUsageRange.value), ...(keyword ? { keyword } : {}) }
+}
+function setQuickProjectRange(days) {
+  const { date_to } = defaultUsageDates()
+  const start = new Date(`${date_to}T00:00:00Z`)
+  start.setUTCDate(start.getUTCDate() - days + 1)
+  return applyProjectUsageFilters({ date_from: start.toISOString().slice(0, 10), date_to })
+}
+function setProjectUsageDate(key, date) {
+  const nextRange = { ...projectUsageRange.value, [key]: date || '' }
+  if (nextRange.date_from && nextRange.date_to && nextRange.date_from > nextRange.date_to) {
+    nextRange[key === 'date_from' ? 'date_to' : 'date_from'] = ''
+  }
+  return applyProjectUsageFilters(nextRange)
+}
+function applyProjectUsageFilters(patch = {}) {
+  return router.push(projectLocation({ ...projectUsageRange.value, ...patch }, { page: 1 }))
+}
+async function loadScopedProjectOptions(includeCustomers = false) {
+  const scope = projectOptionsScope.value
+  const key = projectOptionsKey.value
+  const requestId = ++projectOptionsRequest
+  projectOptions.value = { key, items: scopedProjects.value, loading: !!scope }
+  if (!scope && !includeCustomers) return
+  try {
+    const options = await costsAPI.filterOptions(scope || undefined)
+    individualCustomers.value = options.individual_customers || []
+    if (requestId !== projectOptionsRequest || key !== projectOptionsKey.value) return
+    projectOptions.value.items = scope ? options.projects || [] : []
+  } catch (_) {
+    // The selected value remains visible even if the options request failed.
+  } finally {
+    if (requestId === projectOptionsRequest && key === projectOptionsKey.value) projectOptions.value.loading = false
+  }
+}
+function loadProjectUsageOptions() {
+  return Promise.allSettled([
+    adminAPI.customerOrganizations().then(items => { customerOrganizations.value = items }),
+    loadScopedProjectOptions(true),
+  ])
+}
+function refreshProjectUsage() { return Promise.all([loadProjectUsage(), loadProjectUsageOptions()]) }
+async function loadProjectUsage() {
+  const requestId = ++projectUsageRequest
+  const params = projectUsageParams()
+  const emptyHistorical = { items: [] }
+  projectUsageLoading.value = true
+  try {
+    const [result, historical] = await Promise.all([
+      adminAPI.projectUsage(params),
+      showHistoricalUsage.value && includesUnassignedUsage.value ? adminAPI.unassignedProjectUsage({ ...params, page: 1 }) : emptyHistorical,
+    ])
+    if (requestId !== projectUsageRequest) return
+    projectUsage.value = result
+    historicalUsage.value = historical
+    Object.assign(pages.projectUsage, { page: result.page || 1, page_size: result.page_size || 20, total: result.total || 0 })
+  } catch (error) {
+    if (requestId !== projectUsageRequest) return
+    projectUsage.value = null
+    historicalUsage.value = emptyHistorical
+    pages.projectUsage.total = 0
+    ElMessage.error(error?.message || '项目用量加载失败')
+  } finally {
+    if (requestId === projectUsageRequest) projectUsageLoading.value = false
+  }
+}
+function changeProjectUsagePage(page) { return router.push(projectLocation(projectUsageRange.value, { page, keyword: projectKeyword(route.query) })) }
+function clearProjectUsageFilters() {
+  return router.push(projectLocation(readUsageRange({}), { page: 1, keyword: '' }))
+}
 async function toggleHistoricalUsage() { showHistoricalUsage.value = !showHistoricalUsage.value; await loadProjectUsage() }
-async function openProjectUsageDetail(row) { projectUsageDetail.value = await adminAPI.projectUsageDetail(row.drama_id, projectUsageParams()); showProjectUsageDetail.value = true }
-async function openUsageAudit(dramaId) { filters.billing.drama_id = Number(dramaId); activeView.value = 'governance'; governanceTab.value = 'usage'; syncRoute(); await loadGovernance(); showProjectUsageDetail.value = false }
-async function loadGovernance() { const params = billingFilterParams(pages.usage); const [nextUsers, nextBooks, nextTenants, nextOrganizations, nextConfigs, nextTransactions, nextPayments, nextUsage, nextUsageSummary, nextAudit] = await Promise.all([adminAPI.users(), adminAPI.priceBooks(), adminAPI.tenants(), adminAPI.customerOrganizations(), request.get('/ai-configs'), adminAPI.transactions(billingFilterParams(pages.transactions)), adminAPI.paymentOrders({ ...pages.paymentOrders, ...filters.payments }), adminAPI.usage(params), adminAPI.usageSummary(params), adminAPI.audit(pages.audit)]); users.value = nextUsers; books.value = nextBooks; tenants.value = nextTenants; customerOrganizations.value = nextOrganizations; availableConfigs.value = nextConfigs; applyPage(transactions, 'transactions', nextTransactions); applyPage(paymentOrders, 'paymentOrders', nextPayments); applyPage(usage, 'usage', nextUsage); usageSummary.value = nextUsageSummary; applyPage(audits, 'audit', nextAudit) }
+async function openProjectUsageDetail(row) {
+  if (projectUsageLoading.value) return
+  const requestId = projectUsageRequest
+  try {
+    const detail = await adminAPI.projectUsageDetail(row.drama_id, projectUsageParams())
+    if (requestId !== projectUsageRequest || activeView.value !== 'projectUsage') return
+    projectUsageDetail.value = detail
+    showProjectUsageDetail.value = true
+  } catch (error) {
+    if (requestId === projectUsageRequest && activeView.value === 'projectUsage') ElMessage.error(error?.message || '项目明细加载失败')
+  }
+}
+function openUsageAudit(dramaId) {
+  const auditId = String(dramaId)
+  projectAudit.value = { id: auditId, title: projectUsageDetail.value.project.title }
+  return router.push({
+    ...projectLocation(projectUsageRange.value, { auditId, keyword: projectKeyword(route.query) }),
+    state: { projectUsageParent: true },
+  })
+}
+function returnToProjectUsage() {
+  const location = projectLocation(projectUsageRange.value, { keyword: projectKeyword(route.query) })
+  if (!auditProjectId(route.query)) return router.push(location)
+  return router.options.history.state.projectUsageParent ? router.back() : router.replace(location)
+}
+function exitProjectAudit() {
+  return router.push({ query: { ...route.query, audit_drama_id: undefined } })
+}
+function onGovernanceTabChange(tab) {
+  if (auditProjectId(route.query) && tab !== 'usage') {
+    return router.push({ query: { ...route.query, settings: tab, audit_drama_id: undefined } })
+  }
+}
+async function loadProjectAuditTitle() {
+  const id = auditProjectId(route.query)
+  if (!projectAuditScope.value || projectAudit.value?.id === id) return
+  try {
+    const detail = await adminAPI.projectUsageDetail(id, projectAuditScope.value.params)
+    if (id === auditProjectId(route.query)) projectAudit.value = { id, title: detail.project.title }
+  } catch (_) {}
+}
+function modelUsageFilterParams() {
+  const { page, page_size } = pages.usage
+  return projectAuditScope.value
+    ? { page, page_size, ...projectAuditScope.value.params }
+    : billingFilterParams({ page, page_size })
+}
+async function loadModelUsage() {
+  const requestId = ++modelUsageRequest
+  const params = modelUsageFilterParams()
+  const [records, summary] = await Promise.all([adminAPI.usage(params), adminAPI.usageSummary(params)])
+  if (requestId !== modelUsageRequest) return
+  applyPage(usage, 'usage', records)
+  usageSummary.value = summary
+}
+async function loadGovernance() {
+  const [nextUsers, nextBooks, nextTenants, nextOrganizations, nextConfigs, nextTransactions, nextPayments, nextAudit] = await Promise.all([
+    adminAPI.users(), adminAPI.priceBooks(), adminAPI.tenants(), adminAPI.customerOrganizations(), request.get('/ai-configs'),
+    adminAPI.transactions(billingFilterParams(pages.transactions)), adminAPI.paymentOrders({ ...pages.paymentOrders, ...filters.payments }),
+    adminAPI.audit(pages.audit), loadModelUsage(),
+  ])
+  users.value = nextUsers
+  books.value = nextBooks
+  tenants.value = nextTenants
+  customerOrganizations.value = nextOrganizations
+  availableConfigs.value = nextConfigs
+  applyPage(transactions, 'transactions', nextTransactions)
+  applyPage(paymentOrders, 'paymentOrders', nextPayments)
+  applyPage(audits, 'audit', nextAudit)
+}
 // 轮询治理视图时只刷新当前 tab 的数据源，避免每 30s 并发十个请求。
 async function refreshGovernanceTab() {
   const tab = governanceTab.value
@@ -435,7 +670,7 @@ async function refreshGovernanceTab() {
   else if (tab === 'tenants') tenants.value = await adminAPI.tenants()
   else if (tab === 'transactions') applyPage(transactions, 'transactions', await adminAPI.transactions(billingFilterParams(pages.transactions)))
   else if (tab === 'paymentOrders') applyPage(paymentOrders, 'paymentOrders', await adminAPI.paymentOrders({ ...pages.paymentOrders, ...filters.payments }))
-  else if (tab === 'usage') { const params = billingFilterParams(pages.usage); const [nextUsage, nextUsageSummary] = await Promise.all([adminAPI.usage(params), adminAPI.usageSummary(params)]); applyPage(usage, 'usage', nextUsage); usageSummary.value = nextUsageSummary }
+  else if (tab === 'usage') await loadModelUsage()
   else if (tab === 'audit') applyPage(audits, 'audit', await adminAPI.audit(pages.audit))
 }
 async function loadPaymentOrders() { pages.paymentOrders.page = 1; applyPage(paymentOrders, 'paymentOrders', await adminAPI.paymentOrders({ ...pages.paymentOrders, ...filters.payments })) }
@@ -444,10 +679,37 @@ async function syncPaymentOrder(row) { try { await adminAPI.syncPaymentOrder(row
 async function reloadBilling() { pages.transactions.page = 1; pages.usage.page = 1; await loadGovernance() }
 async function onBillingRoleChange() { const selectedUser = users.value.find((user) => Number(user.id) === Number(filters.billing.user_id)); if (selectedUser && filters.billing.role && selectedUser.role !== filters.billing.role) filters.billing.user_id = null; await reloadBilling() }
 async function clearBillingFilters() { filters.billing.dates = []; filters.billing.role = ''; filters.billing.user_id = null; filters.billing.tenant_id = null; filters.billing.organization_id = null; filters.billing.drama_id = null; await reloadBilling() }
-async function loadCurrent() { if (activeView.value === 'overview') return refresh(); if (activeView.value === 'production') return loadProduction(); if (activeView.value === 'archives') return Promise.all([refresh(), loadArchives(), loadLas()]); if (activeView.value === 'reconciliations') return loadReconciliations(); if (activeView.value === 'projectUsage') return loadProjectUsage(); return loadGovernance() }
-async function openView(view) { activeView.value = view; syncRoute(); await loadCurrent() }
+async function loadCurrent() {
+  if (activeView.value === 'overview') return refresh()
+  if (activeView.value === 'production') return loadProduction()
+  if (activeView.value === 'archives') return Promise.all([refresh(), loadArchives(), loadLas()])
+  if (activeView.value === 'reconciliations') return loadReconciliations()
+  if (activeView.value === 'projectUsage') return refreshProjectUsage()
+  if (projectAuditScope.value) return Promise.all([loadModelUsage(), loadProjectAuditTitle(), loadProjectUsageOptions()])
+  return loadGovernance()
+}
+async function openView(view) {
+  if (view === 'projectUsage') {
+    if (activeView.value === view) return refreshProjectUsage()
+    return returnToProjectUsage()
+  }
+  if (route.query.tab === 'projectUsage' || auditProjectId(route.query)) {
+    const query = { ...viewQuery(view), audit_drama_id: undefined }
+    if (view === 'governance') query.settings = governanceTab.value
+    return router.push({ query })
+  }
+  activeView.value = view
+  syncRoute()
+  await loadCurrent()
+}
 async function drill(target = {}) { const view = target.tab || 'production'; if (view === 'production' && target.status) filters.production.status = target.status; if (view === 'production' && target.model) filters.production.model = target.model; if (view === 'archives') filters.archives.status = target.status || ''; if (view === 'reconciliations') filters.reconciliations.status = target.status || ''; await openView(view) }
-async function changePage(name, page) { pages[name].page = page; if (name === 'las') return loadLas(); if (name === activeView.value) await loadCurrent(); else if (name === 'transactions' || name === 'usage' || name === 'audit') await loadGovernance() }
+async function changePage(name, page) {
+  pages[name].page = page
+  if (name === 'las') return loadLas()
+  if (name === 'usage' && projectAuditScope.value) return loadModelUsage()
+  if (name === activeView.value) await loadCurrent()
+  else if (name === 'transactions' || name === 'usage' || name === 'audit') await loadGovernance()
+}
 async function openProduction(id) { productionDetail.value = await adminAPI.productionDetail(id); outputPreviewFailed.value = false; showProduction.value = true }
 function openProductionReproduction() {
   const replay = productionDetail.value?.reproduction
@@ -538,9 +800,63 @@ async function clonePrice(book) {
   } catch (error) { ElMessage.error(error?.message || '复制新版本失败') }
 }
 async function rollbackPrice(book) { const notifyUsers = ref(true); try { await ElMessageBox.confirm(() => h('div', [h('p', `将创建新版本，并把价格回滚到“${book.name}”。发布后立即生效。`), h(ElCheckbox, { modelValue: notifyUsers.value, 'onUpdate:modelValue': value => { notifyUsers.value = value } }, () => '通知用户价格更新')]), '确认价目回滚', { type: 'warning', confirmButtonText: '确认回滚' }); await adminAPI.rollbackPriceBook(book.id, { confirm: true, reason: `管理员回滚到历史价目 ${book.name}`, idempotency_key: createClientRequestId(`price-rollback-${book.id}`), notify_users: notifyUsers.value, notice_title: '模型调用价格已回滚', notice_body: `价格配置已回滚到历史版本“${book.name}”。新请求立即使用回滚后的价格。` }); await loadGovernance(); ElMessage.success('价目已回滚，新版本已发布') } catch (error) { if (error !== 'cancel' && error !== 'close') ElMessage.error(error?.message || '回滚失败') } }
+watch(() => route.query, async (query, previous) => {
+  if (route.name !== 'admin') return
+  const auditId = auditProjectId(query)
+  const previousAuditId = auditProjectId(previous)
+  if (query.tab !== 'projectUsage' && previous.tab !== 'projectUsage' && !auditId && !previousAuditId) return
+
+  const view = validViews.includes(query.tab) ? query.tab : 'overview'
+  if (previous.tab === 'projectUsage' && view !== 'projectUsage') {
+    projectUsageScroll = window.scrollY
+    projectUsageRequest++
+    projectUsageLoading.value = false
+  }
+  const previousOptionsKey = projectOptionsKey.value
+  projectUsageRange.value = readUsageRange(query)
+  filters.projectUsage.keyword = projectKeyword(query)
+  pages.projectUsage.page = projectPage(query)
+  activeView.value = view
+  showProjectUsageDetail.value = false
+  if (!includesUnassignedUsage.value) showHistoricalUsage.value = false
+  if (view === 'governance' && governanceSettings.includes(query.settings)) governanceTab.value = query.settings
+
+  if (auditId || previousAuditId) {
+    if (!previousAuditId) standaloneUsagePage = pages.usage.page
+    modelUsageRequest++
+    pages.usage.page = auditId ? 1 : standaloneUsagePage
+    usage.value = []
+    usageSummary.value = null
+  }
+  if (auditId) {
+    await nextTick()
+    if (route.query !== query) return
+    window.scrollTo({ top: 0, behavior: 'instant' })
+  }
+
+  try {
+    if (view === 'projectUsage' && previous.tab === 'projectUsage') {
+      await Promise.all([
+        loadProjectUsage(),
+        previousOptionsKey !== projectOptionsKey.value ? loadScopedProjectOptions() : undefined,
+      ])
+    } else await loadCurrent()
+  } catch (error) {
+    if (route.query === query) ElMessage.error(error?.message || '运营数据加载失败')
+  }
+  if (view === 'projectUsage' && previous.tab !== 'projectUsage' && route.query === query) {
+    await nextTick()
+    window.scrollTo({ top: projectUsageScroll, behavior: 'instant' })
+  }
+})
+
 let pollTimer; let pollTick = 0
 onMounted(async () => {
-  await loadCurrent()
+  try {
+    await loadCurrent()
+  } catch (error) {
+    ElMessage.error(error?.message || '运营数据加载失败')
+  }
   // 轮询节奏跟随视图：概览 60s，其余视图 30s；治理视图只刷当前 tab。
   pollTimer = window.setInterval(() => {
     if (document.visibilityState !== 'visible') return
@@ -553,6 +869,7 @@ onMounted(async () => {
     try {
       if (view === 'overview') { if (pollTick % 2 === 0) refresh().catch(() => {}) }
       else if (view === 'governance') refreshGovernanceTab().catch(() => {})
+      else if (view === 'projectUsage') loadProjectUsage().catch(() => {})
       else loadCurrent().catch(() => {})
     } catch (_) {}
   }, 30000)
@@ -786,6 +1103,27 @@ html.light .console{--ink:var(--text-primary);--muted:var(--text-muted);--line:v
 @media(max-width:45rem){.users-table-scroll{overflow-x:auto;max-width:100%}.users-table-scroll :deep(.el-table){min-width:1100px}.users-table-scroll :deep(.el-table__cell.is-fixed-column--right){position:static!important}}
 .production-output{margin:18px 0}.production-output h3{margin:0 0 12px}.production-output video{display:block;width:100%;max-height:min(420px,44vh);background:#000;border-radius:10px;object-fit:contain}.production-output p{color:var(--text-secondary);font-size:13px}
 .project-usage-workbench,.historical-usage,.historical-usage>div,.historical-overview-grid>section,.historical-detail,.historical-usage .table-scroll{min-width:0}
+.project-usage-toolbar :deep(.usage-ownership-field){width:min(12rem,100%)}
+.project-usage-selection{display:flex;align-items:center;flex-wrap:wrap;gap:.35rem;min-width:0;color:var(--text-secondary);font-size:.85rem;overflow-wrap:anywhere}
+.project-usage-dates{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:.35rem;width:min(17rem,100%);color:var(--text-secondary)}
+.project-usage-dates :deep(.el-date-editor){width:100%;min-width:0}
+.project-usage-toolbar .el-button+.el-button,.project-audit-context .el-button+.el-button{margin-left:0}
+.project-usage-context,.project-audit-context small{color:var(--text-secondary);font-size:.85rem}
+.project-audit-context{display:flex;flex-wrap:wrap;align-items:center;gap:.65rem;margin:0 0 1rem;padding:.75rem 1rem;border:1px solid var(--border-subtle);border-radius:.75rem;background:var(--bg-raised)}
+.project-audit-context>div{display:grid;gap:.25rem;margin-inline-end:auto;min-width:0;overflow-wrap:anywhere}
+.project-usage-metrics :deep(.el-loading-mask){background:var(--bg-surface)}
+.project-usage-workbench[aria-busy="true"] .project-usage-table-scroll{opacity:.45}
+.project-usage-table-scroll :deep(.el-button.is-link){color:var(--text-primary)}
+.project-usage-table-scroll :deep(.el-button.is-link:hover){text-decoration:underline}
+@media(max-width:30rem){
+  .project-usage-mode .workspace-nav{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .project-usage-mode .workspace-nav button{display:flex;align-items:center;gap:.35rem;min-width:0;min-block-size:2.75rem;white-space:nowrap}
+  .project-usage-mode .workspace-nav button span{display:none}
+  .project-usage-mode .workbench-heading{flex-direction:row;align-items:center}
+  .project-usage-toolbar :deep(.usage-ownership-field){width:calc((100% - .55rem)/2)}
+  .project-usage-workbench .project-usage-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .project-usage-workbench .project-usage-metrics article{padding:.7rem .75rem}
+}
 .historical-usage .table-scroll{width:100%;max-width:100%;overflow-x:auto}
 .historical-overview-grid .table-scroll :deep(.el-table){min-width:480px}
 .historical-detail .table-scroll :deep(.el-table){min-width:850px}

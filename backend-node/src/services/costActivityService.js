@@ -3,15 +3,21 @@ const billing = require('./billingService');
 const ledger = require('./costLedgerService');
 const supplierSnapshots = require('./supplierCostSnapshotService');
 const supplierRates = require('./supplierCostRates');
+const {
+  parseOperationsUsageScope, operationsUsageTables, operationsUsageFilter,
+  operationsProjectAssignments, operationsInternalMemberIds, operationsIndividualCustomers,
+} = require('./operationsUsageScope');
 const DAILY_BASIS = 'supplier_daily_v1';
 const { boundary } = require('./costQueryService');
 const parse = value => { try { return JSON.parse(value || '{}'); } catch (_) { return {}; } };
 const METERS = ['input_token', 'input_image_token', 'cache_token', 'output_token', 'image', 'input_image', 'millisecond', 'second', 'character', 'request'];
 const OFFICIAL_PRODUCT_SOURCES = new Set(['https://www.volcengine.com/product/yunque', 'https://www.volcengine.com/product/doubao/']);
+const snapshotField = (column, field) => `json_extract(CASE WHEN json_valid(${column}) THEN ${column} END,'$.${field}')`;
+const MODEL_KEY = `COALESCE(${snapshotField('x.snapshot_json', 'provider_model')},${snapshotField('x.authorization_snapshot', 'provider_model')},x.model)`;
 
 // One business record per usage log or unsettled authorization. Attempt evidence
 // stays attached to that record; historical imports never become extra usage.
-const SOURCE = `WITH activity AS (
+const ACTIVITY_CTE = `WITH activity AS (
  SELECT 'usage:'||l.id id,l.id usage_id,l.authorization_id,l.user_id,l.organization_id,l.drama_id,
  l.project_title_snapshot project_title,l.source_kind,l.source_id,l.service_type,l.model,l.created_at occurred_at,
  l.snapshot_json, a.snapshot_json authorization_snapshot,l.usage_json,l.charged_micro,
@@ -21,7 +27,7 @@ const SOURCE = `WITH activity AS (
  LEFT JOIN billing_transactions s ON s.id=l.transaction_id AND s.type='settlement'
  UNION ALL
  SELECT 'authorization:'||a.id,NULL,a.id,a.user_id,a.organization_id,a.drama_id,a.project_title_snapshot,
- a.source_kind,a.source_id,json_extract(a.snapshot_json,'$.service_type'),json_extract(a.snapshot_json,'$.model'),a.created_at,
+ a.source_kind,a.source_id,${snapshotField('a.snapshot_json', 'service_type')},${snapshotField('a.snapshot_json', 'model')},a.created_at,
  a.snapshot_json,a.snapshot_json,NULL,NULL,NULL,NULL,NULL,NULL,
  CASE WHEN EXISTS(SELECT 1 FROM billing_transactions v WHERE v.authorization_id=a.id AND v.type='void') THEN 'released'
  WHEN EXISTS(SELECT 1 FROM billing_reconciliation_cases b WHERE b.authorization_id=a.id AND b.status='pending') THEN 'reconciliation' ELSE 'processing' END,NULL
@@ -32,7 +38,8 @@ const SOURCE = `WITH activity AS (
  FROM cost_calls c LEFT JOIN cost_revisions r ON r.id=c.latest_revision_id
  WHERE c.origin='live' AND NOT EXISTS(SELECT 1 FROM billing_transactions a WHERE a.id=c.authorization_id AND a.type='authorization')
  AND NOT EXISTS(SELECT 1 FROM billing_usage_logs l WHERE l.authorization_id=c.authorization_id)
-)
+)`;
+const SOURCE = `${ACTIVITY_CTE}
 SELECT x.*,(SELECT a.created_at FROM billing_transactions a WHERE a.id=x.authorization_id AND a.type='authorization') authorization_at,c.submitted_at,c.config_id,c.connection_id,c.provider,c.user_name recorded_user_name,c.organization_name recorded_organization_name,
  c.context_json,c.status attempt_status,r.usage_json observed_usage_json,
  (SELECT b.observed_usage_json FROM billing_reconciliation_cases b WHERE b.authorization_id=x.authorization_id AND b.observed_usage_json IS NOT NULL ORDER BY b.created_at DESC LIMIT 1) reconciliation_usage,
@@ -55,7 +62,7 @@ function selection(input) {
       if (Number(input[key]) === 0) { clauses.push(`x.${key} IS NULL`); continue; }
     }
     if (key === 'source_kind' && (input[key] === 'unknown' || input[key] === '0')) { clauses.push('x.source_kind IS NULL'); continue; }
-    clauses.push(key === 'model' ? "COALESCE(json_extract(x.snapshot_json,'$.provider_model'),json_extract(x.authorization_snapshot,'$.provider_model'),x.model)=?" : `x.${key}=?`); args.push(input[key]);
+    clauses.push(key === 'model' ? `${MODEL_KEY}=?` : `x.${key}=?`); args.push(input[key]);
   }
   if (input.date_from) { clauses.push('x.occurred_at>=?'); args.push(boundary(input.date_from)); }
   if (input.date_to) { clauses.push('x.occurred_at<?'); args.push(boundary(input.date_to, true)); }
@@ -67,6 +74,11 @@ function providerSource(rate) {
   const c = rate.conditions || {};
   return c.currency === 'CNY' && c.provider === 'volcengine' &&
     ((c.source === 'ListModelActivations' && !!c.source_sync_id) || OFFICIAL_PRODUCT_SOURCES.has(c.source) || /^https:\/\/www\.volcengine\.com\/docs\//.test(c.source || ''));
+}
+
+function originalCustomerKind(organizationId, log, auth) {
+  if (organizationId) return 'customer';
+  return (log?.account_scope || auth?.account_scope) === 'personal' ? 'personal' : 'unknown';
 }
 
 function present(row) {
@@ -82,7 +94,7 @@ function present(row) {
     id: row.id, authorization_id: row.authorization_id, usage_id: row.usage_id, user_id: row.user_id,
     user_name: identity.user_name || row.recorded_user_name || (row.user_id ? `用户 #${row.user_id}` : '未知用户'),
     organization_id: row.organization_id, organization_name: identity.organization_name || row.recorded_organization_name || null,
-    customer_kind: row.organization_id ? 'customer' : (log.account_scope || auth.account_scope) === 'personal' ? 'personal' : 'unknown',
+    customer_kind: originalCustomerKind(row.organization_id, log, auth),
     drama_id: row.drama_id, project_title: row.project_title, project_owner_id: row.project_owner_id,
     project_owner_username: row.project_owner_username, project_owner_display_name: row.project_owner_display_name,
     executor_username: row.executor_username, executor_display_name: row.executor_display_name,
@@ -118,15 +130,65 @@ function present(row) {
   return result;
 }
 
+function operationsAttribution(db, input) {
+  const { scope, customerId, individualId, enabled } = parseOperationsUsageScope(input);
+  if (!enabled && input.group_by !== 'ops_customer') return null;
+
+  const tables = operationsUsageTables(db);
+  const projects = new Map(operationsProjectAssignments(db, tables).map(project => [project.drama_id, project]));
+  const members = new Set(operationsInternalMemberIds(db, tables));
+  const customerNames = new Map(tables.has('customer_organizations')
+    ? db.prepare('SELECT id,name FROM customer_organizations').all().map(customer => [customer.id, customer.name])
+    : []);
+  const individualNames = new Map(operationsIndividualCustomers(db, tables).map(customer => [customer.id, customer.name]));
+
+  return (row) => {
+    let opsScope = 'pending';
+    let opsCustomerId = null;
+    let opsIndividualId = null;
+    if (row.drama_id != null) {
+      const project = projects.get(row.drama_id);
+      if (project) {
+        opsScope = project.scope;
+        opsCustomerId = project.organization_id;
+        opsIndividualId = project.individual_user_id;
+      }
+    } else if (row.organization_id > 0) {
+      opsScope = 'external';
+      opsCustomerId = row.organization_id;
+    } else if (individualNames.has(row.user_id) &&
+      (parse(row.snapshot_json)?.account_scope || parse(row.authorization_snapshot)?.account_scope) === 'personal') {
+      opsScope = 'external';
+      opsIndividualId = row.user_id;
+    } else if (members.has(row.user_id)) {
+      opsScope = 'internal';
+    }
+    if ((scope && scope !== 'all' && opsScope !== scope) ||
+        (customerId != null && opsCustomerId !== customerId) ||
+        (individualId != null && opsIndividualId !== individualId)) return null;
+    return {
+      ops_scope: opsScope,
+      ops_customer_id: opsCustomerId,
+      ops_customer_name: opsCustomerId == null ? null : customerNames.get(opsCustomerId) || `客户 #${opsCustomerId}`,
+      ops_individual_id: opsIndividualId,
+      ops_individual_name: opsIndividualId == null ? null : individualNames.get(opsIndividualId) || `独立客户 #${opsIndividualId}`,
+    };
+  };
+}
+
 function* records(db, input = {}, cursor = {}) {
   const daily = input.basis === DAILY_BASIS;
   const sources = daily ? supplierSnapshots.snapshots(db) : null;
+  const classify = operationsAttribution(db, input);
   let { sql, args } = selection(input);
   if (cursor.after) { sql += (sql ? ' AND ' : ' WHERE ') + '(x.occurred_at,x.id)<(?,?)'; args.push(cursor.after.occurred_at, cursor.after.id); }
   const limit = cursor.limit ? ' LIMIT ?' : '';
   if (cursor.limit) args.push(cursor.limit);
   for (const raw of db.prepare(SOURCE + sql + ' ORDER BY x.occurred_at DESC,x.id DESC' + limit).iterate(...args)) {
+    const attribution = classify?.(raw);
+    if (classify && !attribution) continue;
     const row = present(raw);
+    if (attribution) Object.assign(row, attribution);
     if (daily) {
       row.supplier = supplierRates.estimate(row, sources);
       row.platform_reason = row.reason; row.platform_cost_status = row.cost_status;
@@ -169,6 +231,15 @@ function add(total, row) {
   if (row.service_type === 'video') total.video_output_token += row.usage?.output_token || 0;
 }
 function group(row, key) {
+  if (key === 'ops_customer') {
+    if (row.ops_individual_id != null) {
+      return { key: `individual:${row.ops_individual_id}`, label: row.ops_individual_name };
+    }
+    return {
+      key: row.ops_customer_id == null ? row.ops_scope : String(row.ops_customer_id),
+      label: row.ops_customer_name || (row.ops_scope === 'internal' ? '内部漫剧' : '待确认'),
+    };
+  }
   const fields = { customer: ['organization_id', 'organization_name'], project: ['drama_id', 'project_title'], user: ['user_id', 'user_name'], model: ['model', 'model'], operation: ['source_kind', 'source_kind'] };
   if (fields[key]) {
     const [id, label] = fields[key];
@@ -182,7 +253,7 @@ function group(row, key) {
 }
 function activity(db, input = {}) {
   const key = input.group_by || 'project';
-  if (!['customer', 'project', 'user', 'model', 'operation', 'hour', 'day', 'month'].includes(key)) throw new Error('不支持的分组维度');
+  if (!['customer', 'ops_customer', 'project', 'user', 'model', 'operation', 'hour', 'day', 'month'].includes(key)) throw new Error('不支持的分组维度');
   const page = Math.max(1, Math.trunc(Number(input.page) || 1)), size = 20;
   const groupPage = Math.max(1, Math.trunc(Number(input.group_page) || 1));
   const summary = totals(), items = [], groups = new Map();
@@ -203,13 +274,19 @@ function activity(db, input = {}) {
     }
     add(groups.get(g.key), row);
   }
+  const chronological = input.time_order === 'desc' && ['hour', 'day', 'month'].includes(key);
+  const amountKey = input.basis === DAILY_BASIS ? 'supplier_amount_micro' : 'model_amount_micro';
+  const breakdown = Array.from(groups.values()).sort((a, b) => chronological
+    ? b.key.localeCompare(a.key)
+    : b[amountKey] - a[amountKey] || a.key.localeCompare(b.key));
   return { basis: input.basis === DAILY_BASIS ? DAILY_BASIS : 'billing_activity_v1', ...(input.basis === DAILY_BASIS ? { supplier_prices: supplierSnapshots.status(db) } : {}), generated_at: new Date().toISOString(), timezone: 'Asia/Shanghai', summary,
     calls: { items, total: summary.calls, page, page_size: size },
-    breakdown: { items: Array.from(groups.values()).sort((a, b) => (input.basis === DAILY_BASIS ? b.supplier_amount_micro - a.supplier_amount_micro : b.model_amount_micro - a.model_amount_micro) || a.key.localeCompare(b.key)).slice((groupPage - 1) * size, groupPage * size).map(g => ({ ...g, label: g.label || (g.key === 'unknown' ? '未关联' : `#${g.key}`) })), total: groups.size, page: groupPage, page_size: size } };
+    breakdown: { items: breakdown.slice((groupPage - 1) * size, groupPage * size).map(g => ({ ...g, label: g.label || (g.key === 'unknown' ? '未关联' : `#${g.key}`) })), total: groups.size, page: groupPage, page_size: size } };
 }
 function detail(db, id, input = {}) {
   let row;
-  for (const item of records(db, { id, basis: input.basis })) { row = item; break; }
+  const opsScope = input.ops_scope || input.ops_customer_id || input.ops_individual_id ? 'all' : undefined;
+  for (const item of records(db, { id, basis: input.basis, ops_scope: opsScope })) { row = item; break; }
   if (!row) throw new Error('调用记录不存在');
   row.attempts = db.prepare('SELECT id FROM cost_calls WHERE authorization_id=? OR id=? OR source_key=? ORDER BY submitted_at,id')
     .all(row.authorization_id, id.startsWith('attempt:') ? id.slice(8) : '', row.usage_id ? `legacy_usage:${row.usage_id}` : '').map(x => ledger.get(db, x.id));
@@ -239,21 +316,63 @@ function createReport(db, actor, input) {
     return require('./costQueryService').report(db, id);
   })();
 }
-function filterOptions(db) {
-  const projects = db.prepare(`WITH candidates AS (
-    SELECT id, title, 1 current FROM dramas
-    UNION ALL SELECT drama_id, project_title_snapshot, 0 FROM billing_usage_logs
-    UNION ALL SELECT drama_id, project_title_snapshot, 0 FROM billing_transactions WHERE type='authorization'
-    UNION ALL SELECT drama_id, project_title, 0 FROM cost_calls WHERE origin='live'
-  ) SELECT id, COALESCE(MAX(CASE WHEN current=1 THEN NULLIF(title,'') END), MAX(NULLIF(title,''))) title
-    FROM candidates WHERE id IS NOT NULL AND id>0 GROUP BY id ORDER BY id DESC`).all();
+function unscopedUsageOptions(db) {
   const users = db.prepare(`WITH ids AS (
     SELECT id FROM users UNION SELECT user_id FROM billing_usage_logs
     UNION SELECT user_id FROM billing_transactions WHERE type='authorization'
     UNION SELECT user_id FROM cost_calls WHERE origin='live'
   ) SELECT ids.id,u.username FROM ids LEFT JOIN users u ON u.id=ids.id
     WHERE ids.id IS NOT NULL AND ids.id>0 ORDER BY ids.id`).all();
-  return { projects, users };
+  const models = db.prepare(`${ACTIVITY_CTE}
+    SELECT DISTINCT model FROM (SELECT ${MODEL_KEY} AS model FROM activity x)
+    WHERE typeof(model) = 'text' AND model <> '' ORDER BY model COLLATE NOCASE, model`).pluck().all();
+  return { users, models };
+}
+
+function scopedUsageOptions(db, input) {
+  const { drama_id, date_from, date_to, organization_id, customer_kind } = input;
+  const { sql, args } = selection({ drama_id, date_from, date_to, organization_id });
+  const classify = operationsAttribution(db, input);
+  const users = new Map(), models = new Set();
+  let hasUnknownUser = false;
+  // Use the same business records and attribution as the activity view, with
+  // no pagination, price lookups, or filtering by the current user/model choice.
+  const rows = db.prepare(`${ACTIVITY_CTE}
+    SELECT x.user_id,x.drama_id,x.organization_id,x.snapshot_json,x.authorization_snapshot,
+      ${MODEL_KEY} AS model,u.username,u.display_name
+    FROM activity x LEFT JOIN users u ON u.id=x.user_id ${sql}`).iterate(...args);
+  for (const row of rows) {
+    if (classify && !classify(row)) continue;
+    if (customer_kind && originalCustomerKind(row.organization_id, parse(row.snapshot_json), parse(row.authorization_snapshot)) !== customer_kind) continue;
+    if (row.user_id == null) hasUnknownUser = true;
+    else if (row.user_id > 0 && !users.has(row.user_id)) {
+      users.set(row.user_id, { id: row.user_id, username: row.username, display_name: row.display_name });
+    }
+    if (typeof row.model === 'string' && row.model !== '') models.add(row.model);
+  }
+  return {
+    users: [...users.values()].sort((a, b) => a.id - b.id),
+    models: [...models].sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'base' }) || a.localeCompare(b)),
+    has_unknown_user: hasUnknownUser,
+  };
+}
+
+function filterOptions(db, input = {}) {
+  const attribution = operationsUsageFilter(db, input, { kind: 'project', projectId: 'projects.id' });
+  const projects = db.prepare(`WITH candidates AS (
+    SELECT id, title, 1 current FROM dramas
+    UNION ALL SELECT drama_id, project_title_snapshot, 0 FROM billing_usage_logs
+    UNION ALL SELECT drama_id, project_title_snapshot, 0 FROM billing_transactions WHERE type='authorization'
+    UNION ALL SELECT drama_id, project_title, 0 FROM cost_calls WHERE origin='live'
+  ), projects AS (
+    SELECT id, COALESCE(MAX(CASE WHEN current=1 THEN NULLIF(title,'') END), MAX(NULLIF(title,''))) title
+    FROM candidates WHERE id IS NOT NULL AND id>0 GROUP BY id
+  ) SELECT id, title FROM projects WHERE 1=1 ${attribution.where} ORDER BY id DESC`).all(...attribution.params);
+  const usage = input.scoped_usage === '1' || input.scoped_usage === 1
+    ? scopedUsageOptions(db, input) : unscopedUsageOptions(db);
+  const tables = operationsUsageTables(db);
+  return { projects, ...usage, ...(tables.has('operations_individual_customers')
+    ? { individual_customers: operationsIndividualCustomers(db, tables) } : {}) };
 }
 
 module.exports = { activity, detail, records, createReport, filterOptions };
