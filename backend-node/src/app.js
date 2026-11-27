@@ -117,6 +117,8 @@ function createApp() {
   catch (error) { log.warn('画布交付恢复失败', { error: error.message }); }
   try { require('./services/lasMediaJobService').resume(db, log, config); }
   catch (error) { log.warn('LAS 媒体任务恢复失败', { error: error.message }); }
+  try { require('./services/seedAudioService').initialize(db, log, config); }
+  catch (error) { log.warn('Seed Audio 初始化失败', { error: error.message }); }
   try { require('./services/viralEditJobService').resume(db, log, config); }
   catch (error) { log.warn('投流剪辑任务恢复失败', { error: error.message }); }
   const paymentRecovery = require('./services/paymentService').createPaymentService(db, config, log);

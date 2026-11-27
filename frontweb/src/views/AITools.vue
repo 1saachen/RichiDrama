@@ -9,7 +9,7 @@
     <section class="tool-directory" aria-labelledby="tool-directory-title">
       <header><div><h2 id="tool-directory-title">创作能力</h2></div><button type="button" @click="openMediaLibrary">媒体素材库 →</button></header>
       <div class="directory-list">
-        <button v-for="(tool, index) in tools" :key="tool.title" type="button" @click="$router.push(tool.to)">
+        <button v-for="(tool, index) in visibleTools" :key="tool.title" type="button" @click="$router.push(tool.to)">
           <span class="directory-index">{{ String(index + 1).padStart(2, '0') }}</span>
           <span class="directory-icon">{{ tool.icon }}</span>
           <span class="directory-copy"><small>{{ tool.label }}</small><b>{{ tool.title }}</b><em>{{ tool.description }}</em></span>
@@ -21,11 +21,14 @@
   </main>
 </template>
 <script setup>
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AccountBalanceBadge from '@/components/AccountBalanceBadge.vue'
+import { audioGenerationAPI } from '@/api/audioGeneration'
 
 const route = useRoute()
 const router = useRouter()
+const audioGenerationAvailable = ref(false)
 
 function openMediaLibrary() {
   router.push({ path: '/media-library', query: { return_to: route.fullPath } })
@@ -38,10 +41,21 @@ const tools = [
   { title: '剧本创作', icon: '✦', tone: 'green', label: '文本策划', input: '创意、题材、集数', output: '分集短剧正文', description: '从灵感扩写为分集短剧，可导入项目。', to: '/ai-tools/script-writing', group: 'writing' },
   { title: '图片生成', icon: '▣', tone: 'blue', label: '视觉生成', input: '提示词与参考图', output: '图片生成记录', description: '支持文生图、图生图与多参考。', to: '/ai-tools/image-generation', group: 'visual' },
   { title: '视频生成', icon: '▶', tone: 'copper', label: '视频工作流', input: '提示词、首尾帧、参考', output: '视频任务与成片', description: '按模型能力选择文生、图生、首尾帧或多参考模式。', to: '/ai-tools/video-generation', group: 'visual' },
+  { title: '音频生成', icon: '♫', tone: 'green', label: '音频创作', input: '声音描述', output: '可试听的音频', description: '用 Seed Audio 1.0 生成对白、音效与背景氛围。', to: '/ai-tools/audio-generation', requiresAudioGeneration: true },
   { title: '视频超分', icon: '↗', label: '画质增强', input: '本地视频', output: '最高 4K 视频', description: '上传已有视频，提升分辨率并下载成片。', to: '/ai-tools/video-upscale', group: 'visual' },
   { title: '视频本地化', icon: '文', tone: 'blue', label: '出海制作', input: '项目视频素材', output: '字幕擦除与译制成片', description: '先擦除原字幕，再翻译配音，结果保存到项目素材库。', to: '/ai-tools/video-localization', group: 'visual' },
   { title: '反推提示词', icon: '◌', tone: 'green', label: '素材分析', input: '图片或视频素材', output: '镜头与风格提示词', description: '从视觉素材提炼主体、构图、光影、运动与完整提示词。', to: '/ai-tools/reverse-prompt', group: 'visual' },
 ]
+
+const visibleTools = computed(() => tools.filter((tool) => !tool.requiresAudioGeneration || audioGenerationAvailable.value))
+onMounted(async () => {
+  try {
+    const config = await audioGenerationAPI.getConfig()
+    audioGenerationAvailable.value = config?.available === true
+  } catch (_) {
+    audioGenerationAvailable.value = false
+  }
+})
 </script>
 <style scoped>
 .tools-page{min-height:100vh;padding:28px 32px 56px;background:#10151d;color:#f2f0ea}.tools-hero,.tool-group{max-width:1240px;margin:auto}.crumb{display:flex;align-items:center;gap:10px;color:#9facba;font-size:13px}.hero-content{display:flex;justify-content:space-between;gap:24px;align-items:end;padding:30px 0 24px}.eyebrow{margin:0 0 7px;color:#7ba9cc;font-size:11px;letter-spacing:.12em;font-weight:700}.hero-content h1{margin:0;font-size:clamp(25px,3vw,38px);letter-spacing:-.035em}.hero-copy{max-width:590px;margin:12px 0 0;color:#aab4c0;line-height:1.65}.hero-actions{display:flex;gap:8px;flex:none}.hero-actions :deep(.el-button--primary){--el-button-bg-color:#4b91c8;--el-button-border-color:#4b91c8;--el-button-hover-bg-color:#5ba1d6;--el-button-hover-border-color:#5ba1d6}.workflow{display:flex;align-items:center;gap:12px;padding:14px 16px;border:1px solid #334050;border-radius:8px;background:#181f29;color:#c8d0d7;font-size:13px}.workflow span{display:flex;align-items:center;gap:8px}.workflow b{display:grid;place-items:center;width:21px;height:21px;border-radius:50%;background:#27435a;color:#eaf4fb;font-size:11px}.workflow i{height:1px;flex:1;max-width:72px;background:#415266}.tool-group{padding-top:42px}.group-heading{display:flex;align-items:end;justify-content:space-between;gap:20px;margin-bottom:16px}.group-heading h2{margin:0;font-size:22px}.group-heading>p{max-width:430px;margin:0;color:#9facba;font-size:13px;line-height:1.6}.tool-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.tool-card{display:flex;flex-direction:column;min-height:245px;padding:18px;border:1px solid #334050;border-radius:10px;background:#181f29;cursor:pointer;outline:none;transition:border-color .15s,transform .15s,background .15s}.tool-card:hover,.tool-card:focus-visible{border-color:#4b91c8;background:#1c2631;transform:translateY(-2px)}.card-top{display:flex;align-items:center;justify-content:space-between}.tool-icon{display:grid;place-items:center;width:34px;height:34px;border-radius:8px;background:#22384a;color:#b8dcf5;font-weight:700;font-size:18px}.tool-icon.copper{background:#43331f;color:#e4bc86}.tool-icon.green{background:#203d32;color:#a9dbc1}.type-label{color:#9facba;font-size:11px}.tool-card h3{margin:18px 0 7px;font-size:17px}.tool-card>p{min-height:42px;margin:0;color:#aab4c0;font-size:13px;line-height:1.6}.tool-card dl{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:18px 0}.tool-card dl div{border-left:2px solid #42566a;padding-left:8px}.tool-card dt{color:#8895a4;font-size:10px}.tool-card dd{margin:3px 0 0;color:#d5dce2;font-size:11px;line-height:1.35}.tool-card footer{display:flex;justify-content:space-between;margin-top:auto;padding-top:12px;border-top:1px solid #2e3a48;color:#9fc8e8;font-size:13px}.tool-card footer span{font-size:18px;line-height:12px}@media(max-width:900px){.tools-page{padding:20px}.hero-content,.group-heading{align-items:flex-start;flex-direction:column}.tool-grid{grid-template-columns:1fr 1fr}.workflow{overflow:auto}.workflow i{min-width:30px}}@media(max-width:580px){.tools-page{padding:16px}.tool-grid{grid-template-columns:1fr}.hero-actions{width:100%}.hero-actions .el-button{flex:1}.workflow{font-size:12px}.workflow i{display:none}}

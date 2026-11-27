@@ -490,6 +490,7 @@ function setupRouter(cfg, db, log) {
   // ---------- AI 工具箱（独立运行历史） ----------
   r.get('/tool-templates', tools.templates);
   r.post('/tool-templates', requireAdmin, tools.createTemplate);
+  r.use('/tools/audio-generation', require('./seedAudio')(db, log, cfg));
   r.put('/tool-templates/:id', requireAdmin, tools.updateTemplate);
   r.get('/tool-runs', tools.list);
   r.post('/las-media-jobs', lasMediaJobs.create);

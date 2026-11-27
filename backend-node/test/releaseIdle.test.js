@@ -56,6 +56,29 @@ test('standalone upscales must drain before release while drafts and completed r
   settled.close();
   assert.equal(f.run().code, 0);
 });
+test('Seed Audio admissions, generation, and local finalization must drain before release', t => {
+  const f = fixture(t);
+  assert.equal(f.run().code, 0, 'the previous schema may not have Seed Audio jobs');
+
+  const db = new Database(f.file);
+  db.exec(`CREATE TABLE seed_audio_jobs(status TEXT);
+    INSERT INTO seed_audio_jobs VALUES ('pending'), ('processing'), ('finalizing'),
+      ('completed'), ('failed'), ('pending_reconciliation')`);
+  db.close();
+
+  const before = fs.readFileSync(f.file);
+  const busy = f.run();
+  assert.equal(busy.code, 75);
+  assert.equal(busy.output[0].active.seed_audio_jobs, 3);
+  assert.deepEqual(fs.readFileSync(f.file), before);
+
+  const settled = new Database(f.file);
+  settled.exec("UPDATE seed_audio_jobs SET status='completed' WHERE status IN ('pending','processing','finalizing')");
+  settled.close();
+  const idle = f.run();
+  assert.equal(idle.code, 0);
+  assert.equal(idle.output[0].active.seed_audio_jobs, 0);
+});
 test('new relay image and understanding jobs block release until inactive without changing historical rows', t => {
   const f=fixture(t),db=new Database(f.file);
   db.exec("CREATE TABLE relay_model_jobs(state TEXT); INSERT INTO relay_model_jobs VALUES ('completed'),('reconciliation'),('submitting')");
