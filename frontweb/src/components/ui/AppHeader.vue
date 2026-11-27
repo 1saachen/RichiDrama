@@ -27,6 +27,7 @@
           <template #dropdown>
             <el-dropdown-menu>
               <el-dropdown-item v-for="tool in AI_TOOLS" :key="tool.to" :command="tool.to">{{ tool.title }}<small>{{ tool.group }}</small></el-dropdown-item>
+              <el-dropdown-item v-if="isAdmin && audioGenerationAvailable" command="/ai-tools/audio-generation">音频生成<small>音频创作</small></el-dropdown-item>
             </el-dropdown-menu>
           </template>
         </el-dropdown>
@@ -78,12 +79,13 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { Box, DataAnalysis, Delete, Files, Grid, PictureFilled, Plus, Setting, Sunny, SwitchButton, Upload, User, UserFilled } from '@element-plus/icons-vue'
+import { audioGenerationAPI } from '@/api/audioGeneration'
 import { useTheme } from '@/composables/useTheme'
 import { signOut } from '@/utils/session'
 import { promptCreateCreativeBoard, startOmniProject } from '@/utils/workspaceEntry'
 import AccountBalanceBadge from '@/components/AccountBalanceBadge.vue'
 
-defineProps({
+const props = defineProps({
   // 当前页面在标签栏中的位置，例如 'projects'、'boards'、'tools'。
   active: { type: String, default: 'projects' },
   importing: { type: Boolean, default: false },
@@ -93,6 +95,7 @@ const router = useRouter()
 const { isDark, toggle: toggleTheme } = useTheme()
 const createDropdown = ref(null)
 const accountDropdown = ref(null)
+const audioGenerationAvailable = ref(false)
 
 // 工具箱的完整入口：全部工具都能从标签栏直达，不再需要先进目录页。
 const AI_TOOLS = [
@@ -133,7 +136,20 @@ function closeMenusOnEscape(event) {
   closeMenus()
 }
 
-onMounted(() => window.addEventListener('keydown', closeMenusOnEscape, true))
+async function loadAudioGenerationAvailability() {
+  if (!props.isAdmin) return
+  try {
+    const config = await audioGenerationAPI.getConfig()
+    audioGenerationAvailable.value = config?.available === true
+  } catch (_) {
+    audioGenerationAvailable.value = false
+  }
+}
+
+onMounted(() => {
+  window.addEventListener('keydown', closeMenusOnEscape, true)
+  loadAudioGenerationAvailability()
+})
 onBeforeUnmount(() => window.removeEventListener('keydown', closeMenusOnEscape, true))
 </script>
 
