@@ -2,6 +2,9 @@ import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
 import { defineConfig } from 'vite'
 
+const loopbackPeers = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
+const audioGenerationPath = /^\/api\/v1\/tools\/audio-generation(?:[/?]|$)/i
+
 export default defineConfig({
   plugins: [vue()],
   resolve: {
@@ -21,6 +24,10 @@ export default defineConfig({
         target: 'http://127.0.0.1:5679',
         changeOrigin: false,
         ws: true,
+        bypass(req) {
+          // The backend sees Vite's socket, so gate this route's actual client here.
+          if (audioGenerationPath.test(req.url || '') && !loopbackPeers.has(req.socket.remoteAddress)) return false
+        },
         proxyTimeout: 600000,
         timeout: 600000
       },

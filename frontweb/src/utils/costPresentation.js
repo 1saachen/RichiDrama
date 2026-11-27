@@ -9,7 +9,7 @@ const sourceNames = {
   video_upscale: '画质增强', video_interpolation: '视频插帧', las_media_job: '视频本地化', viral_edit_job: '投流剪辑', storyboard_tts: '分镜配音',
   other: '来源未记录或其他历史',
 }
-const serviceNames = { text: '文本', image: '图片', storyboard_image: '分镜图片', video: '视频', video_postprocess: '视频后处理', tts: '语音' }
+const serviceNames = { text: '文本', image: '图片', storyboard_image: '分镜图片', video: '视频', video_postprocess: '视频后处理', tts: '语音', audio_generation: '音频生成' }
 export function sourceKindLabel(value) { return value ? sourceNames[value] || value : '来源未记录' }
 export function serviceTypeLabel(value) { return value ? serviceNames[value] || value : '服务未记录' }
 export function chinaDate(at = new Date()) { return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(at)) }
